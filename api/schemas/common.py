@@ -1,5 +1,7 @@
+#common.py
 import re
 from typing import Any, Generator
+from altair import value
 from pydantic import BaseModel, Field
 from pydantic_core import core_schema
 
@@ -27,11 +29,14 @@ class PhoneNumber(str):
     @classmethod
     def validate(cls, value: str) -> "PhoneNumber":
         """ Hàm kiểm tra chuỗi đầu vào có khớp regex E.164 hay không """
-        # TODO: Xóa bỏ các khoảng trắng thừa nếu có
-        # TODO: Kiểm tra value với cls.E164_REGEX
-        # TODO: Nếu không khớp, ném ra ValueError("Invalid E.164 phone number format")
-        # TODO: Trả về instance dạng chuỗi chuẩn: return cls(value)
-        pass
+        value = value.strip()
+        if not cls.E164_REGEX.match(value):
+            raise ValueError(
+                f"Invalid E.164 phone number format: '{value}'. "
+                "Expected '+' followed by 7-15 digits, e.g. +84971234567"
+            )
+        return cls(value)                            
+        
 
 # -----------------------------------------------------------------
 # 2. Standard Error Response (Khớp contract của errors.py)

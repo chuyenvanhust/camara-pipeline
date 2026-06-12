@@ -1,0 +1,3 @@
+pytest 
+pydantic #step1-v2
+psycopg2 #step1-v3

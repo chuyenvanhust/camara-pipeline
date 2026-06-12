@@ -194,23 +194,28 @@ camara-pipeline/
 │       ├── auth.py
 │       └── database.py
 │
-├── tests/                      # D6 – Integration Test Suite (36 TC)
-│   ├── README.md               # Danh sách đầy đủ TC01–TC36
-│   ├── conftest.py
-│   ├── fixtures/
-│   │   ├── seed_data.sql
-│   │   └── edge_cases.sql
-│   ├── api/
-│   │   ├── test_sim_swap.py         # TC01–TC09
-│   │   ├── test_device_swap.py      # TC10–TC16
-│   │   ├── test_number_verification.py  # TC17–TC22
-│   │   ├── test_auth.py             # TC35
-│   │   └── test_error_handling.py   # TC34, TC36
-│   └── pipeline/
-│       ├── test_validation.py       # TC32–TC33
-│       ├── test_deduplication.py    # TC23–TC25
-│       ├── test_conflict_resolution.py  # TC26–TC28
-│       └── test_late_arrival.py     # TC29–TC31
+├── tests/                     
+│   ├── unit   
+|   |   ├── README.md               # Đối xứng từng unit
+|   |
+│   └── integration
+|       ├── README.md               # Danh sách đầy đủ TC01–TC36
+│       ├── conftest.py
+│       ├── fixtures/
+|       │   ├── seed_data.sql
+|       │   └── edge_cases.sql
+|       ├── api/
+|       │   ├── test_sim_swap.py         # TC01–TC09
+|       │   ├── test_device_swap.py      # TC10–TC16
+|       │   ├── test_number_verification.py  # TC17–TC22
+|       │   ├── test_auth.py             # TC35
+|       │   └── test_error_handling.py   # TC34, TC36
+|       └── pipeline/
+|           ├── test_validation.py       # TC32–TC33
+|           ├── test_deduplication.py    # TC23–TC25
+|           ├── test_conflict_resolution.py  # TC26–TC28
+|           └── test_late_arrival.py     # TC29–TC31
+
 │
 ├── reporting/                  # D3 – Data Quality Report
 │   ├── README.md
@@ -550,3 +555,5 @@ make lint            # ruff check + mypy
 | Spark Structured Streaming | https://spark.apache.org/docs/latest/structured-streaming-programming-guide.html |
 | PostgreSQL Partitioning | https://www.postgresql.org/docs/current/ddl-partitioning.html |
 | FastAPI | https://fastapi.tiangolo.com/ |
+
+
