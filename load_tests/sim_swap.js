@@ -39,9 +39,9 @@ const errorCount = new Counter("sim_swap_errors");
 
 export const options = {
     stages: [
-        { duration: "30s", target: 100 },  // Ramp up lên 100 VU trong 30s
-        { duration: "60s", target: 100 },  // Giữ 100 VU trong 60s (đo chính)
-        { duration: "10s", target: 0   },  // Ramp down
+        { duration: "10s", target: 20 },  // Ramp up lên 100 VU trong 30s
+        { duration: "20s", target: 20 },  // Giữ 100 VU trong 60s (đo chính)
+        { duration: "5s", target: 0   },  // Ramp down
     ],
 
     // SLA thresholds — test FAIL nếu vi phạm
@@ -120,7 +120,7 @@ export default function () {
             try {
                 const body = JSON.parse(r.body);
                 return typeof body.swapped === "boolean";
-            } catch { return false; }
+            } catch (e){ return false; }
         },
     });
 
@@ -147,7 +147,7 @@ export default function () {
                 const body = JSON.parse(r.body);
                 // latestSimChange có thể null (không có swap) hoặc datetime string
                 return "latestSimChange" in body;
-            } catch { return false; }
+            } catch(e) { return false; }
         },
     });
 

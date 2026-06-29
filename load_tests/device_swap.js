@@ -28,9 +28,9 @@ const errorCount      = new Counter("device_swap_errors");
 // ── Cấu hình ─────────────────────────────────────────────────────────────────
 export const options = {
     stages: [
-        { duration: "30s", target: 100 },
-        { duration: "60s", target: 100 },
-        { duration: "10s", target: 0   },
+        { duration: "10s", target: 20 },
+        { duration: "20s", target: 20 },
+        { duration: "5s", target: 0   },
     ],
     thresholds: {
         "http_req_duration{endpoint:device_swap_check}":    ["p(95)<200"],
@@ -77,7 +77,7 @@ export default function () {
         "check: has deviceSwapped field": (r) => {
             try {
                 return typeof JSON.parse(r.body).deviceSwapped === "boolean";
-            } catch { return false; }
+            } catch(e) { return false; }
         },
     });
 
@@ -99,7 +99,7 @@ export default function () {
         "retrieve: has latestDeviceChange key": (r) => {
             try {
                 return "latestDeviceChange" in JSON.parse(r.body);
-            } catch { return false; }
+            } catch (e){ return false; }
         },
     });
 

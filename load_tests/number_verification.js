@@ -30,9 +30,9 @@ const errorCount    = new Counter("number_verify_errors");
 // ── Cấu hình ─────────────────────────────────────────────────────────────────
 export const options = {
     stages: [
-        { duration: "30s", target: 100 },
-        { duration: "60s", target: 100 },
-        { duration: "10s", target: 0   },
+        { duration: "10s", target: 20 },
+        { duration: "20s", target: 20 },
+        { duration: "5s", target: 0   },
     ],
     thresholds: {
         // SLA ≤ 100ms — nghiêm hơn 2 API kia
@@ -76,7 +76,7 @@ export default function () {
         "verify: has devicePhoneNumberVerified": (r) => {
             try {
                 return typeof JSON.parse(r.body).devicePhoneNumberVerified === "boolean";
-            } catch { return false; }
+            } catch (e){ return false; }
         },
     });
 

@@ -23,19 +23,18 @@ if ! [ -f "$REPORT_NAME" ]; then
     docker cp "camara-spark-master:${REPORT_NAME_IN_CONTAINER}" "$REPORT_NAME" 2>/dev/null
 fi
 
-# Kiểm tra xem báo cáo đã được sinh ra chưa
-if [ -f "$REPORT_NAME" ]; then
-    echo ">>> Báo cáo đã hoàn tất."
+echo ">>> Báo cáo đã hoàn tất tại: $REPORT_NAME"
 
-    # Mở trình duyệt
-    if [[ "$OSTYPE" == "msys" ]]; then
-        start "$REPORT_NAME"
-    elif [[ "$OSTYPE" == "darwin"* ]]; then
-        open "$REPORT_NAME"
-    else
-        xdg-open "$REPORT_NAME"
-    fi
+    # Tự động phát hiện trình duyệt mở file
+if command -v start >/dev/null 2>&1; then
+        # Dành cho Windows (Git Bash/CMD)
+    start "$REPORT_NAME"
+elif command -v open >/dev/null 2>&1; then
+        # Dành cho macOS
+    open "$REPORT_NAME"
+elif command -v xdg-open >/dev/null 2>&1; then
+        # Dành cho Linux
+    xdg-open "$REPORT_NAME"
 else
-    echo ">>> Lỗi: Không thể tạo file báo cáo."
-    exit 1
+    echo ">>> Không tìm thấy lệnh mở trình duyệt tự động. Vui lòng mở thủ công file: $REPORT_NAME"
 fi

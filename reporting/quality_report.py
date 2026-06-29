@@ -40,18 +40,20 @@ def fetch_metrics():
 
     try:
         # --- SECTION 1: TỔNG QUAN ---
-        # Lấy thông tin tổng quan từ metadata chạy gần nhất hoặc aggregate từ tổng hòa
-        cur.execute("SELECT COUNT(*) as total FROM processed_records_log;") # Giả định bảng tracking tổng hoặc sum các log
-        total_records = cur.fetchone()['total'] or 100000 # Fallback data mẫu nếu test độc lập
+        # SỬA ĐỔI: Query đúng bảng radius_sessions thay vì bảng log ảo
+        cur.execute("SELECT COUNT(*) as total FROM radius_sessions;")
+        result = cur.fetchone()
+        total_records = result['total'] if result and result['total'] is not None else 100
         
         metrics['overview'] = {
             "total_records": total_records,
-            "execution_time": "45 seconds",
-            "throughput": round(total_records / 45, 2) if total_records else 0,
+            "execution_time": "N/A", # Có thể thay bằng log từ file nếu cần
+            "throughput": 0, 
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
 
-        # --- SECTION 2: INVALID IMEI ---
+        # --- CÁC SECTION KHÁC (Đảm bảo tên bảng khớp với migration) ---
+        # Section 2: INVALID IMEI
         cur.execute("""
             SELECT 
                 COUNT(*) FILTER (WHERE error_code = 'ERR_IMEI_LUHN') as luhn_fail,
@@ -63,31 +65,32 @@ def fetch_metrics():
         imei_data = cur.fetchone()
         metrics['imei'] = {
             "total": imei_data['total'],
-            "rate": round((imei_data['total'] / total_records) * 100, 2),
+            "rate": round((imei_data['total'] / total_records * 100), 2) if total_records > 0 else 0,
             "luhn_fail": imei_data['luhn_fail'],
             "tac_unknown": imei_data['tac_unknown']
         }
 
-        # --- SECTION 3: DUPLICATE ---
+        # Section 3: DUPLICATE
+        # Lưu ý: Bảng duplicate_log cần có cột created_at (hoặc dùng cột khác bạn định nghĩa)
         cur.execute("SELECT COUNT(*) as total FROM duplicate_log;")
         dup_total = cur.fetchone()['total']
         
-        # Phân bổ duplicate theo giờ
         cur.execute("""
-            SELECT EXTRACT(HOUR FROM created_at) as hour, COUNT(*) as count 
+            SELECT EXTRACT(HOUR FROM detected_at) as hour, COUNT(*) as count 
             FROM duplicate_log 
             GROUP BY hour ORDER BY hour;
-        """)
+        """) # Giả sử dùng detected_at thay vì created_at theo thiết kế storage của bạn
         dup_hourly = cur.fetchall()
         
         metrics['duplicate'] = {
             "total": dup_total,
-            "rate": round((dup_total / total_records) * 100, 2),
-            "hourly_labels": [f"{int(r['hour'])}h" for r in dup_hourly] or ["0h"],
-            "hourly_data": [r['count'] for r in dup_hourly] or [0]
+            "rate": round((dup_total / total_records * 100), 2) if total_records > 0 else 0,
+            "hourly_labels": [f"{int(r['hour'])}h" for r in dup_hourly],
+            "hourly_data": [r['count'] for r in dup_hourly]
         }
 
-        # --- SECTION 4: CONFLICT ---
+        # Section 4: CONFLICT
+        # Đảm bảo bảng conflict_log có cột conflict_type như query này
         cur.execute("""
             SELECT 
                 COUNT(*) FILTER (WHERE conflict_type = 'A') as type_a,
@@ -99,54 +102,52 @@ def fetch_metrics():
         conflict_data = cur.fetchone()
         metrics['conflict'] = {
             "total": conflict_data['total'],
-            "rate": round((conflict_data['total'] / total_records) * 100, 2),
+            "rate": round((conflict_data['total'] / total_records * 100), 2) if total_records > 0 else 0,
             "type_a": conflict_data['type_a'],
             "type_b": conflict_data['type_b'],
             "type_c": conflict_data['type_c']
         }
 
+    
+
         # --- SECTION 5: LATE ARRIVAL ---
-        cur.execute("SELECT COUNT(*) as total FROM invalid_log WHERE error_code = 'ERR_LATE_ARRIVAL';")
+        # SỬA: Không có cột delay_minutes, chúng ta sẽ dùng sự khác biệt giữa event_timestamp và created_at (nếu có) 
+        # hoặc đếm trực tiếp dựa trên error_code
+        cur.execute("""
+            SELECT COUNT(*) as total 
+            FROM invalid_log 
+            WHERE error_code = 'ERR_LATE_ARRIVAL';
+        """)
         late_total = cur.fetchone()['total']
         
-        # Giả lập histogram độ trễ (delay_minutes)
-        cur.execute("""
-            SELECT 
-                CASE 
-                    WHEN delay_minutes <= 5 THEN '0-5m'
-                    WHEN delay_minutes <= 15 THEN '5-15m'
-                    ELSE '>15m'
-                END as bucket, COUNT(*) as count
-            FROM invalid_log WHERE error_code = 'ERR_LATE_ARRIVAL'
-            GROUP BY bucket;
-        """)
-        late_buckets = cur.fetchall()
-        bucket_dict = {b['bucket']: b['count'] for b in late_buckets}
-
+        # Vì schema không có delay_minutes, ta không thể phân loại theo bucket 5-15m được.
+        # Tạm thời trả về count tổng để report không crash.
         metrics['late_arrival'] = {
             "total": late_total,
-            "rate": round((late_total / total_records) * 100, 2),
-            "buckets": ["0-5m", "5-15m", ">15m"],
-            "counts": [bucket_dict.get("0-5m", 0), bucket_dict.get("5-15m", 0), bucket_dict.get(">15m", 0)]
+            "rate": round((late_total / total_records * 100), 2) if total_records > 0 else 0,
+            "buckets": ["Total Late"],
+            "counts": [late_total]
         }
 
         # --- SECTION 6: MISSING FIELD ---
         cur.execute("SELECT COUNT(*) as total FROM invalid_log WHERE error_code = 'ERR_MISSING_FIELD';")
         missing_total = cur.fetchone()['total']
         
+        # SỬA: Dùng 'details' khớp với SELECT phía dưới
         cur.execute("""
-            SELECT missing_field_name, COUNT(*) as count 
+            SELECT details, COUNT(*) as count 
             FROM invalid_log 
             WHERE error_code = 'ERR_MISSING_FIELD'
-            GROUP BY missing_field_name ORDER BY count DESC LIMIT 5;
+            GROUP BY details ORDER BY count DESC LIMIT 5;
         """)
         top_missing = cur.fetchall()
 
+        # SỬA: Trích xuất đúng key 'details' thay vì 'missing_field_name'
         metrics['missing_field'] = {
             "total": missing_total,
-            "rate": round((missing_total / total_records) * 100, 2),
-            "fields": [r['missing_field_name'] for r in top_missing] or ["None"],
-            "counts": [r['count'] for r in top_missing] or [0]
+            "rate": round((missing_total / total_records * 100), 2) if total_records > 0 else 0,
+            "fields": [r['details'] for r in top_missing] if top_missing else ["None"],
+            "counts": [r['count'] for r in top_missing] if top_missing else [0]
         }
 
     except Exception as e:
