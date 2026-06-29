@@ -4,6 +4,8 @@
 > (SIM Swap · Device Swap · Number Verification)  
 > từ dữ liệu **GGSN RADIUS Accounting Request** (RFC 2866 + 3GPP TS 29.061 VSA)
 
+👉 **[Thứ tự Code & Bản đồ Phụ thuộc (BUILD_ORDER.md)](BUILD_ORDER.md)**
+
 ---
 
 ## Mục lục
@@ -479,14 +481,14 @@ API_KEY=dev-secret
 API_PORT=8000
 
 # PostgreSQL
-DB_HOST=localhost
+DB_HOST=postgres
 DB_PORT=5432
 DB_NAME=camara_db
 DB_USER=camara
 DB_PASSWORD=camara
 
 # Kafka
-KAFKA_BOOTSTRAP_SERVERS=localhost:9092
+KAFKA_BOOTSTRAP_SERVERS=camara-kafka:9092
 
 # Pipeline
 LATE_ARRIVAL_THRESHOLD_SECONDS=3600
@@ -509,6 +511,7 @@ SIM_DEFAULT_SUBSCRIBERS=100000
 
 | Tài liệu | Vị trí |
 |----------|--------|
+| Thứ tự Code & Bản đồ Phụ thuộc | [`BUILD_ORDER.md`](BUILD_ORDER.md) |
 | Schema design + so sánh partitioning | [`storage/docs/schema_design.md`](storage/docs/schema_design.md) |
 | OpenAPI – SIM Swap | [`docs/openapi/sim_swap.yaml`](docs/openapi/sim_swap.yaml) |
 | OpenAPI – Device Swap | [`docs/openapi/device_swap.yaml`](docs/openapi/device_swap.yaml) |

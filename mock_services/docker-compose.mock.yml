@@ -1,0 +1,52 @@
+services:
+  gsma-tac:
+    build:
+      context: ..
+      dockerfile: mock_services/gsma_tac/Dockerfile
+    container_name: camara-mock-gsma-tac
+    volumes:
+      - ..:/workspace
+    working_dir: /workspace  # Đảm bảo app chạy từ thư mục gốc
+    ports:
+      - "8100:8100"          # Máy Windows vào qua localhost:8100
+    networks:
+      - camara-network
+    restart: always
+
+  hlr-hss:
+    build:
+      context: ..
+      dockerfile: mock_services/hlr_hss/Dockerfile
+    container_name: camara-mock-hlr-hss
+    volumes:
+      - ..:/workspace
+    working_dir: /workspace
+    ports:
+      - "8200:8100"          # Máy Windows vào qua localhost:8200 (map vào 8100 nội bộ)
+    networks:
+      - camara-network
+    restart: always
+
+  itu-mock:
+    build:
+      context: ..
+      dockerfile: mock_services/itu_e164/Dockerfile
+
+    container_name: camara-mock-itu-mock
+
+    volumes:
+      - ..:/workspace
+
+    working_dir: /workspace
+
+    ports:
+      - "8300:8100"
+
+    networks:
+      - camara-network
+
+    restart: always
+networks:
+  camara-network:
+    external: true
+    name: camara-network

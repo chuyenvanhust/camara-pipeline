@@ -1,0 +1,30 @@
+#docker-compose.test.yml
+networks:
+  camara-test-network:
+    driver: bridge
+
+volumes:
+  test_postgres_data:
+
+services:
+  # Chỉ cần Postgres để chạy Integration Test
+  postgres_test:
+    image: postgres:15-alpine
+    container_name: postgres_test
+    networks:
+      - camara-test-network
+    ports:
+      - "5433:5432"  # Dùng port 5433 để tránh xung đột với Postgres thật (nếu có)
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: camara
+      POSTGRES_DB: camara_db
+    volumes:
+      - ./storage/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d camara_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+ 

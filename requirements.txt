@@ -1,3 +1,19 @@
-pytest 
-pydantic #step1-v2
-psycopg2 #step1-v3
+# requirements.txt
+pytest
+pydantic
+psycopg2-binary
+aiokafka
+kafka-python-ng
+pytest-mock
+asyncpg
+fastapi
+uvicorn
+requests
+altair
+pandas 
+numpy
+python-dotenv
+httpx
+sqlalchemy
+pyspark==3.5.1
+pydantic-settings

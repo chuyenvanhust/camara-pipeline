@@ -1,2 +1,17 @@
 [tool.pytest.ini_options]
 pythonpath = ["."]
+asyncio_mode = "auto"
+asyncio_default_test_loop_scope = "session"
+filterwarnings = [
+    "ignore::DeprecationWarning:starlette.*",
+]
+markers = [
+    "happy_path: happy path test cases",
+    "edge_case: edge case test cases",
+    "pipeline: pipeline unit tests",
+    "late_arrival: late arrival scenario tests",
+    "sim_swap: SIM Swap API tests",
+    "device_swap: Device Swap API tests",
+    "number_verification: Number Verification API tests",
+    "error_handling: error handling tests",
+]

@@ -68,21 +68,21 @@ không phụ thuộc vào pipeline đang chạy.
 | TC05 | test_sim_swap.py | Swap < 1 phút trước → true | edge_case |
 | TC06 | test_sim_swap.py | Swap đúng tại boundary maxAge ngày → true | edge_case |
 | TC07 | test_sim_swap.py | Swap tại maxAge+1 giây → false | edge_case |
-| TC08 | test_sim_swap.py | MSISDN không tồn tại → 404 | edge_case |
+| TC08 | test_sim_swap.py | 200, swapped=false | edge_case |
 | TC09 | test_sim_swap.py | maxAge=0 → false | edge_case |
 | TC10 | test_device_swap.py | IMEI thay đổi 1 ngày trước → true | happy_path |
 | TC11 | test_device_swap.py | IMEI không thay đổi → false | happy_path |
 | TC12 | test_device_swap.py | Swap 35 ngày, maxAge=30 → false | happy_path |
 | TC13 | test_device_swap.py | Swap < 1 phút → true | edge_case |
-| TC14 | test_device_swap.py | MSISDN không tồn tại → 404 | edge_case |
+| TC14 | test_device_swap.py | 200, deviceSwapped=false | edge_case |
 | TC15 | test_device_swap.py | Boundary maxAge chính xác | edge_case |
-| TC16 | test_device_swap.py | phoneNumber format sai → 400 | edge_case |
+| TC16 | test_device_swap.py | phoneNumber format sai → 422 | edge_case |
 | TC17 | test_number_verification.py | Session active trong 24h → verified=true | happy_path |
 | TC18 | test_number_verification.py | Session đã Stop → false | happy_path |
 | TC19 | test_number_verification.py | MSISDN không tồn tại → false (không 404) | happy_path |
 | TC20 | test_number_verification.py | Session Start < 1 phút → true | edge_case |
 | TC21 | test_number_verification.py | Nhiều session active chồng nhau → true | edge_case |
-| TC22 | test_number_verification.py | MSISDN format không hợp lệ → 400 | edge_case |
+| TC22 | test_number_verification.py | MSISDN format không hợp lệ → 422 | edge_case |
 | TC23 | test_deduplication.py | Exact duplicate → 1 giữ, 1 drop | pipeline |
 | TC24 | test_deduplication.py | Cùng session_id nhưng timestamp khác 1ms → cả 2 giữ | pipeline |
 | TC25 | test_deduplication.py | Duplicate đến sau late arrival window → vẫn detect | pipeline, late_arrival |

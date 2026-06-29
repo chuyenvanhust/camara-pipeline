@@ -1,25 +1,64 @@
--- TODO 1.1: Tạo Extension pgcrypto (nếu cần dùng UUID làm ID sự kiện)
+-- storage/migrations/001_init_schema.sql
+
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
--- TODO 1.2: Định nghĩa bảng 'sim_swap_events' sử dụng Declarative Partitioning theo thời gian (BY RANGE)
--- Bảng này bắt buộc phải chứa các trường: id, phone_number (chuẩn E.164), event_timestamp, v.v.
-CREATE TABLE sim_swap_events (
-    id UUID DEFAULT gen_random_uuid(),
-    phone_number VARCHAR(15) NOT NULL,
-    event_timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
-    status VARCHAR(50),
-    -- Lưu ý: Trong Declarative Partitioning, mọi ràng buộc UNIQUE/PRIMARY KEY 
-    -- bắt buộc phải bao gồm cả cột phân vùng (event_timestamp)
+-- 1. radius_sessions — partitioned, surrogate PK để cho phép
+--    nhiều record (Start/Stop/Interim) cùng acct_session_id
+CREATE TABLE IF NOT EXISTS radius_sessions (
+    id               BIGSERIAL,
+    acct_session_id  TEXT NOT NULL,
+    acct_status_type VARCHAR(16),
+    event_timestamp  TIMESTAMPTZ NOT NULL,
+    ingest_timestamp TIMESTAMPTZ DEFAULT NOW(),
+    msisdn           VARCHAR(16),
+    imsi             CHAR(15),
+    imei             CHAR(15),
+    rat_type         VARCHAR(8),
+    framed_ip        INET,
+    nas_ip           INET,
+    mcc_mnc          CHAR(6),
+    late_arrival     BOOLEAN DEFAULT FALSE,
     PRIMARY KEY (id, event_timestamp)
 ) PARTITION BY RANGE (event_timestamp);
 
--- TODO 1.3: Định nghĩa bảng 'device_swap_events' phân vùng theo thời gian (BY RANGE)
--- Bảng này bắt buộc chứa các trường tương tự và bổ sung trường 'imei' (15 chữ số).
-CREATE TABLE device_swap_events (
-    id UUID DEFAULT gen_random_uuid(),
-    phone_number VARCHAR(15) NOT NULL,
-    imei VARCHAR(15) NOT NULL,
-    event_timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
-    status VARCHAR(50),
-    PRIMARY KEY (id, event_timestamp)
-) PARTITION BY RANGE (event_timestamp);
+-- 2. swap_event
+CREATE TABLE IF NOT EXISTS swap_event (
+    id           BIGSERIAL PRIMARY KEY,
+    msisdn       VARCHAR(16),
+    old_imsi     CHAR(15),
+    new_imsi     CHAR(15),
+    old_imei     CHAR(15),
+    new_imei     CHAR(15),
+    imei         CHAR(15),
+    swap_type    VARCHAR(16),
+    detected_at  TIMESTAMPTZ,
+    confirmed_at TIMESTAMPTZ,
+    source       VARCHAR(32)
+);
+
+-- 3. duplicate_log
+CREATE TABLE IF NOT EXISTS duplicate_log (
+    id          SERIAL PRIMARY KEY,
+    session_id  TEXT NOT NULL,
+    detected_at TIMESTAMPTZ DEFAULT NOW(),
+    reason      VARCHAR(50)
+);
+
+-- 4. conflict_log
+CREATE TABLE IF NOT EXISTS conflict_log (
+    id            SERIAL PRIMARY KEY,
+    session_id    TEXT NOT NULL,
+    conflict_type VARCHAR(10) NOT NULL,
+    details       TEXT,
+    error_code      VARCHAR(50)
+);
+
+-- 5. invalid_log
+CREATE TABLE IF NOT EXISTS invalid_log (
+    id         SERIAL PRIMARY KEY,
+    session_id TEXT,
+    msisdn     VARCHAR(20),
+    error_code VARCHAR(50) NOT NULL,
+    details    TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);

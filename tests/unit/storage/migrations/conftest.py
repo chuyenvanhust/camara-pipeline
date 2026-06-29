@@ -7,7 +7,7 @@ def db_connection():
     """ Fixture khởi tạo kết nối tới Postgres Docker Test """
     # Đọc cấu hình từ biến môi trường hoặc dùng mặc định của Container đơn lẻ
     conn = psycopg2.connect(
-        host=os.getenv("DB_HOST", "localhost"),
+        host=os.getenv("DB_HOST", "postgres"),
         database=os.getenv("DB_NAME", "camara_network"),
         user=os.getenv("DB_USER", "postgres"),
         password=os.getenv("DB_PASSWORD", "postgres"),

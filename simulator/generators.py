@@ -3,7 +3,7 @@ import requests
 from typing import List, Dict
 
 class RadiusDataGenerator:
-    def __init__(self, seed: int = 42, gsma_url: str = "http://localhost:8100"):
+    def __init__(self, seed: int = 42, gsma_url: str = "http://camara-mock-gsma-tac:8100"):
         self.seed = seed
         self.gsma_url = gsma_url
         self.tac_pool: List[str] = []

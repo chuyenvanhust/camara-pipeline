@@ -1,0 +1,163 @@
+#docker-compose.yml
+networks:
+  camara-network:
+    name: camara-network
+    driver: bridge
+    external: true
+
+volumes:
+  postgres_data:
+  grafana_data:
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: camara-zookeeper
+    networks:
+      - camara-network
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 2181 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: camara-kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    networks:
+      - camara-network
+    ports:
+      - "9092:9092"
+      - "29092:29092" # Thêm cổng này
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: camara-zookeeper:2181
+      # Sửa lại phần này:
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://camara-kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+      start_period: 15s
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: camara-postgres
+    networks:
+      - camara-network
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: camara
+      POSTGRES_DB: camara_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d camara_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  fastapi:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    container_name: fastapi-app
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - camara-network
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://postgres:camara@camara-postgres:5432/camara_db
+      - DB_HOST=camara-postgres
+      - DB_PORT=5432
+      - DB_USER=postgres
+      - DB_PASSWORD=camara
+      - DB_NAME=camara_db
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  spark-master:
+    build:
+      context: .
+      dockerfile: spark/Dockerfile
+    container_name: camara-spark-master
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - camara-network
+    volumes:
+      - .:/workspace
+    ports:
+      - "4040:4040"
+      - "7077:7077"
+      - "8080:8080" # Thêm cổng này để truy cập Master Web UI
+    environment:
+      - SPARK_MODE=master
+    # Thay đổi lệnh CMD ở đây để cho phép khởi động linh hoạt hơn nếu cần
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master", "--host", "0.0.0.0", "--port", "7077"]
+
+  spark-worker:
+    build:
+      context: .
+      dockerfile: spark/Dockerfile
+    container_name: camara-spark-worker
+    depends_on:
+      - spark-master
+    networks:
+      - camara-network
+    volumes:
+      - .:/workspace
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://camara-spark-master:7077
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://camara-spark-master:7077"]
+
+  prometheus:
+    image: prom/prometheus:v2.45.0
+    container_name: camara-prometheus
+    depends_on:
+      - fastapi
+    networks:
+      - camara-network
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+
+  grafana:
+    image: grafana/grafana:10.0.0
+    container_name: camara-grafana
+    depends_on:
+      - prometheus
+    networks:
+      - camara-network
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./infra/grafana/dashboards/pipeline_dashboard.json:/var/lib/grafana/dashboards/pipeline_dashboard.json
+      - ./infra/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources

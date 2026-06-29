@@ -1,9 +1,10 @@
+#mock_services\gsma_tac\seed.py
 import os
 import csv
 import random
 import argparse
 from typing import Dict
-from mock_services.gsma_tac.models import TacRecord
+from .models import TacRecord
 
 # In-memory DB toàn cục
 TAC_IN_MEMORY_DB: Dict[str, TacRecord] = {}

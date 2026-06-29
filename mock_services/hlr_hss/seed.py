@@ -5,9 +5,12 @@ import random
 from datetime import datetime, timedelta
 from typing import Dict, List
 
+
 # In-memory RAM database để định tuyến siêu tốc O(1)
-SUBSCRIBERS_BY_IMSI: Dict[str, dict] = {}
-SUBSCRIBERS_BY_MSISDN: Dict[str, dict] = {}
+# SUBSCRIBERS_BY_IMSI: mỗi IMSI có thể có nhiều dòng lịch sử (number portability:
+# 1 IMSI gắn nhiều MSISDN theo thời gian) -> giữ List để build msisdn-history.
+SUBSCRIBERS_BY_IMSI: Dict[str, List[dict]] = {}
+SUBSCRIBERS_BY_MSISDN: Dict[str, List[dict]] = {}
 
 def generate_mock_subscribers_csv(output_path: str, count: int, seed_value: int):
     """Sinh file dữ liệu subscribers.csv đồng bộ giả lập dựa trên seed cố định"""
@@ -17,7 +20,7 @@ def generate_mock_subscribers_csv(output_path: str, count: int, seed_value: int)
     headers = [
         "imsi", "msisdn", "status", "mcc", "mnc", "operator",
         "data_enabled", "roaming_enabled", "volte_enabled",
-        "registered_at", "last_updated", "swap_reason"
+        "registered_at", "last_updated"
     ]
     
     base_time = datetime(2022, 1, 1, 8, 0, 0)
@@ -36,10 +39,11 @@ def generate_mock_subscribers_csv(output_path: str, count: int, seed_value: int)
             writer.writerow([
                 imsi, msisdn, "active", "452", "01", "Viettel",
                 "true", "false", "true",
-                reg_date.isoformat() + "Z", up_date.isoformat() + "Z", "initial_activation"
+                reg_date.isoformat() + "Z", up_date.isoformat() + "Z"
             ])
             
             # Tạo hiệu ứng SIM Swap ngẫu nhiên (khoảng 2% dữ liệu)
+            # -> cùng MSISDN, IMSI mới. Phục vụ /subscribers/{msisdn}/imsi-history
             if random.random() < 0.02:
                 swap_imsi = f"4520109{i:08d}"  # IMSI mới
                 swap_date = up_date + timedelta(days=random.randint(30, 180))
@@ -47,7 +51,19 @@ def generate_mock_subscribers_csv(output_path: str, count: int, seed_value: int)
                 writer.writerow([
                     swap_imsi, msisdn, "active", "452", "01", "Viettel",
                     "true", "false", "true",
-                    swap_date.isoformat() + "Z", swap_date.isoformat() + "Z", "customer_request"
+                    swap_date.isoformat() + "Z", swap_date.isoformat() + "Z"
+                ])
+
+            # Tạo hiệu ứng Number Portability ngẫu nhiên (khoảng 2% dữ liệu, độc lập SIM Swap)
+            # -> cùng IMSI, MSISDN mới. Phục vụ /subscribers/{imsi}/msisdn-history
+            if random.random() < 0.02:
+                ported_msisdn = f"+8498{i:07d}"  # MSISDN mới, prefix 98 tránh đụng prefix 97 gốc
+                port_date = up_date + timedelta(days=random.randint(30, 180))
+                # Bản ghi porting gán IMSI cũ sang MSISDN mới
+                writer.writerow([
+                    imsi, ported_msisdn, "active", "452", "01", "Viettel",
+                    "true", "false", "true",
+                    port_date.isoformat() + "Z", port_date.isoformat() + "Z"
                 ])
 
 def load_subscribers_to_memory(file_path: str = "mock_services/hlr_hss/data/subscribers.csv"):
@@ -79,12 +95,13 @@ def load_subscribers_to_memory(file_path: str = "mock_services/hlr_hss/data/subs
                     "volte_enabled": row["volte_enabled"].lower() == "true",
                 },
                 "registered_at": row["registered_at"],
-                "last_updated": row["last_updated"],
-                "swap_reason": row.get("swap_reason", "initial_activation")
+                "last_updated": row["last_updated"]
             }
             
-            # Nạp bảng tra cứu IMSI (Độc nhất)
-            SUBSCRIBERS_BY_IMSI[imsi] = profile
+            # Nạp bảng tra cứu IMSI (Có thể chứa danh sách lịch sử number portability)
+            if imsi not in SUBSCRIBERS_BY_IMSI:
+                SUBSCRIBERS_BY_IMSI[imsi] = []
+            SUBSCRIBERS_BY_IMSI[imsi].append(profile)
             
             # Nạp bảng tra cứu MSISDN (Có thể chứa danh sách lịch sử swap)
             if msisdn not in SUBSCRIBERS_BY_MSISDN:

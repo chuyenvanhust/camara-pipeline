@@ -27,3 +27,23 @@ docker build -f mock_services/itu_e164/Dockerfile -t camara/itu-e164-mock:latest
 phase 3
 
 pytest tests/unit/simulator -v
+
+
+phase 4:
+1.
+docker compose -f mock_services/docker-compose.mock.yml up -d
+pytest tests/unit/pipeline/ingestion -v
+
+2.
+pytest tests/unit/pipeline/validation -v
+3.
+pytest tests\unit\pipeline\deduplication -v
+4.
+
+
+
+6.
+python reporting/quality_report.py
+
+
+docker compose up -d --build fastapi

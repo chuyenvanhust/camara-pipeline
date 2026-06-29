@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Data Quality Report - CAMARA Pipeline</title>
+    <script src="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body class="bg-gray-100 text-gray-800 font-sans">
+
+    <header class="bg-indigo-700 text-white p-6 shadow-md">
+        <div class="container mx-auto flex justify-between items-center">
+            <div>
+                <h1 class="text-3xl font-bold tracking-tight">CAMARA Data Quality Report</h1>
+                <p class="text-sm text-indigo-200 mt-1">Automated Pipeline Execution Analytics</p>
+            </div>
+            <div class="text-right text-sm">
+                <p>Run Time: <span class="font-mono bg-indigo-800 px-2 py-1 rounded">2026-06-25 14:00:48</span></p>
+            </div>
+        </div>
+    </header>
+
+    <main class="container mx-auto px-4 py-8">
+
+        <section class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+            <div class="bg-white p-6 rounded-lg shadow border-l-4 border-blue-500">
+                <h3 class="text-gray-500 text-sm font-medium uppercase">Total Processed Records</h3>
+                <p class="text-3xl font-bold mt-2 text-gray-900">125,000</p>
+            </div>
+            <div class="bg-white p-6 rounded-lg shadow border-l-4 border-green-500">
+                <h3 class="text-gray-500 text-sm font-medium uppercase">Execution Duration</h3>
+                <p class="text-3xl font-bold mt-2 text-gray-900">45 seconds</p>
+            </div>
+            <div class="bg-white p-6 rounded-lg shadow border-l-4 border-purple-500">
+                <h3 class="text-gray-500 text-sm font-medium uppercase">Avg Throughput</h3>
+                <p class="text-3xl font-bold mt-2 text-gray-900">2777.78 <span class="text-sm text-gray-500">rec/s</span></p>
+            </div>
+        </section>
+
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+
+            <div class="bg-white p-6 rounded-lg shadow">
+                <div class="flex justify-between items-center mb-4">
+                    <h2 class="text-xl font-bold text-gray-800">1. Invalid IMEI Distribution</h2>
+                    <span class="bg-red-100 text-red-800 text-xs font-semibold px-2.5 py-0.5 rounded">Rate: 1.0%</span>
+                </div>
+                <div style="max-height: 250px;" class="flex justify-center">
+                    <canvas id="imeiChart"></canvas>
+                </div>
+                <p class="text-sm text-gray-500 mt-4 text-center">Total Invalid IMEI Logs: <strong>1250</strong> records</p>
+            </div>
+
+            <div class="bg-white p-6 rounded-lg shadow">
+                <div class="flex justify-between items-center mb-4">
+                    <h2 class="text-xl font-bold text-gray-800">2. Duplicate Distribution (Hourly)</h2>
+                    <span class="bg-yellow-100 text-yellow-800 text-xs font-semibold px-2.5 py-0.5 rounded">Rate: 2.5%</span>
+                </div>
+                <div>
+                    <canvas id="duplicateChart"></canvas>
+                </div>
+            </div>
+
+            <div class="bg-white p-6 rounded-lg shadow">
+                <div class="flex justify-between items-center mb-4">
+                    <h2 class="text-xl font-bold text-gray-800">3. Conflict Type Distribution</h2>
+                    <span class="bg-indigo-100 text-indigo-800 text-xs font-semibold px-2.5 py-0.5 rounded">Rate: 0.36%</span>
+                </div>
+                <div style="max-height: 250px;" class="flex justify-center">
+                    <canvas id="conflictChart"></canvas>
+                </div>
+                <div class="grid grid-cols-3 text-center mt-4 text-xs font-mono text-gray-600">
+                    <div>Type A: 200</div>
+                    <div>Type B: 150</div>
+                    <div>Type C: 100</div>
+                </div>
+            </div>
+
+            <div class="bg-white p-6 rounded-lg shadow">
+                <div class="flex justify-between items-center mb-4">
+                    <h2 class="text-xl font-bold text-gray-800">4. Late Arrival Latency Histogram</h2>
+                    <span class="bg-pink-100 text-pink-800 text-xs font-semibold px-2.5 py-0.5 rounded">Rate: 1.48%</span>
+                </div>
+                <div>
+                    <canvas id="lateArrivalChart"></canvas>
+                </div>
+            </div>
+
+            <div class="bg-white p-6 rounded-lg shadow lg:col-span-2">
+                <div class="flex justify-between items-center mb-4">
+                    <h2 class="text-xl font-bold text-gray-800">5. Missing Fields Top Breakdown</h2>
+                    <span class="bg-gray-100 text-gray-800 text-xs font-semibold px-2.5 py-0.5 rounded">Rate: 0.5%</span>
+                </div>
+                <div class="flex flex-col md:flex-row gap-6 items-center">
+                    <div class="w-full md:w-1/2">
+                        <canvas id="missingFieldChart"></canvas>
+                    </div>
+                    <div class="w-full md:w-1/2">
+                        <table class="min-w-full divide-y divide-gray-200 text-sm">
+                            <thead class="bg-gray-50">
+                                <tr>
+                                    <th class="px-4 py-2 text-left font-medium text-gray-500 uppercase">Field Name</th>
+                                    <th class="px-4 py-2 text-right font-medium text-gray-500 uppercase">Error Count</th>
+                                </tr>
+                            </thead>
+                            <tbody class="divide-y divide-gray-200 font-mono">
+                                
+                                <tr>
+                                    <td class="px-4 py-2 text-indigo-600 font-bold">msisdn</td>
+                                    <td class="px-4 py-2 text-right text-gray-900">350</td>
+                                </tr>
+                                
+                                <tr>
+                                    <td class="px-4 py-2 text-indigo-600 font-bold">framed_ip</td>
+                                    <td class="px-4 py-2 text-right text-gray-900">200</td>
+                                </tr>
+                                
+                                <tr>
+                                    <td class="px-4 py-2 text-indigo-600 font-bold">imei</td>
+                                    <td class="px-4 py-2 text-right text-gray-900">70</td>
+                                </tr>
+                                
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+    </main>
+
+    <script>
+        // 1. IMEI Chart
+        new Chart(document.getElementById('imeiChart'), {
+            type: 'doughnut',
+            data: {
+                labels: ['Luhn Check Fail', 'TAC Unknown'],
+                datasets: [{
+                    data: [850, 400],
+                    backgroundColor: ['#EF4444', '#F59E0B']
+                }]
+            },
+            options: { responsive: true }
+        });
+
+        // 2. Duplicate Hourly Chart
+        new Chart(document.getElementById('duplicateChart'), {
+            type: 'line',
+            data: {
+                labels: ["08h", "09h", "10h", "11h"],
+                datasets: [{
+                    label: 'Duplicates Count',
+                    data: [500, 1200, 920, 500],
+                    borderColor: '#10B981',
+                    backgroundColor: 'rgba(16, 185, 129, 0.1)',
+                    fill: true,
+                    tension: 0.3
+                }]
+            }
+        });
+
+        // 3. Conflict Type Chart
+        new Chart(document.getElementById('conflictChart'), {
+            type: 'pie',
+            data: {
+                labels: ['Type A', 'Type B', 'Type C'],
+                datasets: [{
+                    data: [200, 150, 100],
+                    backgroundColor: ['#6366F1', '#3B82F6', '#EC4899']
+                }]
+            }
+        });
+
+        // 4. Late Arrival Histogram
+        new Chart(document.getElementById('lateArrivalChart'), {
+            type: 'bar',
+            data: {
+                labels: ["0-5m", "5-15m", "\u003e15m"],
+                datasets: [{
+                    label: 'Records',
+                    data: [1200, 500, 150],
+                    backgroundColor: '#F43F5E'
+                }]
+            }
+        });
+
+        // 5. Missing Field Top Chart
+        new Chart(document.getElementById('missingFieldChart'), {
+            type: 'bar',
+            data: {
+                labels: ["msisdn", "framed_ip", "imei"],
+                datasets: [{
+                    label: 'Missing Count',
+                    data: [350, 200, 70],
+                    backgroundColor: '#6B7280'
+                }]
+            },
+            options: { indexAxis: 'y' }
+        });
+    </script>
+</body>
+</html>
