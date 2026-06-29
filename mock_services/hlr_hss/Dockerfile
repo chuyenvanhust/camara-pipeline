@@ -19,4 +19,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY mock_services/shared/ /workspace/mock_services/shared/
 COPY mock_services/hlr_hss/ /workspace/mock_services/hlr_hss/
 
-CMD ["python", "-m", "uvicorn", "mock_services.hlr_hss.app:app", "--host", "0.0.0.0", "--port", "8100"]
+CMD ["python", "-m", "uvicorn", "mock_services.hlr_hss.app:app", "--host", "0.0.0.0", "--port", "8200"]

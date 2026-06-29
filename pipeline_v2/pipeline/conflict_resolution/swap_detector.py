@@ -8,7 +8,7 @@ class SwapDetector:
     Module phụ trách xử lý hậu kỳ riêng cho Conflict loại C.
     Chứa các logic nghiệp vụ tương tác Network/API I/O: Gọi HLR/HSS Mock và đối chiếu DB PostgreSQL.
     """
-    def __init__(self, hlr_mock_url: str = "http://camara-mock-hlr-hss:8100", db_connection=None):
+    def __init__(self, hlr_mock_url: str = "http://camara-mock-hlr-hss:8200", db_connection=None):
         self.hlr_url = hlr_mock_url
         self.db = db_connection
 

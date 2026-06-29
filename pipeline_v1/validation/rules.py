@@ -35,8 +35,8 @@ class ValidationResult:
 
 
 # Cau hinh Endpoints tu moi truong (xem mock_services/README.md)
-ITU_E164_SERVICE_URL = os.getenv("ITU_E164_SERVICE_URL", "http://camara-mock-itu-mock:8100")
-HLR_HSS_SERVICE_URL = os.getenv("HLR_HSS_SERVICE_URL", "http://camara-mock-hlr-hss:8100")
+ITU_E164_SERVICE_URL = os.getenv("ITU_E164_SERVICE_URL", "http://camara-mock-itu-e164:8300")
+HLR_HSS_SERVICE_URL = os.getenv("HLR_HSS_SERVICE_URL", "http://camara-mock-hlr-hss:8200")
 GSMA_TAC_SERVICE_URL = os.getenv("GSMA_TAC_SERVICE_URL", "http://camara-mock-gsma-tac:8100")
 
 # --- HA TANG RESILIENCE (RETRY BACKOFF & CIRCUIT BREAKER) ---

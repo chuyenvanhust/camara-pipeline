@@ -23,7 +23,7 @@ services:
       - ..:/workspace
     working_dir: /workspace
     ports:
-      - "8200:8100"          # Máy Windows vào qua localhost:8200 (map vào 8100 nội bộ)
+      - "8200:8200"          # Máy Windows vào qua localhost:8200 (map vào 8100 nội bộ)
     networks:
       - camara-network
     restart: always
@@ -33,7 +33,7 @@ services:
       context: ..
       dockerfile: mock_services/itu_e164/Dockerfile
 
-    container_name: camara-mock-itu-mock
+    container_name: camara-mock-itu-e164
 
     volumes:
       - ..:/workspace
@@ -41,7 +41,7 @@ services:
     working_dir: /workspace
 
     ports:
-      - "8300:8100"
+      - "8300:8300"
 
     networks:
       - camara-network

@@ -35,8 +35,8 @@ class ValidationResult:
 
 
 # Cau hinh Endpoints tu moi truong (xem mock_services/README.md)
-ITU_E164_SERVICE_URL = os.getenv("ITU_E164_SERVICE_URL", "http://camara-mock-itu-mock:8100")
-HLR_HSS_SERVICE_URL = os.getenv("HLR_HSS_SERVICE_URL", "http://camara-mock-hlr-hss:8100")
+ITU_E164_SERVICE_URL = os.getenv("ITU_E164_SERVICE_URL", "http://camara-mock-itu-e164:8300")
+HLR_HSS_SERVICE_URL = os.getenv("HLR_HSS_SERVICE_URL", "http://camara-mock-hlr-hss:8200")
 GSMA_TAC_SERVICE_URL = os.getenv("GSMA_TAC_SERVICE_URL", "http://camara-mock-gsma-tac:8100")
 
 # --- HA TANG RESILIENCE (RETRY BACKOFF & CIRCUIT BREAKER) ---
@@ -172,7 +172,7 @@ async def validate_msisdn_format(record: Dict[str, Any], client: httpx.AsyncClie
         return ValidationResult(is_valid=False, error_code="ERR_INVALID_MSISDN", error_message="Violate E.164 regex")
 
     url = f"{ITU_E164_SERVICE_URL}/validate"
-    res, err = await invoke_external_api_with_resilience("ITU_E164", client, "POST", url, json={"msisdn": msisdn})
+    res, err = await invoke_external_api_with_resilience("ITU_E164", client, "POST", url, json={"phone_number": msisdn})
 
     if err == "WARN_RULE_BYPASSED":
         return ValidationResult(is_valid=True, warn_code="WARN_RULE_BYPASSED")
@@ -207,7 +207,7 @@ async def validate_imsi_in_hlr(record: Dict[str, Any], client: httpx.AsyncClient
     if err:
         return ValidationResult(is_valid=False, error_code=err, error_message="HLR service unavailable")
 
-    if res.status_code == 200 and res.json().get("exists") is True:
+    if res.status_code == 200:
         return ValidationResult(is_valid=True)
     return ValidationResult(is_valid=False, error_code="ERR_IMSI_NOT_IN_HLR", error_message="IMSI not found in HLR")
 
@@ -268,10 +268,9 @@ async def validate_imei_tac(record: Dict[str, Any], client: httpx.AsyncClient) -
     if err:
         return ValidationResult(is_valid=False, error_code=err, error_message="GSMA service unavailable")
 
-    if res.status_code == 200 and res.json().get("exists") is True:
+    if res.status_code == 200:
         return ValidationResult(is_valid=True)
     return ValidationResult(is_valid=False, error_code="ERR_IMEI_TAC_UNKNOWN", error_message="Unknown TAC")
-
 
 # ==============================================================================
 # RULE 5: acct_status_type in {Start, Stop, Interim-Update}
@@ -290,23 +289,18 @@ async def validate_acct_status_type(record: Dict[str, Any]) -> ValidationResult:
 # ==============================================================================
 # RULE 6: event_timestamp trong khoang hop le
 # ==============================================================================
-async def validate_event_timestamp(record: Dict[str, Any]) -> ValidationResult:
-    """R6: event_timestamp phai la Unix timestamp (giay) hop le, nam
-    trong [2000-01-01, 2100-01-01) -- tuong duong
-    [946684800, 4102444800).
+from datetime import datetime, timezone
 
-    Returns:
-        ERR_INVALID_TIMESTAMP neu khong parse duoc int hoac ngoai
-        khoang; nguoc lai is_valid=True.
-    """
+async def validate_event_timestamp(record):
+    raw = str(record.get("event_timestamp", "")).strip()
     try:
-        ts = int(str(record.get("event_timestamp", "")).strip())
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        ts = int(dt.timestamp())
         if not (946684800 <= ts <= 4102444800):
             return ValidationResult(is_valid=False, error_code="ERR_INVALID_TIMESTAMP", error_message="Timestamp out of bounds")
         return ValidationResult(is_valid=True)
-    except ValueError:
-        return ValidationResult(is_valid=False, error_code="ERR_INVALID_TIMESTAMP", error_message="Timestamp is not int")
-
+    except (ValueError, TypeError):
+        return ValidationResult(is_valid=False, error_code="ERR_INVALID_TIMESTAMP", error_message="Timestamp is not ISO-8601")
 
 # ==============================================================================
 # DONG CO DIEU PHOI CHUOI TUAN TU (ORCHESTRATOR)

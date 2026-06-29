@@ -38,9 +38,7 @@ case "$1" in
         docker exec -e PYTHONPATH=. -w /workspace camara-mock-gsma-tac python -m mock_services.gsma_tac.seed --count 2000 --seed 42 || { echo "Lỗi seed GSMA"; exit 1; }
         docker exec -e PYTHONPATH=. -w /workspace camara-mock-hlr-hss python -m mock_services.hlr_hss.seed --count 100000 --seed 42 || { echo "Lỗi seed HLR"; exit 1; }
         
-        # Nếu ITU cần container riêng, hãy chắc chắn đã thêm vào docker-compose.mock.yml
-        # Nếu ITU chạy trong gsma-tac:
-        docker exec -e PYTHONPATH=. -w /workspace camara-mock-gsma-tac python -m mock_services.itu_e164.seed || { echo "Lỗi seed ITU"; exit 1; }
+        docker exec -e PYTHONPATH=. -w /workspace camara-mock-itu-e164 python -m mock_services.itu_e164.seed --count 2000 --seed 42 || { echo "Lỗi seed ITU"; exit 1; }
         
         echo ">>> Seeding thành công."
         ;;

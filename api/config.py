@@ -47,6 +47,6 @@ settings = Settings(
     ),
     db_pool_size=int(os.getenv("DB_POOL_SIZE", "10")),
     gsma_tac_api_url=os.getenv("GSMA_TAC_API_URL", "http://camara-mock-gsma-tac:8100"),
-    hlr_hss_api_url=os.getenv("HLR_HSS_API_URL", "http://camara-mock-hlr-hss:8100"),
-    itu_e164_api_url=os.getenv("ITU_E164_API_URL", "http://camara-mock-itu-mock:8100"),
+    hlr_hss_api_url=os.getenv("HLR_HSS_API_URL", "http://camara-mock-hlr-hss:8200"),
+    itu_e164_api_url=os.getenv("ITU_E164_API_URL", "http://camara-mock-itu-e164:8300"),
 )
