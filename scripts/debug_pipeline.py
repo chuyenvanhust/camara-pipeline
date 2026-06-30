@@ -4,7 +4,7 @@ debug_pipeline.py — Chạy toàn bộ validation pipeline trên CSV thật,
 log chi tiết từng record, từng rule, từng HTTP call.
 
 Cách chạy (trong spark-master container hoặc máy host có đủ deps):
-  python3 scripts/debug_pipeline.py --csv data/radius_log.csv
+  python scripts/debug_pipeline.py --csv data/radius_log.csv
 
 Options:
   --csv PATH         Đường dẫn tới radius_log.csv (bắt buộc)
@@ -48,9 +48,9 @@ def info(s): return f"{CYAN}  {s}{RESET}"
 # ─────────────────────────────────────────────────────────────
 # Config (overridable via CLI)
 # ─────────────────────────────────────────────────────────────
-ITU_URL  = os.getenv("ITU_E164_SERVICE_URL",  "http://camara-mock-itu-e164:8300")
-HLR_URL  = os.getenv("HLR_HSS_SERVICE_URL",   "http://camara-mock-hlr-hss:8200")
-GSMA_URL = os.getenv("GSMA_TAC_SERVICE_URL",  "http://camara-mock-gsma-tac:8100")
+ITU_URL  = "http://localhost:8300"
+HLR_URL  = "http://localhost:8200"
+GSMA_URL = "http://localhost:8100"
 TIMEOUT  = 2.0
 
 # ─────────────────────────────────────────────────────────────

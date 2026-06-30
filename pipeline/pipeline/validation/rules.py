@@ -15,7 +15,8 @@ import httpx
 import asyncio
 from typing import Tuple, Optional, Dict, Any
 from dataclasses import dataclass
-
+TAC_CACHE = {}
+IMSI_CACHE = {}
 
 @dataclass
 class ValidationResult:
@@ -42,7 +43,7 @@ GSMA_TAC_SERVICE_URL = os.getenv("GSMA_TAC_SERVICE_URL", "http://camara-mock-gsm
 # --- HA TANG RESILIENCE (RETRY BACKOFF & CIRCUIT BREAKER) ---
 
 #: So lan fail lien tiep toi da truoc khi circuit breaker mo (Open)
-CIRCUIT_BREAKER_LIMIT = 5
+CIRCUIT_BREAKER_LIMIT = 100
 
 #: Bo dem fail hien tai cho moi mock service. Reset ve 0 khi 1 request
 #: thanh cong (ke ca khi response la loi nghiep vu 400/404 -- van la
@@ -98,9 +99,9 @@ async def invoke_external_api_with_resilience(
 
     try:
         if method.upper() == "POST":
-            response = await client.post(url, timeout=0.5, **kwargs)
+            response = await client.post(url, timeout=5.0, **kwargs)
         else:
-            response = await client.get(url, timeout=0.5, **kwargs)
+            response = await client.get(url, timeout=5.0, **kwargs)
 
         failed_counters[service_key] = 0
         return response, None
@@ -161,7 +162,7 @@ async def validate_msisdn_format(record: Dict[str, Any], client: httpx.AsyncClie
         return ValidationResult(is_valid=False, error_code="ERR_INVALID_MSISDN", error_message="Violate E.164 regex")
 
     url = f"{ITU_E164_SERVICE_URL}/validate"
-    res, err = await invoke_external_api_with_resilience("ITU_E164", client, "POST", url, json={"msisdn": msisdn})
+    res, err = await invoke_external_api_with_resilience("ITU_E164", client, "POST", url, json={"phone_number": msisdn})
 
     if err == "WARN_RULE_BYPASSED":
         return ValidationResult(is_valid=True, warn_code="WARN_RULE_BYPASSED")
@@ -177,89 +178,98 @@ async def validate_msisdn_format(record: Dict[str, Any], client: httpx.AsyncClie
 # RULE 3: IMSI ton tai trong HLR
 # ==============================================================================
 async def validate_imsi_in_hlr(record: Dict[str, Any], client: httpx.AsyncClient) -> ValidationResult:
-    """R3: goi HLR/HSS Mock API (GET /subscribers/by-imsi/{imsi}) de
-    xac nhan IMSI ton tai trong subscriber registry.
-
-    Returns:
-        - ERR_IMSI_NOT_IN_HLR neu mock tra exists=False hoac 404.
-        - WARN_RULE_BYPASSED (is_valid=True) neu circuit breaker mo.
-        - ERR_EXTERNAL_* neu mock service loi ha tang.
-        - is_valid=True neu mock tra exists=True.
-    """
     imsi = str(record.get("imsi", "")).strip()
-    url = f"{HLR_HSS_SERVICE_URL}/subscribers/by-imsi/{imsi}"
+    
+    # 1. Kiểm tra Cache
+    if imsi in IMSI_CACHE:
+        return IMSI_CACHE[imsi]
 
+    url = f"{HLR_HSS_SERVICE_URL}/subscribers/by-imsi/{imsi}"
     res, err = await invoke_external_api_with_resilience("HLR_HSS", client, "GET", url)
 
+    # 2. Xử lý lỗi hạ tầng (Infrastructure Errors)
+    # Nếu là lỗi mạng/timeout, trả về ngay và KHÔNG cache
+    if err in ["ERR_EXTERNAL_TIMEOUT", "ERR_EXTERNAL_CONN_FAIL"]:
+        return ValidationResult(
+            is_valid=False, 
+            error_code=err, 
+            error_message="HLR service unavailable due to infrastructure error"
+        )
+    
+    # Nếu Circuit Breaker mở (Bypass)
     if err == "WARN_RULE_BYPASSED":
         return ValidationResult(is_valid=True, warn_code="WARN_RULE_BYPASSED")
-    if err:
-        return ValidationResult(is_valid=False, error_code=err, error_message="HLR service unavailable")
 
-    if res.status_code == 200 and res.json().get("exists") is True:
-        return ValidationResult(is_valid=True)
-    return ValidationResult(is_valid=False, error_code="ERR_IMSI_NOT_IN_HLR", error_message="IMSI not found in HLR")
-
+    # 3. Xử lý kết quả nghiệp vụ (Business Logic)
+    # Kiểm tra status code và dữ liệu trả về
+    if res and res.status_code == 200 and res.json().get("exists") is True:
+        result = ValidationResult(is_valid=True)
+        IMSI_CACHE[imsi] = result  # Cache kết quả hợp lệ
+        return result
+    
+    # 4. Nếu 404 hoặc exists=False -> Đây mới là lỗi nghiệp vụ (Dữ liệu không tồn tại)
+    result = ValidationResult(
+        is_valid=False, 
+        error_code="ERR_IMSI_NOT_IN_HLR", 
+        error_message="IMSI not found in HLR"
+    )
+    IMSI_CACHE[imsi] = result # Cache lỗi nghiệp vụ để tránh gọi lại request vô ích
+    return result
 
 # ==============================================================================
 # RULE 4a: IMEI pass Luhn algorithm
 # ==============================================================================
 async def validate_imei_luhn(record: Dict[str, Any]) -> ValidationResult:
-    """R4a: kiem tra IMEI dung 15 chu so va pass Luhn checksum.
-
-    Thuat toan: voi 14 chu so dau (index 0-13), nhan doi gia tri tai
-    cac vi tri le (index 1,3,5,...), neu > 9 thi tru 9. Tong tat ca
-    lai, check digit dung = (10 - (sum % 10)) % 10, phai bang
-    imei[14].
-
-    Returns:
-        ERR_IMEI_LUHN_FAIL neu khong du 15 so, khong phai toan chu so,
-        hoac check digit sai. Nguoc lai is_valid=True.
-    """
     imei = str(record.get("imei", "")).strip()
     if not imei.isdigit() or len(imei) != 15:
         return ValidationResult(is_valid=False, error_code="ERR_IMEI_LUHN_FAIL", error_message="IMEI must be 15 digits")
 
-    sum_ = 0
-    for i in range(14):
-        digit = int(imei[i])
-        if i % 2 == 1:
-            digit *= 2
-            if digit > 9:
-                digit -= 9
-        sum_ += digit
-    if (10 - (sum_ % 10)) % 10 != int(imei[14]):
+    # LOGIC MỚI: Đồng bộ với Simulator (duyệt từ phải qua trái)
+    digits = [int(d) for d in imei]
+    # Dùng 14 số đầu để tính checksum, so sánh với số thứ 15
+    check_part = digits[:14]
+    
+    # Duyệt từ phải qua trái (index 12, 10, 8, 6, 4, 2, 0)
+    for i in range(len(check_part) - 1, -1, -2):
+        val = check_part[i] * 2
+        check_part[i] = val if val < 10 else val - 9
+        
+    total = sum(check_part)
+    expected_checksum = (10 - (total % 10)) % 10
+    
+    if expected_checksum != digits[14]:
         return ValidationResult(is_valid=False, error_code="ERR_IMEI_LUHN_FAIL", error_message="Luhn check fail")
+        
     return ValidationResult(is_valid=True)
-
 
 # ==============================================================================
 # RULE 4b: TAC (6 chu so dau IMEI) co trong GSMA TAC DB
 # ==============================================================================
 async def validate_imei_tac(record: Dict[str, Any], client: httpx.AsyncClient) -> ValidationResult:
-    """R4b: goi GSMA TAC Mock API (GET /tac/{tac}) voi 6 chu so dau
-    cua IMEI de xac nhan TAC duoc GSMA cap phep.
-
-    Returns:
-        - ERR_IMEI_TAC_UNKNOWN neu mock tra exists=False hoac 404.
-        - WARN_RULE_BYPASSED (is_valid=True) neu circuit breaker mo.
-        - ERR_EXTERNAL_* neu mock service loi ha tang.
-        - is_valid=True neu mock tra exists=True.
-    """
     imei = str(record.get("imei", "")).strip()
     tac = imei[:6]
-    url = f"{GSMA_TAC_SERVICE_URL}/tac/{tac}"
+    
+    # [MỚI] Kiểm tra Cache
+    if tac in TAC_CACHE:
+        return TAC_CACHE[tac]
 
+    url = f"{GSMA_TAC_SERVICE_URL}/tac/{tac}"
     res, err = await invoke_external_api_with_resilience("GSMA_TAC", client, "GET", url)
 
+    # [MỚI] Lưu kết quả vào Cache trước khi return
     if err == "WARN_RULE_BYPASSED":
         return ValidationResult(is_valid=True, warn_code="WARN_RULE_BYPASSED")
     if err:
         return ValidationResult(is_valid=False, error_code=err, error_message="GSMA service unavailable")
 
     if res.status_code == 200 and res.json().get("exists") is True:
-        return ValidationResult(is_valid=True)
-    return ValidationResult(is_valid=False, error_code="ERR_IMEI_TAC_UNKNOWN", error_message="Unknown TAC")
+        result = ValidationResult(is_valid=True)
+        TAC_CACHE[tac] = result # Lưu vào cache
+        return result
+    
+    result = ValidationResult(is_valid=False, error_code="ERR_IMEI_TAC_UNKNOWN", error_message="Unknown TAC")
+    TAC_CACHE[tac] = result # Cache cả trường hợp không tồn tại
+    return result
 
 
 # ==============================================================================
@@ -279,24 +289,51 @@ async def validate_acct_status_type(record: Dict[str, Any]) -> ValidationResult:
 # ==============================================================================
 # RULE 6: event_timestamp trong khoang hop le
 # ==============================================================================
+from datetime import datetime
+
 async def validate_event_timestamp(record: Dict[str, Any]) -> ValidationResult:
-    """R6: event_timestamp phai la Unix timestamp (giay) hop le, nam
-    trong [2000-01-01, 2100-01-01) -- tuong duong
-    [946684800, 4102444800).
-
-    Returns:
-        ERR_INVALID_TIMESTAMP neu khong parse duoc int hoac ngoai
-        khoang; nguoc lai is_valid=True.
     """
+    R6: Kiểm tra tính hợp lệ của cả event_timestamp và ingest_timestamp.
+    Chấp nhận chuỗi ISO (2026-03-29T07:12:00Z) hoặc Unix timestamp.
+    """
+    
+    # Hàm phụ để tái sử dụng logic parse
+    def get_unix_timestamp(field_name: str) -> int:
+        val = str(record.get(field_name, "")).strip()
+        if not val:
+            raise ValueError(f"{field_name} is empty")
+            
+        if "T" in val:
+            # Parse định dạng ISO 8601
+            dt = datetime.fromisoformat(val.replace('Z', '+00:00'))
+            return int(dt.timestamp())
+        else:
+            # Parse định dạng số nguyên
+            return int(val)
+
     try:
-        ts = int(str(record.get("event_timestamp", "")).strip())
-        if not (946684800 <= ts <= 4102444800):
-            return ValidationResult(is_valid=False, error_code="ERR_INVALID_TIMESTAMP", error_message="Timestamp out of bounds")
+        # 1. Kiểm tra event_timestamp (Quan trọng nhất cho logic Partition)
+        event_ts = get_unix_timestamp("event_timestamp")
+        if not (946684800 <= event_ts <= 4102444800):
+            return ValidationResult(
+                is_valid=False, 
+                error_code="ERR_INVALID_TIMESTAMP", 
+                error_message="event_timestamp out of bounds"
+            )
+
+        # 2. Kiểm tra ingest_timestamp (Quan trọng để ghi vào Database không bị lỗi)
+        # Chúng ta chỉ cần đảm bảo nó parse được, không cần check range quá kỹ
+        get_unix_timestamp("ingest_timestamp")
+
         return ValidationResult(is_valid=True)
-    except ValueError:
-        return ValidationResult(is_valid=False, error_code="ERR_INVALID_TIMESTAMP", error_message="Timestamp is not int")
 
-
+    except Exception as e:
+        # Trả về thông báo lỗi cụ thể để dễ debug
+        return ValidationResult(
+            is_valid=False, 
+            error_code="ERR_INVALID_TIMESTAMP", 
+            error_message=f"Timestamp format error: {str(e)}"
+        )
 # ==============================================================================
 # DONG CO DIEU PHOI CHUOI TUAN TU (ORCHESTRATOR)
 # ==============================================================================

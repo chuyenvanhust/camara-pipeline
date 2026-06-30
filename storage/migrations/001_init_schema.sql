@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS radius_sessions (
     id               BIGSERIAL,
     acct_session_id  TEXT NOT NULL,
     acct_status_type VARCHAR(16),
+    acct_session_time INTEGER,
     event_timestamp  TIMESTAMPTZ NOT NULL,
     ingest_timestamp TIMESTAMPTZ DEFAULT NOW(),
     msisdn           VARCHAR(16),

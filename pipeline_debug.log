@@ -1,0 +1,153 @@
+==================================================
+>>> Đang khởi động RADIUS Pipeline (Exec Mode)...
+>>> Input Data: data/radius_log.csv
+==================================================
+time="2026-06-30T00:07:18+07:00" level=warning msg="/mnt/wsl/docker-desktop-bind-mounts/kali-linux/ee9613245f3f45832532b70969c32b904504d04823281b1c4ad96952b2ef49e8/docker-compose.yml: the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion"
+ Container camara-postgres  Creating
+ Container camara-zookeeper  Creating
+ Container camara-postgres  Created
+ Container fastapi-app  Creating
+ Container camara-zookeeper  Created
+ Container camara-kafka  Creating
+ Container fastapi-app  Created
+ Container camara-prometheus  Creating
+ Container camara-kafka  Created
+ Container camara-spark-master  Creating
+ Container camara-prometheus  Created
+ Container camara-grafana  Creating
+ Container camara-spark-master  Created
+ Container camara-spark-worker  Creating
+ Container camara-grafana  Created
+ Container camara-spark-worker  Created
+ Container camara-zookeeper  Starting
+ Container camara-postgres  Starting
+ Container camara-zookeeper  Started
+ Container camara-zookeeper  Waiting
+ Container camara-postgres  Started
+ Container camara-postgres  Waiting
+ Container camara-zookeeper  Healthy
+ Container camara-kafka  Starting
+ Container camara-postgres  Healthy
+ Container fastapi-app  Starting
+ Container camara-kafka  Started
+ Container camara-kafka  Waiting
+ Container fastapi-app  Started
+ Container camara-prometheus  Starting
+ Container camara-prometheus  Started
+ Container camara-grafana  Starting
+ Container camara-grafana  Started
+ Container camara-kafka  Healthy
+ Container camara-spark-master  Starting
+ Container camara-spark-master  Started
+ Container camara-spark-worker  Starting
+ Container camara-spark-worker  Started
+>>> Đợi FastAPI sẵn sàng...
+[OK] FastAPI sẵn sàng
+>>> Đợi Kafka sẵn sàng...
+[OK] Kafka sẵn sàng
+>>> Đợi PostgreSQL sẵn sàng...
+[OK] PostgreSQL sẵn sàng
+>>> Đợi Spark Cluster sẵn sàng...
+>>> Kiểm tra trạng thái Worker...
+    ... Đợi Spark Worker đăng ký với Master (đang kiểm tra log)...
+[OK] Spark Cluster đã sẵn sàng với Worker đang hoạt động
+>>> Khởi động mock services...
+>>> Khởi động pipeline trong spark-master container...
+==================================================
+Workspace : /workspace/pipeline
+Project   : /workspace
+Input CSV : /workspace/data/radius_log.csv (~102968 records)
+==================================================
+>>> Created Kafka topics: ['radius.raw', 'radius.clean', 'radius.invalid']
+>>> [S2] radius.raw -> radius.clean
+>>> Đang chờ [S2] khởi động Spark (tối đa 180s)...
+    ... [S2]: đang tải jar / khởi tạo Spark session...
+26/06/29 17:07:50 WARN NativeCodeLoader: Unable to load native-hadoop library for your platform... using builtin-java classes where applicable
+Setting default log level to "WARN".
+To adjust logging level use sc.setLogLevel(newLevel). For SparkR, use setLogLevel(newLevel).
+26/06/29 17:07:54 WARN ResolveWriteToStream: spark.sql.adaptive.enabled is not supported in streaming DataFrames/Datasets and will be disabled.
+26/06/29 17:07:54 WARN AdminClientConfig: These configurations '[key.deserializer, value.deserializer, enable.auto.commit, max.poll.records, auto.offset.reset]' were supplied but are not used yet.
+>>> [S2] Spark streaming đã sẵn sàng.
+>>> [S3] radius.clean -> PostgreSQL
+>>> Đang chờ [S3] khởi động Spark (tối đa 180s)...
+    ... [S3]: đang tải jar / khởi tạo Spark session...
+26/06/29 17:07:58 WARN NativeCodeLoader: Unable to load native-hadoop library for your platform... using builtin-java classes where applicable
+Setting default log level to "WARN".
+To adjust logging level use sc.setLogLevel(newLevel). For SparkR, use setLogLevel(newLevel).
+26/06/29 17:07:58 WARN Utils: Service 'SparkUI' could not bind on port 4040. Attempting port 4041.
+26/06/29 17:08:01 WARN ResolveWriteToStream: spark.sql.adaptive.enabled is not supported in streaming DataFrames/Datasets and will be disabled.
+26/06/29 17:08:01 WARN AdminClientConfig: These configurations '[key.deserializer, value.deserializer, enable.auto.commit, max.poll.records, auto.offset.reset]' were supplied but are not used yet.
+>>> [S3] Spark streaming đã sẵn sàng.
+>>> [S1] CSV -> radius.raw
+
+Pipeline is running (S2 + S3 đã sẵn sàng, S1 đang ingest).
+Spark UI: http://localhost:4040 (S3 thường ở :4041)
+
+>>> Đang chờ S1 đẩy ~102968 records lên Kafka...
+[Stage 0:>                                                          (0 + 4) / 4]                                                                                    ... S1 đang chạy — radius.raw hiện có 1529 message
+26/06/29 17:08:15 WARN ProcessingTimeExecutor: Current batch is falling behind. The trigger interval is 5000 milliseconds, but spent 10162 milliseconds
+    ... S1 đang chạy — radius.raw hiện có 3523 message
+    ... S1 đang chạy — radius.raw hiện có 5558 message
+    ... S1 đang chạy — radius.raw hiện có 7400 message
+    ... S1 đang chạy — radius.raw hiện có 9439 message
+    ... S1 đang chạy — radius.raw hiện có 11458 message
+    ... S1 đang chạy — radius.raw hiện có 13436 message
+    ... S1 đang chạy — radius.raw hiện có 15482 message
+    ... S1 đang chạy — radius.raw hiện có 17519 message
+    ... S1 đang chạy — radius.raw hiện có 19454 message
+26/06/29 17:09:55 WARN ProcessingTimeExecutor: Current batch is falling behind. The trigger interval is 5000 milliseconds, but spent 100415 milliseconds
+    ... S1 đang chạy — radius.raw hiện có 21445 message
+    ... S1 đang chạy — radius.raw hiện có 23388 message
+    ... S1 đang chạy — radius.raw hiện có 25305 message
+    ... S1 đang chạy — radius.raw hiện có 27234 message
+    ... S1 đang chạy — radius.raw hiện có 29145 message
+    ... S1 đang chạy — radius.raw hiện có 30840 message
+    ... S1 đang chạy — radius.raw hiện có 32759 message
+    ... S1 đang chạy — radius.raw hiện có 34697 message
+    ... S1 đang chạy — radius.raw hiện có 36623 message
+    ... S1 đang chạy — radius.raw hiện có 38593 message
+    ... S1 đang chạy — radius.raw hiện có 40568 message
+    ... S1 đang chạy — radius.raw hiện có 42472 message
+    ... S1 đang chạy — radius.raw hiện có 44380 message
+    ... S1 đang chạy — radius.raw hiện có 46329 message
+    ... S1 đang chạy — radius.raw hiện có 48228 message
+    ... S1 đang chạy — radius.raw hiện có 50166 message
+    ... S1 đang chạy — radius.raw hiện có 52068 message
+26/06/29 17:12:48 WARN ProcessingTimeExecutor: Current batch is falling behind. The trigger interval is 5000 milliseconds, but spent 172852 milliseconds
+    ... S1 đang chạy — radius.raw hiện có 53990 message
+    ... S1 đang chạy — radius.raw hiện có 55912 message
+    ... S1 đang chạy — radius.raw hiện có 57865 message
+    ... S1 đang chạy — radius.raw hiện có 59758 message
+    ... S1 đang chạy — radius.raw hiện có 61672 message
+    ... S1 đang chạy — radius.raw hiện có 63576 message
+    ... S1 đang chạy — radius.raw hiện có 65505 message
+    ... S1 đang chạy — radius.raw hiện có 67448 message
+    ... S1 đang chạy — radius.raw hiện có 69360 message
+    ... S1 đang chạy — radius.raw hiện có 71288 message
+    ... S1 đang chạy — radius.raw hiện có 73185 message
+    ... S1 đang chạy — radius.raw hiện có 75098 message
+    ... S1 đang chạy — radius.raw hiện có 77019 message
+    ... S1 đang chạy — radius.raw hiện có 78954 message
+    ... S1 đang chạy — radius.raw hiện có 80895 message
+    ... S1 đang chạy — radius.raw hiện có 82837 message
+    ... S1 đang chạy — radius.raw hiện có 84796 message
+    ... S1 đang chạy — radius.raw hiện có 86708 message
+    ... S1 đang chạy — radius.raw hiện có 88640 message
+    ... S1 đang chạy — radius.raw hiện có 90648 message
+    ... S1 đang chạy — radius.raw hiện có 92685 message
+    ... S1 đang chạy — radius.raw hiện có 94711 message
+    ... S1 đang chạy — radius.raw hiện có 96758 message
+    ... S1 đang chạy — radius.raw hiện có 98802 message
+    ... S1 đang chạy — radius.raw hiện có 100863 message
+    ... S1 đang chạy — radius.raw hiện có 102780 message
+[S1] Đã đẩy 102968 records lên topic 'radius.raw'.
+>>> Producer finished.
+>>> Đang chờ [S2] xử lý xong topic 'radius.raw'...
+    ... [S2]: 102640/102968 offset đã consume
+>>> [S2] đã xử lý xong 'radius.raw' (102968 message trên 4 partition).
+>>> Đang chờ [S3] xử lý xong topic 'radius.clean'...
+>>> [S3] đã xử lý xong 'radius.clean' (0 message trên 4 partition).
+>>> Kiểm tra dữ liệu đã ghi vào PostgreSQL...
+    ... radius_sessions: 0 rows (radius.clean: 0 msg)
+>>> S3: radius.clean rỗng — không có bản ghi hợp lệ để ghi DB.
+>>> Chờ S3 commit batch cuối (35s)...

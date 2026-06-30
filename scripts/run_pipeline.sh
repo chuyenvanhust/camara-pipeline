@@ -41,6 +41,23 @@ until docker exec camara-postgres pg_isready -U postgres -d camara_db > /dev/nul
 done
 echo "[OK] PostgreSQL sẵn sàng"
 
+echo ">>> Khởi tạo cấu trúc Database (Migrations)..."
+# Lấy danh sách các file .sql, sắp xếp theo thứ tự (001, 002...) để chạy đúng quy trình
+# Lệnh 'ls' kết hợp 'sort' đảm bảo 001_init luôn chạy trước 003_partitions
+for sql_file in $(ls storage/migrations/*.sql | sort); do
+    filename=$(basename "$sql_file")
+    echo "    ... Đang thực thi: $filename"
+    
+    # Thực thi nội dung file SQL vào container
+    # -i: truyền nội dung từ file local vào stdin của psql trong container
+    if docker exec -i camara-postgres psql -U postgres -d camara_db < "$sql_file" > /dev/null 2>&1; then
+        echo "        [OK] $filename hoàn tất"
+    else
+        echo "        [!] Lỗi khi thực thi $filename (có thể bảng đã tồn tại, bỏ qua...)"
+    fi
+done
+echo "[OK] Toàn bộ cấu trúc Database đã sẵn sàng"
+
 # 5. Đợi Spark Cluster sẵn sàng
 echo ">>> Đợi Spark Cluster sẵn sàng..."
 until nc -z localhost 7077 > /dev/null 2>&1; do

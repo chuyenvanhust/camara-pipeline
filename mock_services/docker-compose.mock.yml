@@ -19,6 +19,7 @@ services:
       context: ..
       dockerfile: mock_services/hlr_hss/Dockerfile
     container_name: camara-mock-hlr-hss
+    command: ["python", "-m", "uvicorn", "mock_services.hlr_hss.app:app", "--host", "0.0.0.0", "--port", "8200"]
     volumes:
       - ..:/workspace
     working_dir: /workspace

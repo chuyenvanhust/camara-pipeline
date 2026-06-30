@@ -6,36 +6,58 @@ sys.path.insert(0, _os.path.abspath(_os.path.join(_os.path.dirname(__file__), ".
 """
 Stage 2 — radius.raw → radius.clean
 
-Gộp 3 bước xử lý trong 1 Spark Structured Streaming job:
-  (a) Validation         : 6 rules — loại record lỗi
-  (b) Deduplication      : dict in-memory TTL 3600s theo (acct_session_id, acct_status_type)
-  (c) Conflict resolution: phân loại A/B/C — loại A+B, giữ C
+Gộp 4 bước xử lý trong 1 Spark Structured Streaming job:
+  (a) Validation         : 6 rules — loại record lỗi → invalid_log
+  (b) Late arrival check : đánh dấu trước watermark → invalid_log
+  (c) Deduplication      : dict in-memory TTL 3600s theo (acct_session_id, acct_status_type)
+  (d) Conflict resolution: phân loại A/B/C
+        - A, B → conflict_log, loại khỏi luồng sạch
+        - C    → giữ trong luồng sạch + gọi SwapDetector xác minh qua HLR/HSS → swap_event
 
 Input : Kafka topic radius.raw
-Output: Kafka topic radius.clean
+Output:
+  - Kafka topic radius.clean       (record hợp lệ, bao gồm conflict C)
+  - PostgreSQL invalid_log         (validation fail + late arrival)
+  - PostgreSQL conflict_log        (conflict A/B)
+  - PostgreSQL swap_event          (conflict C đã được HLR/HSS xác nhận)
 
 ===========================================================================
-BOTTLENECK ĐÃ FIX (4 vấn đề):
+BOTTLENECK ĐÃ FIX (4 vấn đề, giữ nguyên từ bản gốc):
 
 [BN-1] applyInPandasWithState bên trong foreachBatch
   → Spark KHÔNG hỗ trợ stateful operator trong foreachBatch callback.
-    Spark cố chạy một micro-batch-inside-micro-batch, treo vĩnh viễn.
-  FIX: thay bằng dict in-memory DEDUP_STATE trong driver process.
-       foreachBatch chỉ được phép dùng batch DataFrame operations hoặc
-       collect() + Python thuần — không được lồng streaming operator.
+  FIX: dict in-memory DEDUP_STATE trong driver process.
 
 [BN-2] asyncio.new_event_loop() tạo mới mỗi batch, không đóng đúng cách
-  → Gây leak event loop + thread, tích lũy qua nhiều batch → OOM / freeze.
-  FIX: dùng asyncio.run() — tự quản lý vòng đời loop, đóng sạch sau mỗi lần gọi.
+  FIX: dùng asyncio.run() — tự quản lý vòng đời loop.
 
-[BN-3] httpx.AsyncClient() tạo mới MỖI RECORD (trong _run_validation_async)
-  → N records = N connection pool init/teardown, cực kỳ tốn kém.
-  FIX: tạo 1 AsyncClient duy nhất PER BATCH, chia sẻ connection pool cho
-       toàn bộ records trong batch đó.
+[BN-3] httpx.AsyncClient() tạo mới MỖI RECORD
+  FIX: 1 AsyncClient duy nhất PER BATCH.
 
 [BN-4] clean_df.count() sau khi đã .save() lên Kafka
-  → Trigger thêm 1 Spark job chỉ để log số dòng — lãng phí.
-  FIX: đếm bằng len(clean_rows) trước khi ghi (đã collect() rồi).
+  FIX: đếm bằng len(clean_rows) trước khi ghi.
+
+===========================================================================
+GAP ĐÃ FIX (5 vấn đề, phát hiện khi báo cáo Data Quality luôn trống):
+
+[GAP-1] invalid_rows chỉ ghi Kafka radius.invalid, không ai consume lại
+  FIX: ghi trực tiếp vào PostgreSQL invalid_log trong cùng _callback,
+       không cần round-trip qua Kafka.
+
+[GAP-2] Conflict A/B bị .drop() trong pandas — biến mất, không ghi đâu cả
+  FIX: _resolve_conflicts() tách riêng nhánh conflicted, ghi conflict_log.
+
+[GAP-3] Late arrival bị Spark watermark âm thầm drop, không log được
+  FIX: đánh dấu cờ late_arrival TRƯỚC khi watermark filter áp dụng,
+       tách ra ghi invalid_log với error_code=ERR_LATE_ARRIVAL.
+
+[GAP-4] SwapDetector tồn tại nhưng KHÔNG được import/gọi ở đâu cả
+  → conflict C trôi thẳng vào radius_sessions, swap_event luôn trống.
+  FIX: gọi SwapDetector.verify_and_emit_swap() cho từng conflict C row,
+       ghi swap_event nếu HLR/HSS xác nhận.
+
+[GAP-5] quality_report.py query sai tên error_code
+  (ERR_IMEI_LUHN thay vì ERR_IMEI_LUHN_FAIL — sửa ở file quality_report.py riêng)
 ===========================================================================
 """
 
@@ -47,6 +69,7 @@ from typing import Dict, List, Optional, Tuple, Any
 
 import httpx
 import pandas as pd
+import psycopg2
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
 from pyspark.sql.types import (
@@ -56,6 +79,7 @@ from pyspark.sql.window import Window
 
 from pipeline.validation.rules import execute_validation_pipeline
 from pipeline.deduplication.state_manager import DedupStateManager
+from pipeline.conflict_resolution.swap_detector import SwapDetector, write_swap_events
 from pipeline.spark_jars import KAFKA_PACKAGE, configure_spark_jars
 
 logger = logging.getLogger(__name__)
@@ -67,10 +91,16 @@ logger = logging.getLogger(__name__)
 RAW_RADIUS_SCHEMA = StructType([
     StructField("acct_status_type", StringType(), True),
     StructField("acct_session_id",  StringType(), True),
+    StructField("acct_session_time", StringType(), True),
+    StructField("event_timestamp",  StringType(), True),
+    StructField("ingest_timestamp", StringType(), True),
     StructField("msisdn",           StringType(), True),
     StructField("imsi",             StringType(), True),
     StructField("imei",             StringType(), True),
-    StructField("event_timestamp",  StringType(), True),
+    StructField("rat_type",         StringType(), True),
+    StructField("framed_ip",        StringType(), True),
+    StructField("nas_ip",           StringType(), True),
+    StructField("mcc_mnc",          StringType(), True),
 ])
 
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "camara-kafka:9092")
@@ -82,7 +112,29 @@ CHECKPOINT_LOCATION     = os.getenv(
     "/tmp/spark-pipeline-processing-checkpoint",
 )
 
+#: Ngưỡng coi là "late arrival" — record đến trễ hơn N giây so với event_timestamp.
+#: Khớp với LATE_ARRIVAL_THRESHOLD_SECONDS trong README pipeline (3600s = 1h).
+LATE_ARRIVAL_THRESHOLD_SECONDS = int(os.getenv("LATE_ARRIVAL_THRESHOLD_SECONDS", "3600"))
+
 TTL_SECONDS = DedupStateManager.TTL_SECONDS  # 3600
+
+#: DSN dùng chung cho mọi ghi PostgreSQL trong module này (invalid_log,
+#: conflict_log, swap_event). writer.py (Stage 3) dùng DSN riêng cho
+#: radius_sessions — không trùng connection pool.
+DB_DSN = dict(
+    host=os.getenv("DB_HOST", "postgres"),
+    port=int(os.getenv("DB_PORT", "5432")),
+    dbname=os.getenv("DB_NAME", "camara_db"),
+    user=os.getenv("DB_USER", "postgres"),
+    password=os.getenv("DB_PASSWORD", "camara"),
+)
+
+HLR_HSS_URL = os.getenv("HLR_HSS_SERVICE_URL", "http://camara-mock-hlr-hss:8200")
+
+# Singleton SwapDetector — tái sử dụng giữa các batch, tránh tạo lại
+# HTTP session mỗi lần (xem swap_detector.py).
+_swap_detector = SwapDetector(hlr_mock_url=HLR_HSS_URL)
+
 
 # ==============================================================================
 # 2. PURE LOGIC
@@ -100,25 +152,77 @@ async def _run_validation_batch(records: List[Dict]) -> List[Tuple]:
         return await asyncio.gather(*tasks)
 
 
-def _filter_valid(records: List[Dict], results: List[Tuple]) -> List[Dict]:
-    """Giữ record is_valid=True; gắn warn_code nếu có."""
-    valid = []
+def _filter_valid(records: List[Dict], results: List[Tuple]) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Tách records thành (valid, invalid) dựa trên ValidationResult.
+
+    invalid record giữ nguyên field gốc + thêm error_code, error_details
+    (dùng đúng tên thuộc tính của ValidationResult trong rules.py).
+    """
+    valid: List[Dict] = []
+    invalid: List[Dict] = []
     for record, (res, warn) in zip(records, results):
+        payload = dict(record)
         if res.is_valid:
-            payload = dict(record)
             if warn:
                 payload["warn_code"] = warn
             valid.append(payload)
-    return valid
+        else:
+            payload["error_code"] = res.error_code
+            payload["error_details"] = res.error_message
+            invalid.append(payload)
+    return valid, invalid
 
 
-# ── 2b. Deduplication (in-memory, driver-side) ─────────────────────────────
+# ── 2b. Late arrival detection ──────────────────────────────────────────────
+
+def _split_late_arrival(records: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+    """
+    [GAP-3] Tách record đến trễ hơn LATE_ARRIVAL_THRESHOLD_SECONDS so với
+    event_timestamp, TRƯỚC khi Spark watermark có cơ hội âm thầm drop nó.
+
+    So sánh ingest_timestamp (lúc simulator/producer gửi đi) với
+    event_timestamp (lúc sự kiện RADIUS thực sự xảy ra). Cả 2 đều là
+    Unix timestamp dạng string trong RAW_RADIUS_SCHEMA.
+
+    Returns:
+        (on_time_records, late_records)
+        late_records có shape khớp invalid_log: acct_session_id, msisdn,
+        error_code='ERR_LATE_ARRIVAL', error_details mô tả độ trễ.
+    """
+    on_time: List[Dict] = []
+    late: List[Dict] = []
+
+    for r in records:
+        try:
+            event_ts = int(str(r.get("event_timestamp", "")).strip())
+            ingest_ts = int(str(r.get("ingest_timestamp", "")).strip())
+            delay_seconds = ingest_ts - event_ts
+        except (ValueError, TypeError):
+            # Không parse được timestamp -> để nguyên, validation rule khác
+            # (ERR_INVALID_TIMESTAMP) sẽ bắt lỗi này, không phải late arrival.
+            on_time.append(r)
+            continue
+
+        if delay_seconds > LATE_ARRIVAL_THRESHOLD_SECONDS:
+            payload = dict(r)
+            payload["error_code"] = "ERR_LATE_ARRIVAL"
+            payload["error_details"] = (
+                f"Delayed {delay_seconds}s "
+                f"(threshold={LATE_ARRIVAL_THRESHOLD_SECONDS}s), "
+                f"event_timestamp={event_ts}, ingest_timestamp={ingest_ts}"
+            )
+            late.append(payload)
+        else:
+            on_time.append(r)
+
+    return on_time, late
+
+
+# ── 2c. Deduplication (in-memory, driver-side) ─────────────────────────────
 #
 # [FIX BN-1] Thay applyInPandasWithState bằng dict in-memory.
 # DEDUP_STATE: { (acct_session_id, acct_status_type) -> last_seen_epoch_ms }
-# Đủ cho bài toán RADIUS vì số session đang hoạt động đồng thời thực tế
-# nằm trong khoảng vài chục nghìn → memory footprint ~vài MB.
-# Nếu cần scale lên multi-node → chuyển sang Redis với TTL native.
 
 DEDUP_STATE: Dict[Tuple[str, str], int] = {}
 _DEDUP_LAST_CLEANUP: float = time.time()
@@ -146,13 +250,12 @@ def _dedup_filter(records: List[Dict]) -> List[Dict]:
     """
     global _DEDUP_LAST_CLEANUP
 
-    # Dọn expired định kỳ
     if time.time() - _DEDUP_LAST_CLEANUP > _DEDUP_CLEANUP_INTERVAL:
         _dedup_cleanup_expired()
 
     now_ms = int(time.time() * 1000)
     ttl_ms = TTL_SECONDS * 1000
-    unique = []
+    unique: List[Dict] = []
 
     for record in records:
         key = (
@@ -160,7 +263,7 @@ def _dedup_filter(records: List[Dict]) -> List[Dict]:
             str(record.get("acct_status_type", "")),
         )
         last_ms = DEDUP_STATE.get(key)
-        ts_raw  = record.get("event_timestamp", "")
+        ts_raw = record.get("event_timestamp", "")
         try:
             event_ms = int(str(ts_raw).strip()) * 1000
         except (ValueError, TypeError):
@@ -169,28 +272,35 @@ def _dedup_filter(records: List[Dict]) -> List[Dict]:
         if last_ms is None or (event_ms - last_ms) > ttl_ms:
             DEDUP_STATE[key] = event_ms
             unique.append(record)
-        # else: duplicate → bỏ
+        # else: duplicate -> bỏ
 
     return unique
 
 
-# ── 2c. Conflict resolution (pandas, driver-side) ──────────────────────────
+# ── 2d. Conflict resolution (pandas, driver-side) ──────────────────────────
 
-def _resolve_conflicts(records: List[Dict]) -> List[Dict]:
+def _resolve_conflicts(records: List[Dict]) -> Tuple[List[Dict], List[Dict], List[Dict]]:
     """
     Phân loại conflict A/B/C bằng pandas (đã collect() rồi, batch nhỏ).
-    Loại A+B, giữ C (SIM Swap hợp lệ nghiệp vụ).
 
     Conflict A: cùng session, imsi/msisdn thay đổi sau Start.
     Conflict B: cùng imsi có 2+ Start chưa Stop.
     Conflict C: cùng msisdn nhưng imsi thay đổi (SIM Swap signal).
+
+    [GAP-2] [GAP-4] Trả về 3 nhóm thay vì chỉ "clean":
+        clean_records       — record sạch, BAO GỒM conflict C (đúng thiết kế
+                               nghiệp vụ: C là business event hợp lệ, không
+                               phải lỗi dữ liệu).
+        conflict_records     — chỉ A/B, khớp schema bảng conflict_log
+                               (session_id, conflict_type, details, error_code).
+        conflict_c_records   — chỉ C, dùng để feed cho SwapDetector xác minh
+                               qua HLR/HSS trước khi ghi swap_event.
     """
     if not records:
-        return []
+        return [], [], []
 
     df = pd.DataFrame(records)
 
-    # Đảm bảo cột timestamp tồn tại
     if "event_timestamp_ts" not in df.columns:
         df["event_timestamp_ts"] = pd.to_datetime(
             df["event_timestamp"].apply(
@@ -215,11 +325,7 @@ def _resolve_conflicts(records: List[Dict]) -> List[Dict]:
 
     # ── Conflict B ──────────────────────────────────────────────────────────
     start_mask = (df["acct_status_type"] == "Start") & (~df["is_conflict_a"])
-    df["_imsi_start_rank"] = (
-        df[start_mask]
-          .groupby("imsi")
-          .cumcount()
-    )
+    df["_imsi_start_rank"] = df[start_mask].groupby("imsi").cumcount()
     df["is_conflict_b"] = (
         (~df["is_conflict_a"]) &
         (df["acct_status_type"] == "Start") &
@@ -235,8 +341,26 @@ def _resolve_conflicts(records: List[Dict]) -> List[Dict]:
         (df["imsi"] != df["prev_imsi"])
     )
 
-    # Loại A+B, giữ C
-    clean = df[~df["is_conflict_a"] & ~df["is_conflict_b"]].copy()
+    # ── Tách 3 nhóm ───────────────────────────────────────────────────────────
+    is_conflicted_ab = df["is_conflict_a"] | df["is_conflict_b"]
+
+    clean = df[~is_conflicted_ab].copy()
+
+    # Conflict C nằm TRONG clean (giữ nguyên thiết kế) — lấy riêng ra để
+    # feed SwapDetector mà không loại khỏi luồng sạch.
+    conflict_c_records: List[Dict] = []
+    if "is_conflict_c" in clean.columns:
+        c_only = clean[clean["is_conflict_c"] == True].copy()
+        if not c_only.empty:
+            conflict_c_records = c_only.drop(
+                columns=[
+                    "first_imsi", "first_msisdn", "is_conflict_a",
+                    "is_conflict_b", "_imsi_start_rank", "prev_imsi",
+                    "is_conflict_c", "event_timestamp_ts",
+                ],
+                errors="ignore",
+            ).to_dict(orient="records")
+
     clean = clean.drop(
         columns=[
             "first_imsi", "first_msisdn", "is_conflict_a",
@@ -245,7 +369,143 @@ def _resolve_conflicts(records: List[Dict]) -> List[Dict]:
         ],
         errors="ignore",
     )
-    return clean.to_dict(orient="records")
+
+    conflicted_ab = df[is_conflicted_ab].copy()
+    conflict_records: List[Dict] = []
+    if not conflicted_ab.empty:
+        conflicted_ab["conflict_type"] = conflicted_ab.apply(
+            lambda r: "A" if r["is_conflict_a"] else "B", axis=1
+        )
+        conflicted_ab["details"] = conflicted_ab.apply(
+            lambda r: (
+                f"Session {r['acct_session_id']}: IMSI/MSISDN thay đổi sau Start"
+                if r["is_conflict_a"]
+                else f"IMSI {r['imsi']}: 2+ Start chưa Stop"
+            ),
+            axis=1,
+        )
+        conflicted_ab["error_code"] = conflicted_ab["conflict_type"].apply(
+            lambda t: f"CONFLICT_{t}"
+        )
+        conflicted_ab = conflicted_ab.rename(columns={"acct_session_id": "session_id"})
+        conflict_records = conflicted_ab[
+            ["session_id", "conflict_type", "details", "error_code"]
+        ].to_dict(orient="records")
+
+    return clean.to_dict(orient="records"), conflict_records, conflict_c_records
+
+
+# ── 2e. PostgreSQL writers (invalid_log, conflict_log) ─────────────────────
+#
+# [GAP-1] [GAP-2] Ghi trực tiếp vào PostgreSQL trong cùng foreachBatch,
+# không cần round-trip qua Kafka. swap_event writer nằm trong
+# swap_detector.py (write_swap_events) vì nó cần I/O đồng bộ với HLR/HSS.
+
+def _write_invalid_log(rows: List[Dict]) -> None:
+    """
+    Ghi invalid_rows (validation fail + late arrival) vào bảng invalid_log.
+    Khớp đúng cột trong storage/migrations/001_init_schema.sql:
+        session_id, msisdn, error_code, details
+    """
+    if not rows:
+        return
+
+    sql = """
+        INSERT INTO invalid_log (session_id, msisdn, error_code, details)
+        VALUES (%s, %s, %s, %s)
+    """
+    data = [
+        (
+            r.get("acct_session_id"),
+            r.get("msisdn"),
+            r.get("error_code"),
+            r.get("error_details"),
+        )
+        for r in rows
+    ]
+
+    conn = psycopg2.connect(**DB_DSN)
+    try:
+        with conn.cursor() as cur:
+            cur.executemany(sql, data)
+        conn.commit()
+        logger.info("Wrote %d rows to invalid_log", len(data))
+    except Exception:
+        conn.rollback()
+        logger.exception("Failed to write invalid_log")
+        raise
+    finally:
+        conn.close()
+
+
+def _write_conflict_log(rows: List[Dict]) -> None:
+    """
+    Ghi conflict A/B vào bảng conflict_log.
+    Khớp đúng cột trong storage/migrations/001_init_schema.sql:
+        session_id, conflict_type, details, error_code
+    """
+    if not rows:
+        return
+
+    sql = """
+        INSERT INTO conflict_log (session_id, conflict_type, details, error_code)
+        VALUES (%s, %s, %s, %s)
+    """
+    data = [
+        (r["session_id"], r["conflict_type"], r["details"], r["error_code"])
+        for r in rows
+    ]
+
+    conn = psycopg2.connect(**DB_DSN)
+    try:
+        with conn.cursor() as cur:
+            cur.executemany(sql, data)
+        conn.commit()
+        logger.info("Wrote %d rows to conflict_log", len(data))
+    except Exception:
+        conn.rollback()
+        logger.exception("Failed to write conflict_log")
+        raise
+    finally:
+        conn.close()
+
+
+def _process_sim_swap_signals(conflict_c_rows: List[Dict]) -> None:
+    """
+    [GAP-4] Với mỗi record conflict C, gọi HLR/HSS xác nhận lịch sử IMSI
+    qua SwapDetector, ghi swap_event nếu được xác nhận.
+
+    I/O đồng bộ (requests, không async) — chạy tuần tự, chấp nhận được
+    vì conflict C hiếm trong dataset (xem README: tổng conflict mặc định
+    1%, trong đó C chỉ là 1 phần của 3 loại A/B/C).
+    """
+    if not conflict_c_rows:
+        return
+
+    confirmed_events: List[Dict] = []
+    for row in conflict_c_rows:
+        try:
+            event = _swap_detector.verify_and_emit_swap(row)
+            if event:
+                confirmed_events.append(event)
+        except Exception:
+            logger.exception(
+                "SwapDetector failed for msisdn=%s imsi=%s",
+                row.get("msisdn"), row.get("imsi"),
+            )
+
+    if confirmed_events:
+        write_swap_events(confirmed_events, DB_DSN)
+        logger.info(
+            "Confirmed %d/%d SIM Swap events -> swap_event",
+            len(confirmed_events), len(conflict_c_rows),
+        )
+    else:
+        logger.info(
+            "0/%d conflict C records confirmed by HLR/HSS (false positive or "
+            "HLR unreachable)",
+            len(conflict_c_rows),
+        )
 
 
 # ==============================================================================
@@ -253,7 +513,14 @@ def _resolve_conflicts(records: List[Dict]) -> List[Dict]:
 # ==============================================================================
 
 def build_stream(spark: SparkSession) -> DataFrame:
-    """Đọc radius.raw → parse JSON → áp watermark."""
+    """
+    Đọc radius.raw, parse JSON theo RAW_RADIUS_SCHEMA, áp watermark.
+
+    Watermark chỉ ảnh hưởng tới việc Spark dọn state nội bộ (không liên
+    quan tới _split_late_arrival ở pure logic) — late arrival detection
+    thực sự nằm trong make_callback._callback, chạy TRƯỚC khi watermark
+    có cơ hội drop bất kỳ điều gì.
+    """
     return (
         spark.readStream
         .format("kafka")
@@ -261,7 +528,7 @@ def build_stream(spark: SparkSession) -> DataFrame:
         .option("subscribe", KAFKA_TOPIC_RAW)
         .option("startingOffsets", "earliest")
         .option("failOnDataLoss", "false")
-        .option("maxOffsetsPerTrigger", "2000")
+        .option("maxOffsetsPerTrigger", "500")
         .option("kafka.metadata.max.age.ms", "10000")
         .load()
         .selectExpr("CAST(value AS STRING) AS raw_value")
@@ -274,42 +541,73 @@ def build_stream(spark: SparkSession) -> DataFrame:
 
 def make_callback(spark: SparkSession):
     """
-    foreachBatch callback: collect → validate → dedup → conflict → ghi Kafka.
-    Không có bất kỳ streaming operator nào bên trong (fix BN-1).
+    foreachBatch callback: collect -> validate -> late-arrival split
+    -> dedup -> conflict resolution -> ghi 4 đích (Kafka + 3 bảng Postgres).
+
+    Không có bất kỳ streaming operator nào bên trong (giữ nguyên fix BN-1).
     """
+
     def _callback(batch_df: DataFrame, batch_id: int) -> None:
         t0 = time.time()
 
-        # ── Collect ──────────────────────────────────────────────────────────
+        # ── 1. Collect ───────────────────────────────────────────────────────
         rows = [r.asDict() for r in batch_df.collect()]
         if not rows:
             return
 
-        # ── (a) Validation — [FIX BN-2] asyncio.run() thay new_event_loop() ──
+        # ── 2. Validation ────────────────────────────────────────────────────
         val_results = asyncio.run(_run_validation_batch(rows))
-        valid_rows  = _filter_valid(rows, val_results)
+        valid_rows, invalid_rows = _filter_valid(rows, val_results)
+
+        # ── 3. Late arrival — tách khỏi valid_rows TRƯỚC dedup/conflict ──────
+        on_time_rows, late_rows = _split_late_arrival(valid_rows)
 
         logger.info(
-            "Batch %d | total=%d valid=%d (%.0fms)",
-            batch_id, len(rows), len(valid_rows), (time.time()-t0)*1000,
+            "Batch %d | total=%d valid=%d invalid=%d late_arrival=%d (%.0fms)",
+            batch_id, len(rows), len(valid_rows), len(invalid_rows),
+            len(late_rows), (time.time() - t0) * 1000,
         )
-        if not valid_rows:
+
+        # ── 4. Ghi invalid_log: validation fail + late arrival ───────────────
+        all_invalid_rows = invalid_rows + late_rows
+        if all_invalid_rows:
+            try:
+                _write_invalid_log(all_invalid_rows)
+            except Exception as e:
+                logger.error("Batch %d | Failed to write invalid_log: %s", batch_id, e)
+
+        if not on_time_rows:
             return
 
-        # ── (b) Dedup — [FIX BN-1] dict in-memory thay applyInPandasWithState ──
-        deduped_rows = _dedup_filter(valid_rows)
-        logger.info(
-            "Batch %d | after dedup=%d", batch_id, len(deduped_rows),
-        )
+        # ── 5. Deduplication ─────────────────────────────────────────────────
+        deduped_rows = _dedup_filter(on_time_rows)
+        logger.info("Batch %d | after dedup=%d", batch_id, len(deduped_rows))
         if not deduped_rows:
             return
 
-        # ── (c) Conflict resolution — pandas, không lồng Spark job ──────────
-        clean_rows = _resolve_conflicts(deduped_rows)
+        # ── 6. Conflict resolution ───────────────────────────────────────────
+        clean_rows, conflict_rows, conflict_c_rows = _resolve_conflicts(deduped_rows)
+
+        # ── 7. Ghi conflict_log (A/B) ─────────────────────────────────────────
+        if conflict_rows:
+            try:
+                _write_conflict_log(conflict_rows)
+            except Exception as e:
+                logger.error("Batch %d | Failed to write conflict_log: %s", batch_id, e)
+
+        # ── 8. Xác minh SIM Swap (C) qua HLR/HSS, ghi swap_event ──────────────
+        if conflict_c_rows:
+            try:
+                _process_sim_swap_signals(conflict_c_rows)
+            except Exception as e:
+                logger.error(
+                    "Batch %d | Failed to process SIM Swap signals: %s", batch_id, e
+                )
+
         if not clean_rows:
             return
 
-        # ── Ghi ra radius.clean ───────────────────────────────────────────────
+        # ── 9. Ghi radius.clean (record sạch, bao gồm conflict C) ────────────
         clean_df = spark.createDataFrame(clean_rows)
         (
             clean_df
@@ -321,16 +619,23 @@ def make_callback(spark: SparkSession):
             .save()
         )
 
-        # [FIX BN-4] dùng len() thay clean_df.count() — không trigger thêm Spark job
         logger.info(
-            "Batch %d | → %s rows=%d (total %.0fms)",
-            batch_id, KAFKA_TOPIC_CLEAN, len(clean_rows), (time.time()-t0)*1000,
+            "Batch %d | -> clean=%d conflict_ab=%d conflict_c=%d invalid=%d "
+            "late=%d (total %.0fms)",
+            batch_id, len(clean_rows), len(conflict_rows), len(conflict_c_rows),
+            len(invalid_rows), len(late_rows), (time.time() - t0) * 1000,
         )
 
     return _callback
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+
     builder = (
         SparkSession.builder
         .appName("Camara-Processing-Job")
@@ -339,8 +644,6 @@ def main() -> None:
     )
     spark = configure_spark_jars(builder, KAFKA_PACKAGE).getOrCreate()
 
-    # RocksDB không cần nữa (dedup chuyển sang in-memory)
-    # nhưng vẫn set checkpoint location cho Spark streaming
     spark.conf.set(
         "spark.sql.streaming.checkpointLocation",
         CHECKPOINT_LOCATION,

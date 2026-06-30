@@ -142,7 +142,7 @@ def run_stage(script_relpath: str, *args: str) -> subprocess.Popen:
     env.setdefault("HOME", "/opt/spark/work-dir")
 
     command = [sys.executable, "-u", script_path, *args]
-    return subprocess.Popen(command, cwd=WORKSPACE, env=env)
+    return subprocess.Popen(command, cwd=WORKSPACE, env=env,stdout=sys.stdout, stderr=sys.stderr)
 
 
 def stop_all(processes: List[subprocess.Popen]) -> None:

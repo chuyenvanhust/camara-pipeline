@@ -17,3 +17,4 @@ httpx
 sqlalchemy
 pyspark==3.5.1
 pydantic-settings
+sqlite3

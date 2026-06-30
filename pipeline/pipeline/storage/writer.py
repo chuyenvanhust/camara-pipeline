@@ -25,7 +25,7 @@ import psycopg2
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
 from pyspark.sql.types import (
-    StructType, StructField, StringType, BooleanType,
+    StructType, StructField, StringType, BooleanType,LongType
 )
 
 from pipeline.storage.models import RadiusSession
@@ -58,9 +58,11 @@ CHECKPOINT_LOCATION = os.getenv(
 
 #: Schema JSON từ radius.clean — khớp RadiusSession.INSERT_COLUMNS
 CLEAN_RECORD_SCHEMA = StructType([
-    StructField("acct_session_id",  StringType(), True),
     StructField("acct_status_type", StringType(), True),
+    StructField("acct_session_id",  StringType(), True),
+    StructField("acct_session_time", LongType(), True),
     StructField("event_timestamp",  StringType(), True),
+    StructField("ingest_timestamp",  StringType(), True),
     StructField("msisdn",           StringType(), True),
     StructField("imsi",             StringType(), True),
     StructField("imei",             StringType(), True),
@@ -84,17 +86,10 @@ def build_dsn(
     return dict(host=host, port=port, dbname=dbname, user=user, password=password)
 
 
-def build_upsert_sql(table_name, columns, conflict_columns) -> str:
-    """
-    Tạo INSERT ... ON CONFLICT (...) DO NOTHING.
-
-    >>> build_upsert_sql("t", ("a","b"), ("a",))
-    'INSERT INTO t (a, b) VALUES (%s, %s) ON CONFLICT (a) DO NOTHING'
-    """
-    cols      = ", ".join(columns)
-    phs       = ", ".join(["%s"] * len(columns))
-    conflicts = ", ".join(conflict_columns)
-    return f"INSERT INTO {table_name} ({cols}) VALUES ({phs}) ON CONFLICT ({conflicts}) DO NOTHING"
+def build_insert_sql(table_name, columns) -> str:
+    cols = ", ".join(columns)
+    phs = ", ".join(["%s"] * len(columns))
+    return f"INSERT INTO {table_name} ({cols}) VALUES ({phs})"
 
 
 def extract_rows_from_batch(rows: List[Dict], columns) -> List[Tuple]:
@@ -107,38 +102,25 @@ def extract_rows_from_batch(rows: List[Dict], columns) -> List[Tuple]:
 # ==============================================================================
 
 def write_micro_batch(dsn: dict, batch_size: int = SPARK_JDBC_BATCH_SIZE):
-    """
-    Trả về foreachBatch callback:
-      collect → extract_rows → psycopg2 executemany → commit.
-    Tạo connection mới mỗi batch (tránh leak khi Spark restart callback).
-    """
-    upsert_sql = build_upsert_sql(
-        RadiusSession.__tablename__,
-        RadiusSession.INSERT_COLUMNS,
-        RadiusSession.CONFLICT_COLUMNS,
-    )
+    # Dùng insert_sql thay vì upsert_sql
+    insert_sql = build_insert_sql(RadiusSession.__tablename__, RadiusSession.INSERT_COLUMNS)
 
     def _callback(batch_df: DataFrame, batch_id: int) -> None:
         rows = [r.asDict() for r in batch_df.collect()]
-        if not rows:
-            return
-
+        if not rows: return
         data = extract_rows_from_batch(rows, RadiusSession.INSERT_COLUMNS)
-
         conn = psycopg2.connect(**dsn)
         try:
             with conn.cursor() as cur:
-                for i in range(0, len(data), batch_size):
-                    cur.executemany(upsert_sql, data[i: i + batch_size])
+                # Trigger trong DB sẽ tự xử lý trùng, Python chỉ việc gửi data
+                cur.executemany(insert_sql, data)
             conn.commit()
-            logger.info("S3 batch %d: %d rows → %s", batch_id, len(data), RadiusSession.__tablename__)
-        except Exception:
+            logger.info("S3 batch %d: %d rows written", batch_id, len(data))
+        except Exception as e:
             conn.rollback()
-            logger.exception("S3 batch %d: write to PostgreSQL failed", batch_id)
-            raise
+            logger.error("S3 batch %d failed: %s", batch_id, e)
         finally:
             conn.close()
-
     return _callback
 
 
@@ -162,7 +144,17 @@ def start_storage_stream(spark: SparkSession):
         raw_stream
         .select(F.from_json(F.col("value").cast("string"), CLEAN_RECORD_SCHEMA).alias("d"))
         .select("d.*")
-        .withColumn("event_timestamp", F.to_timestamp("event_timestamp"))
+        # 1. Ép kiểu thời lượng session về số nguyên
+        .withColumn("acct_session_time", F.col("acct_session_time").cast("integer"))
+        
+        # 2. Chuyển ISO String của sự kiện sang Timestamp chuẩn
+        .withColumn("event_timestamp", F.to_timestamp(F.col("event_timestamp")))
+        
+        # 3. BỔ SUNG: Chuyển ISO String của thời điểm nạp sang Timestamp chuẩn
+        .withColumn("ingest_timestamp", F.to_timestamp(F.col("ingest_timestamp")))
+        
+        # 4. Đảm bảo late_arrival không bị Null (gán False nếu không có)
+        .withColumn("late_arrival", F.coalesce(F.col("late_arrival"), F.lit(False)))
     )
 
     dsn   = build_dsn()

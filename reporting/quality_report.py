@@ -56,8 +56,8 @@ def fetch_metrics():
         # Section 2: INVALID IMEI
         cur.execute("""
             SELECT 
-                COUNT(*) FILTER (WHERE error_code = 'ERR_IMEI_LUHN') as luhn_fail,
-                COUNT(*) FILTER (WHERE error_code = 'ERR_IMEI_TAC') as tac_unknown,
+                COUNT(*) FILTER (WHERE error_code = 'ERR_IMEI_LUHN_FAIL') as luhn_fail,
+                COUNT(*) FILTER (WHERE error_code = 'ERR_IMEI_TAC_UNKNOWN') as tac_unknown,
                 COUNT(*) as total
             FROM invalid_log 
             WHERE error_code LIKE 'ERR_IMEI%';
@@ -110,7 +110,7 @@ def fetch_metrics():
 
     
 
-        # --- SECTION 5: LATE ARRIVAL ---
+        '''# --- SECTION 5: LATE ARRIVAL ---
         # SỬA: Không có cột delay_minutes, chúng ta sẽ dùng sự khác biệt giữa event_timestamp và created_at (nếu có) 
         # hoặc đếm trực tiếp dựa trên error_code
         cur.execute("""
@@ -127,7 +127,7 @@ def fetch_metrics():
             "rate": round((late_total / total_records * 100), 2) if total_records > 0 else 0,
             "buckets": ["Total Late"],
             "counts": [late_total]
-        }
+        }'''
 
         # --- SECTION 6: MISSING FIELD ---
         cur.execute("SELECT COUNT(*) as total FROM invalid_log WHERE error_code = 'ERR_MISSING_FIELD';")

@@ -1,3 +1,4 @@
+#mock_services\itu_e164\app.py
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -5,6 +6,7 @@ import uuid
 import asyncio
 from mock_services.itu_e164.router import router as itu_router
 from mock_services.itu_e164.seed import generate_mock_itu_csv, load_itu_data_to_memory
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -16,6 +18,12 @@ async def lifespan(app: FastAPI):
     print("🛑 [ITU E.164] Service stopped.")
 
 app = FastAPI(title="ITU-T E.164 Mock API", version="1.0.0", lifespan=lifespan)
+
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 # Kế thừa Phase 1: Giả lập bộ Middleware tích hợp cơ chế X-Inject-Fault từ shared/errors.py
 @app.middleware("http")

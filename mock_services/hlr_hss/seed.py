@@ -4,13 +4,16 @@ import argparse
 import random
 from datetime import datetime, timedelta
 from typing import Dict, List
-
+import sqlite3
 
 # In-memory RAM database để định tuyến siêu tốc O(1)
 # SUBSCRIBERS_BY_IMSI: mỗi IMSI có thể có nhiều dòng lịch sử (number portability:
 # 1 IMSI gắn nhiều MSISDN theo thời gian) -> giữ List để build msisdn-history.
 SUBSCRIBERS_BY_IMSI: Dict[str, List[dict]] = {}
 SUBSCRIBERS_BY_MSISDN: Dict[str, List[dict]] = {}
+
+
+
 
 def generate_mock_subscribers_csv(output_path: str, count: int, seed_value: int):
     """Sinh file dữ liệu subscribers.csv đồng bộ giả lập dựa trên seed cố định"""
@@ -114,3 +117,4 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
     generate_mock_subscribers_csv("mock_services/hlr_hss/data/subscribers.csv", args.count, args.seed)
+    print(f"gen mock xong")

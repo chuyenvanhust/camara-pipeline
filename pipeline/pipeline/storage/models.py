@@ -41,17 +41,10 @@ class Base(DeclarativeBase):
 # ==============================================================================
 
 class RadiusSession(Base):
-    """
-    Lưu toàn bộ RADIUS record đã qua pipeline (radius.clean → S5).
-    Partition RANGE by event_timestamp (monthly) — xem ADR-003.
-
-    Ghi bởi: pipeline/storage/writer.py (Stage S5)
-    Query bởi: api/routers/ (SIM Swap, Device Swap, Number Verification)
-    """
     __tablename__ = "radius_sessions"
     __table_args__ = (
         UniqueConstraint(
-            "acct_session_id", "event_timestamp",
+            "acct_session_id", "acct_status_type", "event_timestamp", # Thêm status_type vào đây cho chắc chắn
             name="uq_session_event",
         ),
         {"info": {"partition_by": "RANGE (event_timestamp)"}},
@@ -60,26 +53,43 @@ class RadiusSession(Base):
     id = Column(BigInteger, primary_key=True, autoincrement=True)
     acct_session_id = Column(String(36), nullable=False)
     acct_status_type = Column(String(16), nullable=False)
+    
+    # LỖI 1: Đổi 'acct_status_time' thành 'acct_session_time' để khớp với CSV và INSERT_COLUMNS
+    acct_session_time = Column(Integer, nullable=False) 
+    
     event_timestamp = Column(DateTime(timezone=True), nullable=False)
-    ingest_timestamp = Column(DateTime(timezone=True), server_default=func.now())
+    
+    # LỖI 2: ingest_timestamp nên cho phép Null hoặc nhận từ Spark truyền xuống
+    ingest_timestamp = Column(DateTime(timezone=True), nullable=True) 
+    
     msisdn = Column(String(16), nullable=False)
     imsi = Column(String(15), nullable=False)
     imei = Column(String(15), nullable=False)
     rat_type = Column(String(8), nullable=True)
-    framed_ip = Column(String(45), nullable=True)   # IPv4/IPv6 as text
+    framed_ip = Column(String(45), nullable=True)
     nas_ip = Column(String(45), nullable=True)
     mcc_mnc = Column(String(6), nullable=True)
     late_arrival = Column(Boolean, default=False)
 
-    #: Cột cần INSERT (id auto-generated, ingest_timestamp server_default)
+    #: THỨ TỰ CẦN KHỚP 100% VỚI SCHEMA TRONG WRITER.PY
     INSERT_COLUMNS = (
-        "acct_session_id", "acct_status_type", "event_timestamp",
-        "msisdn", "imsi", "imei",
-        "rat_type", "framed_ip", "nas_ip", "mcc_mnc", "late_arrival",
+        "acct_session_id", 
+        "acct_status_type",
+        "acct_session_time", 
+        "event_timestamp",
+        "ingest_timestamp", # Thêm vào để khớp với dữ liệu 12 cột
+        "msisdn", 
+        "imsi", 
+        "imei",
+        "rat_type", 
+        "framed_ip", 
+        "nas_ip", 
+        "mcc_mnc", 
+        "late_arrival",
     )
 
-    #: Unique constraint columns cho ON CONFLICT DO NOTHING
-    CONFLICT_COLUMNS = ("acct_session_id", "event_timestamp")
+    #: Cột dùng để check trùng (Cho Partitioned table, bắt buộc phải có event_timestamp)
+    CONFLICT_COLUMNS = ("acct_session_id", "acct_status_type", "event_timestamp")
 
     def __repr__(self):
         return (
