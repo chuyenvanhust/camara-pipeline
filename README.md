@@ -325,14 +325,14 @@ curl -H "X-Inject-Fault: error_rate=0.2" http://localhost:8100/tac/352099
 ```bash
 git clone <repo-url> camara-pipeline
 cd camara-pipeline
-cp .env.example .env
+cp .env.test .env
 ```
 
-### Bước 2 — Khởi động toàn bộ stack (10 services)
+### Bước 2 — Khởi động toàn bộ stack 
 
 ```bash
-make up
-# docker compose up --build -d
+
+        docker compose -f mock_services/docker-compose.mock.yml up -d
 ```
 
 Bao gồm: Kafka, Zookeeper, PostgreSQL, Spark, FastAPI,
@@ -341,17 +341,17 @@ Prometheus, Grafana, **và 3 mock services**.
 ### Bước 3 — Seed mock services (chạy 1 lần)
 
 ```bash
-# Seed phải đúng thứ tự: TAC trước, HLR/HSS sau
-python mock_services/gsma_tac/seed.py  --count 2000   --seed 42
-python mock_services/hlr_hss/seed.py   --count 100000 --seed 42
-python mock_services/itu_e164/seed.py  # static data, không cần seed
+        docker exec -e PYTHONPATH=. -w /workspace camara-mock-gsma-tac python -m mock_services.gsma_tac.seed --count 2000 --seed 42 || { echo "Lỗi seed GSMA"; exit 1; }
+        
+        docker exec -e PYTHONPATH=. -w /workspace camara-mock-hlr-hss python -m mock_services.hlr_hss.seed --count 100000 --seed 42 || { echo "Lỗi seed HLR"; exit 1; }
+        
+        docker exec -e PYTHONPATH=. -w /workspace camara-mock-itu-e164 python -m mock_services.itu_e164.seed --count 1000 --seed 42 || { echo "Lỗi seed ITU"; exit 1; }
 ```
 
 ### Bước 4 — Sinh dữ liệu
 
 ```bash
-make sim
-# python simulator/simulator.py --records 2000000 --seed 42 --output data/radius_log.csv
+bash scripts/run_simulator.sh
 ```
 
 Simulator gọi GSMA TAC mock (`GET /tac`) khi khởi động để tải danh sách TAC hợp lệ.
@@ -359,8 +359,7 @@ Simulator gọi GSMA TAC mock (`GET /tac`) khi khởi động để tải danh s
 ### Bước 5 — Chạy pipeline
 
 ```bash
-make pipeline
-# python pipeline/run_pipeline.py --input data/radius_log.csv
+bash scripts/run_pipeline.sh
 ```
 
 Pipeline stage S2 gọi 3 mock services qua HTTP trong quá trình validation.
@@ -370,7 +369,7 @@ Stage S4 gọi HLR/HSS mock khi phát hiện conflict C.
 
 ```bash
 # Data Quality Report
-make report
+bash scripts/generate_report.sh
 # Mở reports/quality_report_<timestamp>.html
 
 # Gọi thử API
@@ -429,11 +428,11 @@ docker compose -f docker-compose.test.yml up -d
 pip install -e ".[test]"
 
 # Tất cả 36 test case
-pytest tests/ -v
+pytest tests/integration -v
 
 # Theo nhóm
-pytest tests/api/      -v          # TC01–TC22, TC34–TC36
-pytest tests/pipeline/ -v          # TC23–TC33
+pytest tests/integration/api/      -v          # TC01–TC22, TC34–TC36
+pytest tests/integration/pipeline/ -v          # TC23–TC33
 
 # Theo marker
 pytest -m edge_case    -v
