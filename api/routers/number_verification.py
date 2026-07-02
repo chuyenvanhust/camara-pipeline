@@ -13,14 +13,40 @@ Query logic (simplified lab — xem Quyết định Lab #9):
       AND r1.event_timestamp >= NOW() - INTERVAL '24 hours'
       AND NOT EXISTS (
         SELECT 1 FROM radius_sessions r2
-        WHERE r2.acct_session_id = r1.acct_session_id
+        WHERE r2.msisdn = $1
+          AND r2.acct_session_id = r1.acct_session_id
           AND r2.acct_status_type = 'Stop'
+          AND r2.event_timestamp >= r1.event_timestamp
       )
   )
 
+[FIX - KHONG THEM INDEX MOI] Ban truoc subquery r2 chi loc theo
+`acct_session_id` -- cot nay KHONG nam trong bat ky index nao (3
+index hien co idx_msisdn_ts/idx_imsi_ts/idx_imei_ts deu khong phu
+acct_session_id) -> Postgres phai Seq Scan TOAN BO cac partition cho
+MOI row cua r1 de tim Stop tuong ung -> voi bang trieu record, vi
+pham SLA p95<=100ms nghiem trong.
+
+Thay vi them index moi cho acct_session_id, sua truc tiep cau SQL:
+them dieu kien `r2.msisdn = $1` (hang so da biet tu tham so, khong
+phai gia tri tuong quan) vao subquery r2. Vi moi ban ghi Start/Stop
+cua CUNG 1 session luon co CUNG msisdn (session khong the "doi chu"
+giua Start va Stop trong du lieu hop le), dieu kien nay khong lam
+sai lech ket qua, nhung cho phep planner dung idx_msisdn_ts
+(msisdn, event_timestamp DESC) DA CO SAN de gioi han subquery r2 chi
+quet trong tap ban ghi CUA RIENG thue bao nay (thuong vai chuc/vai
+tram dong trong toan bo lich su), thay vi toan bang.
+
+Them dieu kien `r2.event_timestamp >= r1.event_timestamp` de:
+  1. Dung dinh dung nghiep vu: 1 ban ghi Stop luon xay ra SAU (hoac
+     cung luc) ban ghi Start tuong ung cua no, khong bao gio truoc.
+  2. Giup planner uu tien quet theo thu tu DESC cua index, dung lai
+     som hon khi tim thay Stop gan nhat.
+
 SLA: p95 ≤ 100ms — nghiêm hơn SIM/Device Swap.
-Đảm bảo bởi: index idx_msisdn_ts (msisdn, event_timestamp DESC)
-+ query chỉ scan partition tháng hiện tại (RANGE partition by month).
+Đảm bảo bởi: idx_msisdn_ts (msisdn, event_timestamp DESC) — DÙNG
+CHUNG cho cả r1 lẫn r2 (không cần index mới nào khác) + partition
+pruning theo event_timestamp cho r1 (RANGE by month).
 """
 
 from fastapi import APIRouter, Depends
@@ -41,6 +67,9 @@ router = APIRouter(
 
 # Dùng EXISTS thay vì COUNT(*) — dừng scan ngay khi tìm thấy 1 row,
 # hiệu quả hơn khi index đã có, đảm bảo SLA 100ms p95.
+#
+# [FIX] Thêm `r2.msisdn = $1` và `r2.event_timestamp >= r1.event_timestamp`
+# để subquery r2 tận dụng được idx_msisdn_ts sẵn có, KHÔNG cần index mới.
 _QUERY_ACTIVE_SESSION = """
     SELECT EXISTS (
         SELECT 1
@@ -51,8 +80,10 @@ _QUERY_ACTIVE_SESSION = """
           AND NOT EXISTS (
               SELECT 1
               FROM radius_sessions r2
-              WHERE r2.acct_session_id = r1.acct_session_id
+              WHERE r2.msisdn = $1
+                AND r2.acct_session_id = r1.acct_session_id
                 AND r2.acct_status_type = 'Stop'
+                AND r2.event_timestamp >= r1.event_timestamp
           )
     ) AS has_active_session
 """
@@ -87,6 +118,7 @@ async def verify_number(
     Returns:
         NumberVerifyResponse: { devicePhoneNumberVerified: bool }
     """
-    row = await db.fetchrow(_QUERY_ACTIVE_SESSION, str(body.phoneNumber))
+    msisdn = str(body.phoneNumber)
+    row = await db.fetchrow(_QUERY_ACTIVE_SESSION, msisdn)
     verified = row["has_active_session"] if row else False
     return NumberVerifyResponse(devicePhoneNumberVerified=verified)

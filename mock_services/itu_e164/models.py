@@ -18,7 +18,7 @@ class CountryCodeInfo(BaseModel):
 class SingleValidationRequest(BaseModel):
     phone_number: str = Field(..., description="Số điện thoại cần kiểm tra, ví dụ: +84912345678")
 class BatchValidationRequest(BaseModel):
-    phone_numbers: List[str] = Field(..., max_length=100)
+    phone_numbers: List[str] = Field(..., max_length=500)
 class ValidationResult(BaseModel):
     phone_number: str
     valid: bool

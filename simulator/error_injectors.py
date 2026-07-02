@@ -1,79 +1,211 @@
+#simulator\error_injectors.py
 import random
 from typing import List, Dict, Any
 from datetime import datetime, timedelta
 
+from shared.seed_config import SUBSCRIBER_POOL_SIZE
+from shared.subscriber_pool import base_subscriber, has_sim_swap, swap_new_imsi_subscriber
+
+SWAP_ELIGIBLE_INDICES = [i for i in range(SUBSCRIBER_POOL_SIZE) if has_sim_swap(i)]
 class ErrorInjector:
+    """
+    Tiêm lỗi/kịch bản nghiệp vụ vào dữ liệu RADIUS đã sinh sạch.
+    Mỗi loại lỗi có tỷ lệ riêng, lấy trực tiếp từ SimulatorConfig
+    (duplicate_rate, late_arrival_rate, invalid_imei_rate, conflict_rate,
+    missing_field_rate) — không gộp chung 1 ngân sách.
+
+    Dùng RNG cục bộ (self.rng = random.Random(config.seed)), KHÔNG gọi
+    random.seed() trên global random module, để tránh bị các thành phần
+    khác (RadiusDataGenerator, gsma_tac/seed.py, hlr_hss/seed.py) tranh
+    chấp/reseed lẫn nhau khi chạy chung tiến trình.
+    """
+
     def __init__(self, config):
         self.config = config
-        random.seed(config.seed)
+        self.rng = random.Random(config.seed)
 
     def inject_duplicates(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Nhân bản bản ghi giữ nguyên Session ID và Timestamp theo tỷ lệ cấu hình"""
+        """Nhân bản bản ghi giữ nguyên Session ID và Timestamp theo tỷ lệ duplicate_rate"""
         if self.config.duplicate_rate <= 0:
             return records
-        
+
         output = []
         for rec in records:
             output.append(rec)
-            if random.random() < self.config.duplicate_rate:
-                # Tạo bản sao sâu nông để giữ nguyên định danh nhưng tạo luồng trùng
+            if self.rng.random() < self.config.duplicate_rate:
                 dup_rec = rec.copy()
                 output.append(dup_rec)
         return output
 
     def inject_late_arrivals(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Đẩy ingest_timestamp lên rất cao mô phỏng mạng trễ (Late Arrival)"""
+        """Đẩy ingest_timestamp muộn hơn event_timestamp 3 tiếng (> 7200s threshold),
+        theo tỷ lệ late_arrival_rate, mô phỏng mạng trễ."""
         if self.config.late_arrival_rate <= 0:
             return records
 
         for rec in records:
-            if random.random() < self.config.late_arrival_rate:
-                # Đẩy thời gian nhận (ingest) muộn hơn thời gian sinh sự kiện (event) 3 tiếng (> 7200s threshold)
+            if self.rng.random() < self.config.late_arrival_rate:
                 evt_time = datetime.fromisoformat(rec["event_timestamp"].replace("Z", ""))
                 late_ingest = evt_time + timedelta(hours=3)
                 rec["ingest_timestamp"] = late_ingest.isoformat() + "Z"
         return records
 
     def inject_invalid_imei(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Phá hỏng checksum Luhn hoặc gán mã TAC ma không tồn tại"""
+        """Phá hỏng checksum Luhn của IMEI (đổi chữ số cuối) theo tỷ lệ invalid_imei_rate
+        -> IMEI không hợp lệ, GSMA TAC mock sẽ reject khi validate."""
         if self.config.invalid_imei_rate <= 0:
             return records
 
         for rec in records:
-            if random.random() < self.config.invalid_imei_rate:
+            if self.rng.random() < self.config.invalid_imei_rate:
+                if "imei" not in rec or not rec["imei"]:
+                    continue
                 imei = list(rec["imei"])
-                # Phá hoại bằng cách đổi chữ số cuối cùng (checksum digit) thành chữ số sai hoặc chữ chữ cái 'X'
                 imei[-1] = "9" if imei[-1] != "9" else "0"
                 rec["imei"] = "".join(imei)
         return records
 
     def inject_conflicts(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Tiêm các dạng Xung đột Nghiệp vụ (Conflict A / B / C) theo tỷ lệ 50/30/20"""
-        if self.config.conflict_rate <= 0:
-            return records
+            """
+            Tiêm Conflict A/B/C đúng định nghĩa README, theo conflict_rate,
+            phân bổ nội bộ 50/30/20.
+            """
+            if self.config.conflict_rate <= 0:
+                return records
 
-        for rec in records:
-            if random.random() < self.config.conflict_rate:
-                conflict_type = random.choices(["A", "B", "C"], weights=[50, 30, 20])[0]
-                if conflict_type == "A":
-                    # Conflict A: 1 IP gán cho 2 IMSI khác nhau tại cùng một mốc thời gian
-                    rec["imsi"] = f"452010999{random.randint(1000, 9999)}"
-                elif conflict_type == "B":
-                    # Conflict B: 1 IMSI chiếm giữ 2 IP khác nhau đồng thời
-                    rec["framed_ip"] = f"10.0.{random.randint(1,254)}.{random.randint(1,254)}"
-                elif conflict_type == "C":
-                    # Conflict C: Dấu hiệu SIM Swap (1 MSISDN liên kết với IMSI lạ hoàn toàn)
-                    rec["imsi"] = f"452010888{random.randint(1000, 9999)}"
-        return records
+            output: List[Dict[str, Any]] = []
+            i, n = 0, len(records)
+
+            while i < n:
+                start_rec = records[i]
+                stop_rec = records[i + 1] if i + 1 < n else None
+                output.append(start_rec)
+
+                if stop_rec is None:
+                    i += 2
+                    continue
+
+                if self.rng.random() < self.config.conflict_rate:
+                    conflict_type = self.rng.choices(["A", "B", "C"], weights=[50, 30, 20])[0]
+
+                    if conflict_type == "A":
+                        # [FIX] Trước đây bịa chuỗi IMSI/MSISDN tuỳ ý
+                        # ("452010999xxxx" chỉ 13 số, "84999xxxxxx" thiếu "+")
+                        # -> sai định dạng E.164/IMSI thật VÀ không tồn tại
+                        # trong HLR -> bị bước validate R3 (IMSI/MSISDN có tồn
+                        # tại không) loại bỏ trước khi tới conflict resolution.
+                        #
+                        # Sửa: mutate sang identifier của MỘT SUBSCRIBER KHÁC
+                        # có thật trong HLR (dùng base_subscriber() - cùng công
+                        # thức HLR/HSS seed.py dùng) -> vẫn hợp lệ định dạng,
+                        # vẫn tồn tại trong HLR, nhưng khác với Start cùng
+                        # session_id -> đúng định nghĩa Session Inconsistency.
+                        mutated_stop = dict(stop_rec)
+                        cur_idx = start_rec.get("_sub_idx", 0)
+                        other_idx = (cur_idx + 1) % SUBSCRIBER_POOL_SIZE
+                        if other_idx == cur_idx:  # phòng khi pool size = 1
+                            other_idx = (cur_idx + 2) % SUBSCRIBER_POOL_SIZE
+                        other_sub = base_subscriber(other_idx)
+
+                        if self.rng.random() < 0.5:
+                            mutated_stop["imsi"] = other_sub["imsi"]
+                        else:
+                            mutated_stop["msisdn"] = other_sub["msisdn"]
+                        output.append(mutated_stop)
+
+                    elif conflict_type == "B":
+                        extra_start = dict(start_rec)
+                        extra_start["acct_session_id"] = f"SESS_B_{i:010d}"
+                        extra_start["acct_session_time"] = "0"
+                        try:
+                            t0 = datetime.fromisoformat(start_rec["event_timestamp"].replace("Z", ""))
+                            t1 = datetime.fromisoformat(stop_rec["event_timestamp"].replace("Z", ""))
+                            mid = t0 + (t1 - t0) / 2
+                            extra_start["event_timestamp"] = mid.isoformat() + "Z"
+                            extra_start["ingest_timestamp"] = (mid + timedelta(seconds=2)).isoformat() + "Z"
+                        except (ValueError, TypeError):
+                            pass
+                        output.append(extra_start)
+                        output.append(stop_rec)
+
+                    elif conflict_type == "C":
+                        output.append(stop_rec)
+
+                        # [FIX] Trước đây dùng sub_idx của session HIỆN TẠI
+                        # (start_rec["_sub_idx"]) rồi check has_sim_swap(sub_idx)
+                        # -> chỉ đúng với ~2% subscriber (index % 50 == 0), mà
+                        # round-robin (s % config.subscribers) hiếm khi rơi vào
+                        # đúng các index đó -> hầu hết roll trúng "C" bị continue,
+                        # không sinh ra record nào (mất tích trong im lặng).
+                        #
+                        # Sửa: KHÔNG phụ thuộc sub_idx của session hiện tại nữa.
+                        # Chọn trực tiếp 1 subscriber từ SWAP_ELIGIBLE_INDICES
+                        # (đã biết chắc HLR có seed sẵn bản ghi swap) -> luôn
+                        # tạo được Conflict C hợp lệ mỗi khi roll trúng type C.
+                        if not SWAP_ELIGIBLE_INDICES:
+                            # An toàn: nếu vì lý do gì đó pool rỗng, bỏ qua thay
+                            # vì crash.
+                            i += 2
+                            continue
+
+                        swap_idx = self.rng.choice(SWAP_ELIGIBLE_INDICES)
+                        swap_msisdn = base_subscriber(swap_idx)["msisdn"]
+                        new_imsi = swap_new_imsi_subscriber(swap_idx, SUBSCRIBER_POOL_SIZE)["imsi"]
+                        swap_session_id = f"SESS_C_{i:010d}"
+
+                        try:
+                            t_stop = datetime.fromisoformat(stop_rec["event_timestamp"].replace("Z", ""))
+                            t_swap_start = t_stop + timedelta(minutes=10)
+                            t_swap_stop = t_swap_start + timedelta(seconds=60)
+                        except (ValueError, TypeError):
+                            t_swap_start = t_swap_stop = None
+
+                        # [FIX kèm theo] swap_start/swap_stop phải dùng ĐÚNG
+                        # msisdn của subscriber được chọn (swap_msisdn), không
+                        # phải msisdn của start_rec/stop_rec gốc như bản cũ —
+                        # nếu không, Conflict C sẽ có 2 msisdn khác nhau trong
+                        # cùng 1 "sự kiện swap", vô nghĩa với swap_detector.py.
+                        swap_start = dict(start_rec)
+                        swap_start.update({
+                            "acct_session_id": swap_session_id,
+                            "acct_status_type": "Start",
+                            "acct_session_time": "0",
+                            "msisdn": swap_msisdn,
+                            "imsi": new_imsi,
+                            "_sub_idx": swap_idx,
+                        })
+                        swap_stop = dict(stop_rec)
+                        swap_stop.update({
+                            "acct_session_id": swap_session_id,
+                            "acct_status_type": "Stop",
+                            "acct_session_time": "60",
+                            "msisdn": swap_msisdn,
+                            "imsi": new_imsi,
+                            "_sub_idx": swap_idx,
+                        })
+                        if t_swap_start is not None:
+                            swap_start["event_timestamp"] = t_swap_start.isoformat() + "Z"
+                            swap_start["ingest_timestamp"] = (t_swap_start + timedelta(seconds=2)).isoformat() + "Z"
+                            swap_stop["event_timestamp"] = t_swap_stop.isoformat() + "Z"
+                            swap_stop["ingest_timestamp"] = (t_swap_stop + timedelta(seconds=2)).isoformat() + "Z"
+
+                        output.append(swap_start)
+                        output.append(swap_stop)
+                else:
+                    output.append(stop_rec)
+
+                i += 2
+
+            return output
 
     def inject_missing_fields(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Xóa ngẫu nhiên các trường bắt buộc (Mandatory) của bản ghi"""
+        """Xóa ngẫu nhiên 1 trong các trường bắt buộc theo tỷ lệ missing_field_rate"""
         if self.config.missing_field_rate <= 0:
             return records
 
         mandatory_fields = ["acct_status_type", "acct_session_id", "msisdn"]
         for rec in records:
-            if random.random() < self.config.missing_field_rate:
-                field_to_drop = random.choice(mandatory_fields)
-                rec[field_to_drop] = ""  # Để trống trường dữ liệu
+            if self.rng.random() < self.config.missing_field_rate:
+                field_to_drop = self.rng.choice(mandatory_fields)
+                rec[field_to_drop] = ""
         return records

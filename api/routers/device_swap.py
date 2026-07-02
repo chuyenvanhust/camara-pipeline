@@ -11,15 +11,32 @@ Endpoints:
   POST /device-swap/v0/check          → deviceSwapped: bool
   POST /device-swap/v0/retrieve-date  → latestDeviceChange: datetime | null
 
-Query logic:
-  SELECT detected_at FROM swap_event
+[FIX - KHONG SUA SQL/INDEX] Cung loi nghiep vu nhu sim_swap.py: query
+CU dung `detected_at` (tin hieu tho) thay vi `confirmed_at` (da xac
+nhan qua nguon su that) va khong loc `confirmed_at IS NOT NULL`. Sua
+dong bo voi sim_swap.py.
+
+Query logic MOI:
+  SELECT confirmed_at FROM swap_event
   WHERE msisdn = $1
     AND swap_type = 'DEVICE_SWAP'
-    AND detected_at >= NOW() - $2 * INTERVAL '1 day'
-  ORDER BY detected_at DESC
+    AND confirmed_at IS NOT NULL
+    AND confirmed_at >= NOW() - $2 * INTERVAL '1 day'
+  ORDER BY confirmed_at DESC
   LIMIT 1
 
-SLA: p95 ≤ 200ms — index idx_swap_imei (imei, detected_at DESC).
+[VE INDEX] KHONG can tao index moi. Query luon loc theo `msisdn`
+(vi input la phoneNumber, khong phai imei) nen idx_swap_msisdn hien
+co (msisdn, detected_at DESC) van duoc dung de thu hep pham vi quet
+xuong chi cac dong cua RIENG thue bao nay, truoc khi loc/sort theo
+confirmed_at tren tap con nho da thu hep.
+
+[LUU Y] idx_swap_imei (imei, detected_at DESC) hien co KHONG duoc
+dung boi endpoint nay (va cung khong duoc dung boi sim_swap.py) vi
+ca 2 API deu nhan phoneNumber (msisdn) lam input, khong phai imei.
+Index nay chi co y nghia neu sau nay co them 1 endpoint tra cuu
+truc tiep theo IMEI (hien chua ton tai) -- khong dong cham gi trong
+lan sua nay vi yeu cau la KHONG sua SQL.
 """
 
 from fastapi import APIRouter, Depends
@@ -39,13 +56,16 @@ router = APIRouter(
     dependencies=[Depends(verify_api_key)],
 )
 
+# [FIX] Doi detected_at -> confirmed_at, them confirmed_at IS NOT NULL,
+# dong bo voi sim_swap.py.
 _QUERY_LATEST_DEVICE_SWAP = """
-    SELECT detected_at
+    SELECT confirmed_at
     FROM swap_event
     WHERE msisdn = $1
       AND swap_type = 'DEVICE_SWAP'
-      AND detected_at >= NOW() - ($2 * INTERVAL '1 day')
-    ORDER BY detected_at DESC
+      AND confirmed_at IS NOT NULL
+      AND confirmed_at >= NOW() - ($2 * INTERVAL '1 day')
+    ORDER BY confirmed_at DESC
     LIMIT 1
 """
 
@@ -65,8 +85,9 @@ async def check_device_swap(
     db: asyncpg.Connection = Depends(get_db),
 ) -> DeviceSwapCheckResponse:
     """
-    Trả về deviceSwapped=True nếu IMEI của thuê bao thay đổi
-    trong khoảng maxAge ngày gần nhất.
+    Trả về deviceSwapped=True nếu IMEI của thuê bao thay đổi trong
+    khoảng maxAge ngày gần nhất, VÀ sự kiện đó đã được xác nhận
+    (confirmed_at IS NOT NULL).
 
     Args:
         body: phoneNumber (E.164) + maxAge (ngày, mặc định 30).
@@ -87,7 +108,7 @@ async def check_device_swap(
     summary="Lấy thời điểm đổi thiết bị gần nhất",
     description=(
         "**Custom extension** — trả về thời điểm IMEI thay đổi gần nhất. "
-        "null nếu không có thay đổi trong khoảng maxAge ngày."
+        "null nếu không có thay đổi đã xác nhận trong khoảng maxAge ngày."
     ),
 )
 async def retrieve_device_swap_date(
@@ -95,7 +116,8 @@ async def retrieve_device_swap_date(
     db: asyncpg.Connection = Depends(get_db),
 ) -> DeviceSwapRetrieveDateResponse:
     """
-    Trả về thời điểm đổi thiết bị gần nhất trong maxAge ngày.
+    Trả về thời điểm đổi thiết bị gần nhất ĐÃ ĐƯỢC XÁC NHẬN
+    (confirmed_at) trong maxAge ngày.
 
     Args:
         body: phoneNumber (E.164) + maxAge (ngày).
@@ -108,5 +130,5 @@ async def retrieve_device_swap_date(
         _QUERY_LATEST_DEVICE_SWAP, str(body.phoneNumber), body.maxAge
     )
     return DeviceSwapRetrieveDateResponse(
-        latestDeviceChange=row["detected_at"] if row else None
+        latestDeviceChange=row["confirmed_at"] if row else None
     )

@@ -54,7 +54,7 @@ class BatchLookupItemResult(BaseModel):
     subscriber: Optional[SubscriberProfile] = None
 
 class BatchLookupRequest(BaseModel):
-    lookups: List[LookupQuery] = Field(..., max_length=200)
+    lookups: List[LookupQuery] = Field(..., max_length=500)
 
 class BatchLookupResponse(BaseModel):
     results: List[BatchLookupItemResult]

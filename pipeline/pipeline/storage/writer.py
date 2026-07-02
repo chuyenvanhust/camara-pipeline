@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # Bootstrap sys.path
+#pipeline\pipeline\storage\writer.py
 import sys, os as _os
 sys.path.insert(0, _os.path.abspath(_os.path.join(_os.path.dirname(__file__), "..", "..")))
 
@@ -48,8 +49,8 @@ DB_PASSWORD = os.getenv("DB_PASSWORD", "camara")
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "camara-kafka:9092")
 KAFKA_TOPIC_CLEAN       = os.getenv("KAFKA_TOPIC_CLEAN", "radius.clean")
 
-SPARK_JDBC_BATCH_SIZE    = int(os.getenv("SPARK_JDBC_BATCH_SIZE",         "1000"))
-SPARK_COMMIT_INTERVAL    = os.getenv("SPARK_COMMIT_INTERVAL_SECONDS",     "5")
+SPARK_JDBC_BATCH_SIZE    = int(os.getenv("SPARK_JDBC_BATCH_SIZE",         "20000"))
+SPARK_COMMIT_INTERVAL    = os.getenv("SPARK_COMMIT_INTERVAL_SECONDS",     "0")
 
 CHECKPOINT_LOCATION = os.getenv(
     "STORAGE_CHECKPOINT_DIR",
@@ -101,26 +102,78 @@ def extract_rows_from_batch(rows: List[Dict], columns) -> List[Tuple]:
 # 3. SPARK I/O
 # ==============================================================================
 
-def write_micro_batch(dsn: dict, batch_size: int = SPARK_JDBC_BATCH_SIZE):
-    # Dùng insert_sql thay vì upsert_sql
-    insert_sql = build_insert_sql(RadiusSession.__tablename__, RadiusSession.INSERT_COLUMNS)
+import io
+import csv
+import psycopg2
+from pyspark.sql import DataFrame
+
+
+def write_micro_batch(dsn: dict):
+    columns = RadiusSession.INSERT_COLUMNS
+    table = RadiusSession.__tablename__
+
+    copy_sql = f"""
+        COPY {table} ({", ".join(columns)})
+        FROM STDIN
+        WITH (
+            FORMAT CSV,
+            DELIMITER ',',
+            QUOTE '"',
+            ESCAPE '"',
+            NULL ''
+        )
+    """
 
     def _callback(batch_df: DataFrame, batch_id: int) -> None:
         rows = [r.asDict() for r in batch_df.collect()]
-        if not rows: return
-        data = extract_rows_from_batch(rows, RadiusSession.INSERT_COLUMNS)
+        if not rows:
+            return
+
         conn = psycopg2.connect(**dsn)
+
         try:
-            with conn.cursor() as cur:
-                # Trigger trong DB sẽ tự xử lý trùng, Python chỉ việc gửi data
-                cur.executemany(insert_sql, data)
-            conn.commit()
-            logger.info("S3 batch %d: %d rows written", batch_id, len(data))
-        except Exception as e:
-            conn.rollback()
-            logger.error("S3 batch %d failed: %s", batch_id, e)
+            with conn:
+                with conn.cursor() as cur:
+
+                    # chỉ áp dụng cho transaction hiện tại
+                    cur.execute("SET LOCAL synchronous_commit = OFF;")
+
+                    buffer = io.StringIO()
+
+                    writer = csv.writer(
+                        buffer,
+                        delimiter=",",
+                        quotechar='"',
+                        quoting=csv.QUOTE_MINIMAL,
+                        lineterminator="\n",
+                    )
+
+                    for row in rows:
+                        writer.writerow([
+                            row.get(col)
+                            for col in columns
+                        ])
+
+                    buffer.seek(0)
+
+                    cur.copy_expert(copy_sql, buffer)
+
+            logger.info(
+                "S3 batch %d: %d rows copied via COPY",
+                batch_id,
+                len(rows),
+            )
+
+        except Exception:
+            logger.exception(
+                "S3 batch %d failed (%d rows rolled back)",
+                batch_id,
+                len(rows),
+            )
+
         finally:
             conn.close()
+
     return _callback
 
 
@@ -148,13 +201,37 @@ def start_storage_stream(spark: SparkSession):
         .withColumn("acct_session_time", F.col("acct_session_time").cast("integer"))
         
         # 2. Chuyển ISO String của sự kiện sang Timestamp chuẩn
-        .withColumn("event_timestamp", F.to_timestamp(F.col("event_timestamp")))
+        .withColumn(
+            "event_timestamp",
+            F.when(
+                F.col("event_timestamp").rlike(r"^\d+$"),
+                F.to_timestamp(F.col("event_timestamp").cast("long"))
+            ).otherwise(
+                F.to_timestamp(F.col("event_timestamp"))
+            )
+        )
         
         # 3. BỔ SUNG: Chuyển ISO String của thời điểm nạp sang Timestamp chuẩn
-        .withColumn("ingest_timestamp", F.to_timestamp(F.col("ingest_timestamp")))
+        .withColumn(
+            "ingest_timestamp",
+            F.when(
+                F.col("ingest_timestamp").rlike(r"^\d+$"),
+                F.to_timestamp(F.col("ingest_timestamp").cast("long"))
+            ).otherwise(
+                F.to_timestamp(F.col("ingest_timestamp"))
+            )
+        )
         
         # 4. Đảm bảo late_arrival không bị Null (gán False nếu không có)
         .withColumn("late_arrival", F.coalesce(F.col("late_arrival"), F.lit(False)))
+        .withColumn(
+            "framed_ip",
+            F.when(F.col("framed_ip") == "", None).otherwise(F.col("framed_ip"))
+        )
+        .withColumn(
+            "nas_ip",
+            F.when(F.col("nas_ip") == "", None).otherwise(F.col("nas_ip"))
+        )
     )
 
     dsn   = build_dsn()
@@ -172,13 +249,16 @@ def start_storage_stream(spark: SparkSession):
     )
     return query
 
-
 def main() -> None:
+    s3_cores = os.getenv("SPARK_S3_LOCAL_CORES", "2")            # THÊM
+    s3_driver_memory = os.getenv("SPARK_S3_DRIVER_MEMORY", "512m")  # THÊM
+
     builder = (
         SparkSession.builder
         .appName("Camara-Storage-Job")
-        .master("local[*]")
-        .config("spark.sql.shuffle.partitions", "4")
+        .master(f"local[{s3_cores}]")                             # SỬA: local[*] -> local[N] tường minh
+        .config("spark.driver.memory", s3_driver_memory)           # THÊM
+        .config("spark.sql.shuffle.partitions", "2")               # SỬA: 4 -> 2, S3 chỉ ghi tuần tự
     )
     spark = configure_spark_jars(builder, KAFKA_PG_PACKAGES).getOrCreate()
 

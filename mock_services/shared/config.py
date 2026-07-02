@@ -1,5 +1,6 @@
 import os
-
+from datetime import datetime, timezone
+RADIUS_SIMULATION_START = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
 class MockConfig:
     # ITU
     ITU_CC_PATH = os.getenv("ITU_CC_PATH", "mock_services/itu_e164/data/country_codes.csv")

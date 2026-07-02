@@ -1,16 +1,23 @@
 import random
 import requests
 from typing import List, Dict
+from shared.seed_config import MASTER_SEED, GSMA_MOCK_URL, TAC_POOL_SIZE, SUBSCRIBER_POOL_SIZE
+from shared.tac_pool import generate_tac_codes
+from shared.subscriber_pool import base_subscriber
+
 
 class RadiusDataGenerator:
-    def __init__(self, seed: int = 42, gsma_url: str = "http://camara-mock-gsma-tac:8100"):
+    def __init__(self, seed: int = MASTER_SEED, gsma_url: str = GSMA_MOCK_URL):
         self.seed = seed
         self.gsma_url = gsma_url
         self.tac_pool: List[str] = []
-        random.seed(self.seed)
+        self.rng = random.Random(self.seed)  # RNG cục bộ, KHÔNG đụng global random
 
     def fetch_tac_pool_from_mock(self):
-        """Gọi API sang GSMA TAC Mock để đồng bộ Pool dữ liệu TAC hợp lệ"""
+        """Đồng bộ TAC pool từ GSMA TAC Mock. Nếu mock offline, fallback
+        sang generate_tac_codes(seed, TAC_POOL_SIZE) — hàm DÙNG CHUNG với
+        gsma_tac/seed.py nên luôn ra đúng tập TAC mà mock thực sự đã seed,
+        kể cả khi không gọi được API."""
         try:
             response = requests.get(f"{self.gsma_url}/tac", timeout=5)
             if response.status_code == 200:
@@ -19,26 +26,20 @@ class RadiusDataGenerator:
                     self.tac_pool = [item.get("tac") if isinstance(item, dict) else item for item in data]
                 elif isinstance(data, dict) and "records" in data:
                     self.tac_pool = [item["tac"] for item in data["records"]]
-                
                 print(f"✅ [Simulator Generator] Synchronized {len(self.tac_pool)} valid TACs from GSMA Mock.")
             else:
                 self._fallback_tac_pool()
         except requests.RequestException:
-            print("⚠️ [Simulator Generator] GSMA Mock offline. Using local sequential fallback TAC pool.")
+            print("⚠️ [Simulator Generator] GSMA Mock offline. Using deterministic fallback TAC pool.")
             self._fallback_tac_pool()
 
     def _fallback_tac_pool(self):
-        """
-        [CẬP NHẬT] Tạo pool TAC tuần tự từ 000000 đến 999999.
-        Việc tạo 1 triệu chuỗi tốn khoảng 80MB RAM, hoàn toàn ổn định cho môi trường hiện tại.
-        """
-        print("🔄 [Simulator] Generating 1,000,000 sequential TACs (000000-999999)...")
-        # Tạo danh sách các chuỗi từ "000000" đến "999999"
-        self.tac_pool = [f"{i:06d}" for i in range(1000000)]
+        self.tac_pool = generate_tac_codes(self.seed, TAC_POOL_SIZE)
+        print(f"🔄 [Simulator] Generated {len(self.tac_pool)} deterministic fallback TACs "
+              f"(identical to gsma_tac seed, seed={self.seed}).")
 
     def generate_luhn_checksum(self, number_str: str) -> str:
         digits = [int(d) for d in number_str]
-        # Sửa range để khớp với Validator: nhân đôi các index 13, 11, 9, 7, 5, 3, 1
         for i in range(len(digits) - 1, -1, -2):
             val = digits[i] * 2
             digits[i] = val if val < 10 else val - 9
@@ -46,29 +47,20 @@ class RadiusDataGenerator:
         return str((10 - (total % 10)) % 10)
 
     def generate_valid_imei(self) -> str:
-        """
-        [CẬP NHẬT] Sinh mã IMEI 15 chữ số.
-        Cấu trúc: TAC(6 số) + FAC(2 số) + SNR(6 số) + Checksum(1 số) = 15 số.
-        """
-        # Chọn ngẫu nhiên 1 TAC từ pool tuần tự 000000-999999
-        tac = random.choice(self.tac_pool) if self.tac_pool else f"{random.randint(0, 999999):06d}"
-        
-        # 2 số tiếp theo thường là Final Assembly Code (mặc định 00)
+        tac = self.rng.choice(self.tac_pool) if self.tac_pool else f"{self.rng.randint(0, 999999):06d}"
         fac = "00"
-        
-        # 6 số tiếp theo là Serial Number ngẫu nhiên
-        snr = f"{random.randint(0, 999999):06d}"
-        
-        # Gộp thành 14 số đầu
+        snr = f"{self.rng.randint(0, 999999):06d}"
         partial_imei = f"{tac}{fac}{snr}"
-        
-        # Tính số thứ 15 (Checksum)
         checksum = self.generate_luhn_checksum(partial_imei)
-        
         return f"{partial_imei}{checksum}"
 
     def generate_base_subscriber(self, index: int) -> Dict[str, str]:
-        """Sinh cặp định danh cơ sở đồng bộ với mock hlr_hss"""
-        imsi = f"452010{index:09d}"
-        msisdn = f"+8497{index:07d}"
-        return {"imsi": imsi, "msisdn": msisdn}
+        """Sinh cặp định danh cơ sở. Bắt buộc index < SUBSCRIBER_POOL_SIZE
+        để đảm bảo IMSI/MSISDN sinh ra LUÔN tồn tại trong HLR mock đã seed."""
+        if index >= SUBSCRIBER_POOL_SIZE:
+            raise ValueError(
+                f"index={index} vượt quá SUBSCRIBER_POOL_SIZE={SUBSCRIBER_POOL_SIZE}. "
+                "Tăng SUBSCRIBER_POOL_SIZE trong shared/seed_config.py và seed lại HLR mock "
+                "trước khi sinh thêm dữ liệu, nếu không bản ghi sẽ không tra cứu được ở HLR."
+            )
+        return base_subscriber(index)

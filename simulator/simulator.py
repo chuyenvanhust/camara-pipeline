@@ -20,47 +20,67 @@ class RadiusSimulator:
         self.injector = ErrorInjector(config)
 
     def execute_simulation(self):
-        """Khởi chạy điều phối tạo chuỗi dữ liệu lớn"""
         print("🚀 Starting RADIUS Accounting Log Simulator...")
         self.generator.fetch_tac_pool_from_mock()
-        
+
         start_time = datetime(2026, 1, 1, 0, 0, 0)
+
+        # [FIX] Sinh theo CẶP session (Start + Stop CÙNG acct_session_id),
+        # thay vì mỗi record 1 session_id riêng như bản cũ — nếu không, Conflict A
+        # (dựa vào so sánh Start/Stop cùng session_id) không bao giờ có thể xảy ra,
+        # và Conflict B (double active theo imsi) cũng vô nghĩa vì không có khái
+        # niệm "session đang mở" nào tồn tại quá 1 bản ghi.
+        num_sessions = max(1, self.config.records // 2)
         records: List[Dict[str, Any]] = []
-        
-        # 1. Sinh chuỗi dữ liệu Happy Path cơ sở
-        for i in range(self.config.records):
-            sub_idx = i % self.config.subscribers
+
+        for s in range(num_sessions):
+            sub_idx = s % self.config.subscribers
             sub = self.generator.generate_base_subscriber(sub_idx)
             imei = self.generator.generate_valid_imei()
-            
-            # Giả lập thời gian tịnh tiến dần lên
-            event_date = start_time + timedelta(seconds=i * (86400 * self.config.days // self.config.records))
-            
-            # Format dữ liệu theo đúng chuẩn RFC 2866 của gói RADIUS Accounting Log
-            record = {
-                "acct_status_type": "Start" if i % 2 == 0 else "Stop",
-                "acct_session_id": f"SESS_{i:010d}",
-                "acct_session_time": str(i % 3600),
-                "event_timestamp": event_date.isoformat() + "Z",
-                "ingest_timestamp": (event_date + timedelta(seconds=2)).isoformat() + "Z", # Mặc định độ trễ mạng 2s
+            session_id = f"SESS_{s:010d}"
+
+            t_start = start_time + timedelta(
+                seconds=s * (86400 * self.config.days // num_sessions)
+            )
+            duration_seconds = 60 + (s % 3600)  # thời lượng session, xác định deterministic theo seed s
+            t_stop = t_start + timedelta(seconds=duration_seconds)
+
+            common = {
                 "msisdn": sub["msisdn"],
                 "imsi": sub["imsi"],
                 "imei": imei,
-                "rat_type": "E-UTRAN", # Mô phỏng mạng 4G/LTE
+                "rat_type": "E-UTRAN",
                 "framed_ip": f"10.100.{sub_idx // 254}.{sub_idx % 254 + 1}",
                 "nas_ip": "192.168.1.1",
-                "mcc_mnc": "452-01"
+                "mcc_mnc": "452-01",
+                "_sub_idx": sub_idx,
             }
-            records.append(record)
-            
-        # 2. Thực hiện "Tiêm nhiễm lỗi" thông qua chuỗi Pipeline tuần tự
+
+            records.append({
+                **common,
+                "acct_session_id": session_id,
+                "acct_status_type": "Start",
+                "acct_session_time": "0",
+                "event_timestamp": t_start.isoformat() + "Z",
+                "ingest_timestamp": (t_start + timedelta(seconds=2)).isoformat() + "Z",
+            })
+            records.append({
+                **common,
+                "acct_session_id": session_id,
+                "acct_status_type": "Stop",
+                "acct_session_time": str(duration_seconds),
+                "event_timestamp": t_stop.isoformat() + "Z",
+                "ingest_timestamp": (t_stop + timedelta(seconds=2)).isoformat() + "Z",
+            })
+
+        # 2. Tiêm lỗi/nghiệp vụ — inject_conflicts() BẮT BUỘC chạy TRƯỚC các injector
+        # khác, vì nó giả định records vẫn còn nguyên thứ tự cặp (Start, Stop) liên tiếp.
         records = self.injector.inject_conflicts(records)
         records = self.injector.inject_invalid_imei(records)
         records = self.injector.inject_late_arrivals(records)
         records = self.injector.inject_duplicates(records)
         records = self.injector.inject_missing_fields(records)
-        
-        # 3. Kết xuất đầu ra dữ liệu (CSV File hoặc Stream to Kafka)
+
         if self.config.kafka:
             self._stream_to_kafka(records)
         else:
@@ -76,7 +96,7 @@ class RadiusSimulator:
         ]
         
         with open(self.config.output, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=headers)
+            writer = csv.DictWriter(f, fieldnames=headers, extrasaction='ignore')
             writer.writeheader()
             for rec in records:
                 writer.writerow(rec)

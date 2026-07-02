@@ -65,14 +65,7 @@ until nc -z localhost 7077 > /dev/null 2>&1; do
     sleep 3
 done
 
-# 6. Kiểm tra Worker đã đăng ký thành công chưa
-echo ">>> Kiểm tra trạng thái Worker..."
-# Kiểm tra log của Master xem có dòng báo nhận Worker mới không
-until docker logs camara-spark-master 2>&1 | grep -q "Registering worker"; do
-    echo "    ... Đợi Spark Worker đăng ký với Master (đang kiểm tra log)..."
-    sleep 3
-done
-echo "[OK] Spark Cluster đã sẵn sàng với Worker đang hoạt động"
+
 
 # 7. Khởi động mock services (S2 validation cần HTTP tới GSMA/HLR/ITU)
 echo ">>> Khởi động mock services..."

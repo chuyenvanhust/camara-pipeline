@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # Bootstrap sys.path
+#pipeline\pipeline\processing\processor.py
 import sys, os as _os
 sys.path.insert(0, _os.path.abspath(_os.path.join(_os.path.dirname(__file__), "..", "..")))
 
@@ -32,10 +33,64 @@ BOTTLENECK ĐÃ FIX (4 vấn đề, giữ nguyên từ bản gốc):
   FIX: dùng asyncio.run() — tự quản lý vòng đời loop.
 
 [BN-3] httpx.AsyncClient() tạo mới MỖI RECORD
-  FIX: 1 AsyncClient duy nhất PER BATCH.
+  FIX: 1 AsyncClient duy nhất PER PARTITION (xem BN-6 bên dưới — trước
+  đây là "per batch", nay mỗi partition tự tạo client riêng vì chạy
+  trên process khác nhau).
 
 [BN-4] clean_df.count() sau khi đã .save() lên Kafka
   FIX: đếm bằng len(clean_rows) trước khi ghi.
+
+[BN-5] Validation gọi API (GSMA/HLR/ITU) RIÊNG LẺ cho từng record
+  (vd 200 record → tối đa 600 HTTP call/batch, TAC tra cứu lại dù đã biết).
+  FIX: "Hybrid Prefetch" — trước khi validate, gom cả batch lại và gọi
+  MỖI service đúng 1 lần (batch API), rồi validate từng record dựa trên
+  kết quả đã prefetch. Xem pipeline/validation/rules.py::
+  execute_validation_pipeline_batch() để biết chi tiết chiến lược.
+
+[BN-6] .collect() TOÀN BỘ batch về driver rồi validate TUẦN TỰ trong 1
+  process duy nhất — dù validate đã dùng Hybrid Prefetch (BN-5), toàn bộ
+  công việc I/O-bound (gọi GSMA/HLR/ITU) vẫn chạy trên đúng 1 CPU core
+  (driver), không tận dụng được nhiều core của máy (kể cả khi cấu hình
+  local[N] với N lớn — trong kiến trúc CŨ, local[N] KHÔNG có tác dụng gì
+  cho bước validate vì mọi thứ đã bị .collect() về 1 process trước khi
+  validate chạy).
+
+  FIX: tách VALIDATE ra khỏi phần .collect() ban đầu, dùng
+  `batch_df.rdd.mapPartitions(_validate_partition)` để Spark tự chia
+  batch thành N partition và validate chúng SONG SONG trên N Python
+  worker subprocess (N quyết định bởi spark.sql.shuffle.partitions /
+  repartition, chạy trên các luồng của local[N]). Đây MỚI là chỗ
+  local[N] thực sự phát huy tác dụng, vì bước validate là I/O-bound
+  (chờ mạng) — nhiều core/process chạy song song nhiều request HTTP
+  cùng lúc sẽ giảm wall-clock time gần tuyến tính theo số partition.
+
+  QUAN TRỌNG — TẠI SAO KHÔNG mapPartitions CHO CẢ DEDUP + CONFLICT
+  RESOLUTION: 2 bước đó cần NHÌN THẤY TOÀN BỘ batch trong 1 nơi để
+  đúng đắn:
+    - Dedup dựa vào DEDUP_STATE (dict Python toàn cục, có TTL xuyên
+      suốt nhiều batch). Nếu phân tán, mỗi worker process có 1 bản
+      dict RIÊNG — 2 record trùng nhau rơi vào 2 partition khác nhau
+      sẽ KHÔNG bị phát hiện là trùng → dữ liệu trùng lọt qua, SAI.
+    - Conflict resolution cần groupby(session_id/imsi/msisdn) + sắp
+      xếp theo thời gian trên TOÀN BỘ batch (pandas). Nếu 1 session bị
+      chia sang 2 partition, phép so sánh "record trước đó" sẽ thiếu
+      dữ liệu, phát hiện sai/sót conflict.
+  => Do đó: SAU KHI mapPartitions validate xong, kết quả (đã gắn
+  error_code, nhỏ hơn nhiều so với lúc trước vì record lỗi sẽ được lọc
+  khỏi luồng dedup/conflict ngay sau đó) được .collect() về driver 1
+  lần để làm dedup + conflict resolution TUẦN TỰ như cũ — phần này
+  KHÔNG thể và KHÔNG NÊN phân tán.
+
+  ĐÁNH ĐỔI CHẤP NHẬN ĐƯỢC: TAC_CACHE và circuit breaker (failed_counters)
+  trong pipeline/validation/rules.py là global-per-process — khi chạy
+  phân tán qua mapPartitions, mỗi worker process (Python subprocess do
+  PySpark spawn) có bản cache/counter RIÊNG, không share giữa các
+  partition. Hệ quả: TAC_CACHE kém hiệu quả hơn (gọi GSMA lặp lại nhiều
+  hơn giữa các worker), circuit breaker "cục bộ" hơn (mỗi worker tự mở
+  breaker độc lập). Đây KHÔNG phải lỗi đúng/sai — chỉ là giảm hiệu quả
+  tối ưu hoá, kết quả validate vẫn ĐÚNG. Nếu muốn cache/breaker share
+  toàn cục qua nhiều worker, cần store ngoài (Redis) — nằm ngoài phạm
+  vi thay đổi này.
 
 ===========================================================================
 GAP ĐÃ FIX (5 vấn đề, phát hiện khi báo cáo Data Quality luôn trống):
@@ -65,19 +120,17 @@ import os
 import asyncio
 import logging
 import time
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Iterator
 
-import httpx
 import pandas as pd
 import psycopg2
-from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import SparkSession, DataFrame, Row
 from pyspark.sql import functions as F
 from pyspark.sql.types import (
     StructType, StructField, StringType, TimestampType, LongType, BooleanType,
 )
 from pyspark.sql.window import Window
 
-from pipeline.validation.rules import execute_validation_pipeline
 from pipeline.deduplication.state_manager import DedupStateManager
 from pipeline.conflict_resolution.swap_detector import SwapDetector, write_swap_events
 from pipeline.spark_jars import KAFKA_PACKAGE, configure_spark_jars
@@ -132,45 +185,119 @@ DB_DSN = dict(
 HLR_HSS_URL = os.getenv("HLR_HSS_SERVICE_URL", "http://camara-mock-hlr-hss:8200")
 
 # Singleton SwapDetector — tái sử dụng giữa các batch, tránh tạo lại
-# HTTP session mỗi lần (xem swap_detector.py).
+# HTTP session mỗi lần (xem swap_detector.py). Chỉ dùng ở driver (bước
+# conflict C xử lý tuần tự), KHÔNG dùng trong mapPartitions.
 _swap_detector = SwapDetector(hlr_mock_url=HLR_HSS_URL)
+
+#: [BN-6] Số partition Spark dùng để chia batch trước khi mapPartitions
+#: validate. Đây là "độ song song" thực sự cho bước validate — nên đặt
+#: bằng (hoặc gần bằng) số CPU core khả dụng cho local[N]. Mặc định 4
+#: (an toàn cho máy yếu); tăng lên bằng số core thật của máy (vd 8, 12)
+#: qua env var để tận dụng đa nhân mà KHÔNG cần sửa code — đúng tinh
+#: thần "nhất quán, mang sang máy khác chỉ cần đổi env" của kế hoạch
+#: song song hoá.
+VALIDATION_PARTITIONS = int(os.getenv("VALIDATION_PARTITIONS", "8"))
 
 
 # ==============================================================================
 # 2. PURE LOGIC
 # ==============================================================================
 
-# ── 2a. Validation ─────────────────────────────────────────────────────────
+# ── 2a. Validation (mapPartitions — chạy phân tán trên N worker) ───────────
 
-async def _run_validation_batch(records: List[Dict]) -> List[Tuple]:
+def _validate_partition(rows_iter: Iterator[Row]) -> Iterator[Dict[str, Any]]:
     """
-    [FIX BN-3] 1 AsyncClient duy nhất cho toàn batch.
-    Tất cả records chạy song song qua asyncio.gather().
-    """
-    async with httpx.AsyncClient() as client:
-        tasks = [execute_validation_pipeline(r, client) for r in records]
-        return await asyncio.gather(*tasks)
+    [BN-6] Hàm chạy TRÊN TỪNG PARTITION, trong 1 Python worker subprocess
+    RIÊNG BIỆT do PySpark tự spawn (kể cả ở local[N], mapPartitions vẫn
+    chạy qua worker subprocess thật, không chỉ là thread — nên đây là
+    đa TIẾN TRÌNH thật, tận dụng nhiều core CPU vật lý).
 
+    Vì chạy trên process riêng, KHÔNG được closure qua bất kỳ object nào
+    tạo ở driver (httpx.AsyncClient, DB connection...) — mọi thứ (kể cả
+    import module) phải được tạo/import MỚI bên trong hàm này.
 
-def _filter_valid(records: List[Dict], results: List[Tuple]) -> Tuple[List[Dict], List[Dict]]:
-    """
-    Tách records thành (valid, invalid) dựa trên ValidationResult.
+    Import trễ (deferred import) + tự bootstrap sys.path bên trong hàm:
+    worker subprocess là 1 process Python HOÀN TOÀN MỚI, không tự thừa
+    hưởng `sys.path.insert(...)` mà driver đã chạy lúc import module —
+    nếu không tự bootstrap lại ở đây, `import pipeline.validation.rules`
+    sẽ ném ModuleNotFoundError trên worker. Cách này tự chứa (self
+    contained), hoạt động đúng bất kể PYTHONPATH của container worker có
+    được set sẵn hay không.
 
-    invalid record giữ nguyên field gốc + thêm error_code, error_details
-    (dùng đúng tên thuộc tính của ValidationResult trong rules.py).
+    Args:
+        rows_iter: iterator các pyspark.sql.Row của 1 partition.
+
+    Yields:
+        dict — record gốc + (nếu invalid) error_code/error_details,
+        hoặc (nếu valid) warn_code nếu có circuit breaker bypass.
+        KHÔNG lọc valid/invalid ở đây — driver sẽ tự tách sau khi
+        collect() (xem _split_validated).
     """
-    valid: List[Dict] = []
-    invalid: List[Dict] = []
+    records = [r.asDict() for r in rows_iter]
+    if not records:
+        return iter([])
+
+    # --- Bootstrap sys.path + import trễ, chỉ chạy trong worker process ---
+    import sys as _sys, os as _os2
+    _project_root = _os2.path.abspath(
+        _os2.path.join(_os2.path.dirname(__file__), "..", "..")
+    )
+    if _project_root not in _sys.path:
+        _sys.path.insert(0, _project_root)
+
+    import asyncio as _asyncio
+    import httpx as _httpx
+    from pipeline.validation.rules import execute_validation_pipeline_batch
+
+    async def _run():
+        limits = _httpx.Limits(max_connections=20, max_keepalive_connections=10)
+        async with _httpx.AsyncClient(limits=limits) as client:
+            return await execute_validation_pipeline_batch(records, client)
+
+    try:
+        results = _asyncio.run(_run())
+    except Exception:
+        # An toàn: nếu 1 partition gặp lỗi bất ngờ (vd mạng đứt hoàn
+        # toàn), KHÔNG để cả Spark task/batch fail — coi toàn bộ record
+        # trong partition này là lỗi hạ tầng, vẫn trả về (ghi invalid_log)
+        # thay vì làm sập cả micro-batch.
+        logger.exception(
+            "mapPartitions validate: loi khong luong truoc, danh dau %d "
+            "record trong partition nay la ERR_PARTITION_VALIDATION_FAILED",
+            len(records),
+        )
+        for record in records:
+            payload = dict(record)
+            payload["error_code"] = "ERR_PARTITION_VALIDATION_FAILED"
+            payload["error_details"] = "Unhandled exception during partition validation"
+            yield payload
+        return
+
     for record, (res, warn) in zip(records, results):
         payload = dict(record)
         if res.is_valid:
             if warn:
                 payload["warn_code"] = warn
-            valid.append(payload)
         else:
             payload["error_code"] = res.error_code
             payload["error_details"] = res.error_message
-            invalid.append(payload)
+        yield payload
+
+
+def _split_validated(annotated_rows: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Tách rows đã được _validate_partition gắn nhãn thành (valid, invalid),
+    dựa trên viec co "error_code" hay khong (thay cho _filter_valid cu,
+    vi annotation gio duoc gan tu trong mapPartitions, khong con
+    ValidationResult object o day nua sau khi collect ve driver).
+    """
+    valid: List[Dict] = []
+    invalid: List[Dict] = []
+    for row in annotated_rows:
+        if row.get("error_code"):
+            invalid.append(row)
+        else:
+            valid.append(row)
     return valid, invalid
 
 
@@ -219,10 +346,14 @@ def _split_late_arrival(records: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
     return on_time, late
 
 
-# ── 2c. Deduplication (in-memory, driver-side) ─────────────────────────────
+# ── 2c. Deduplication (in-memory, driver-side, BẮT BUỘC tuần tự) ───────────
 #
 # [FIX BN-1] Thay applyInPandasWithState bằng dict in-memory.
 # DEDUP_STATE: { (acct_session_id, acct_status_type) -> last_seen_epoch_ms }
+#
+# [BN-6] KHÔNG được chuyển bước này sang mapPartitions — xem giải thích
+# đầy đủ trong docstring đầu file. DEDUP_STATE phải là 1 dict DUY NHẤT
+# trong 1 process để phát hiện đúng record trùng.
 
 DEDUP_STATE: Dict[Tuple[str, str], int] = {}
 _DEDUP_LAST_CLEANUP: float = time.time()
@@ -277,7 +408,7 @@ def _dedup_filter(records: List[Dict]) -> List[Dict]:
     return unique
 
 
-# ── 2d. Conflict resolution (pandas, driver-side) ──────────────────────────
+# ── 2d. Conflict resolution (pandas, driver-side, BẮT BUỘC tuần tự) ────────
 
 def _resolve_conflicts(records: List[Dict]) -> Tuple[List[Dict], List[Dict], List[Dict]]:
     """
@@ -286,6 +417,10 @@ def _resolve_conflicts(records: List[Dict]) -> Tuple[List[Dict], List[Dict], Lis
     Conflict A: cùng session, imsi/msisdn thay đổi sau Start.
     Conflict B: cùng imsi có 2+ Start chưa Stop.
     Conflict C: cùng msisdn nhưng imsi thay đổi (SIM Swap signal).
+
+    [BN-6] KHÔNG được chuyển bước này sang mapPartitions — groupby +
+    so sánh thời gian cần TOÀN BỘ batch trong 1 nơi (xem giải thích đầu
+    file).
 
     [GAP-2] [GAP-4] Trả về 3 nhóm thay vì chỉ "clean":
         clean_records       — record sạch, BAO GỒM conflict C (đúng thiết kế
@@ -324,19 +459,54 @@ def _resolve_conflicts(records: List[Dict]) -> Tuple[List[Dict], List[Dict], Lis
     )
 
     # ── Conflict B ──────────────────────────────────────────────────────────
-    start_mask = (df["acct_status_type"] == "Start") & (~df["is_conflict_a"])
-    df["_imsi_start_rank"] = df[start_mask].groupby("imsi").cumcount()
-    df["is_conflict_b"] = (
-        (~df["is_conflict_a"]) &
-        (df["acct_status_type"] == "Start") &
-        (df["_imsi_start_rank"].fillna(0) > 0)
-    )
+# ── Conflict B ──────────────────────────────────────────────────────────
+    # [FIX] Bản cũ flag MỌI Start thứ 2 trở đi của cùng imsi bằng cumcount(),
+    # kể cả khi Start trước đó ĐÃ Stop từ lâu -> sai định nghĩa README
+    # ("2 Start CHƯA có Stop tương ứng"). Sửa: duyệt tuần tự theo thời gian
+    # cho từng imsi, theo dõi tập session_id đang "mở" (đã Start, chưa Stop).
+    # Một Start mới chỉ là Conflict B khi tại thời điểm đó imsi này đang có
+    # >=1 session KHÁC còn mở (double active thật sự, có chồng lấn thời gian).
+    def _flag_conflict_b(group: pd.DataFrame) -> pd.Series:
+        open_sessions: set = set()
+        flags = []
+        for _, row in group.iterrows():
+            if row["is_conflict_a"]:
+                flags.append(False)
+                continue
+            status, sess_id = row["acct_status_type"], row["acct_session_id"]
+            if status == "Start":
+                if sess_id in open_sessions:
+                    flags.append(False)  # duplicate Start của chính session này, không phải B
+                elif len(open_sessions) > 0:
+                    flags.append(True)   # đã có session khác mở -> double active
+                else:
+                    flags.append(False)
+                    open_sessions.add(sess_id)
+            elif status in ("Stop", "Interim"):
+                open_sessions.discard(sess_id)
+                flags.append(False)
+            else:
+                flags.append(False)
+        return pd.Series(flags, index=group.index)
+
+    if df.empty:
+        df["is_conflict_b"] = False
+    else:
+        df["is_conflict_b"] = (
+            df.groupby("msisdn" if False else "imsi", group_keys=False)  # group theo imsi (đúng README B)
+              .apply(_flag_conflict_b)
+              .reindex(df.index)
+              .fillna(False)
+        )
 
     # ── Conflict C ──────────────────────────────────────────────────────────
-    df["prev_imsi"] = df.groupby("msisdn")["imsi"].shift(1)
+    # [FIX] Chỉ tính prev_imsi từ các bản ghi KHÔNG phải conflict A/B, tránh
+    # so sánh với 1 imsi đã "hỏng" do Conflict A (session inconsistency) gây
+    # false positive/negative cho C.
+    legit_mask = (~df["is_conflict_a"]) & (~df["is_conflict_b"])
+    df["prev_imsi"] = df[legit_mask].groupby("msisdn")["imsi"].shift(1)
     df["is_conflict_c"] = (
-        (~df["is_conflict_a"]) &
-        (~df["is_conflict_b"]) &
+        legit_mask &
         df["prev_imsi"].notna() &
         (df["imsi"] != df["prev_imsi"])
     )
@@ -528,7 +698,7 @@ def build_stream(spark: SparkSession) -> DataFrame:
         .option("subscribe", KAFKA_TOPIC_RAW)
         .option("startingOffsets", "earliest")
         .option("failOnDataLoss", "false")
-        .option("maxOffsetsPerTrigger", "500")
+        .option("maxOffsetsPerTrigger", "20000")
         .option("kafka.metadata.max.age.ms", "10000")
         .load()
         .selectExpr("CAST(value AS STRING) AS raw_value")
@@ -541,31 +711,41 @@ def build_stream(spark: SparkSession) -> DataFrame:
 
 def make_callback(spark: SparkSession):
     """
-    foreachBatch callback: collect -> validate -> late-arrival split
-    -> dedup -> conflict resolution -> ghi 4 đích (Kafka + 3 bảng Postgres).
-
-    Không có bất kỳ streaming operator nào bên trong (giữ nguyên fix BN-1).
+    foreachBatch callback: mapPartitions-validate (SONG SONG) -> collect
+    -> late-arrival split -> dedup -> conflict resolution (TUẦN TỰ) ->
+    ghi 4 đích (Kafka + 3 bảng Postgres).
     """
 
     def _callback(batch_df: DataFrame, batch_id: int) -> None:
         t0 = time.time()
 
-        # ── 1. Collect ───────────────────────────────────────────────────────
-        rows = [r.asDict() for r in batch_df.collect()]
-        if not rows:
+        # ── 1. Validation — SONG SONG qua mapPartitions ─────────────────────
+        # [BN-6] KHÔNG .collect() truoc khi validate nua. Repartition batch
+        # thanh VALIDATION_PARTITIONS phan de Spark chia deu cong viec HTTP
+        # (I/O-bound) cho nhieu worker subprocess chay dong thoi, tan dung
+        # nhieu core CPU that su -- day la cho local[N] thuc su co tac dung
+        # (khac voi kien truc cu, moi thu da bi .collect() truoc khi validate).
+        #
+        # repartition() voi batch nho hon VALIDATION_PARTITIONS van hoat dong
+        # dung, chi la mot so partition rong -> mapPartitions bo qua rong,
+        # khong ton hao gi dang ke.
+        repartitioned = batch_df.repartition(VALIDATION_PARTITIONS)
+        annotated_rows = repartitioned.rdd.mapPartitions(_validate_partition).collect()
+
+        if not annotated_rows:
             return
 
-        # ── 2. Validation ────────────────────────────────────────────────────
-        val_results = asyncio.run(_run_validation_batch(rows))
-        valid_rows, invalid_rows = _filter_valid(rows, val_results)
+        # ── 2. Tach valid / invalid tu ket qua da annotate ──────────────────
+        valid_rows, invalid_rows = _split_validated(annotated_rows)
 
         # ── 3. Late arrival — tách khỏi valid_rows TRƯỚC dedup/conflict ──────
         on_time_rows, late_rows = _split_late_arrival(valid_rows)
 
         logger.info(
-            "Batch %d | total=%d valid=%d invalid=%d late_arrival=%d (%.0fms)",
-            batch_id, len(rows), len(valid_rows), len(invalid_rows),
-            len(late_rows), (time.time() - t0) * 1000,
+            "Batch %d | total=%d valid=%d invalid=%d late_arrival=%d "
+            "(validate_partitions=%d, %.0fms)",
+            batch_id, len(annotated_rows), len(valid_rows), len(invalid_rows),
+            len(late_rows), VALIDATION_PARTITIONS, (time.time() - t0) * 1000,
         )
 
         # ── 4. Ghi invalid_log: validation fail + late arrival ───────────────
@@ -579,13 +759,13 @@ def make_callback(spark: SparkSession):
         if not on_time_rows:
             return
 
-        # ── 5. Deduplication ─────────────────────────────────────────────────
+        # ── 5. Deduplication (TUẦN TỰ, driver-side — xem BN-6) ───────────────
         deduped_rows = _dedup_filter(on_time_rows)
         logger.info("Batch %d | after dedup=%d", batch_id, len(deduped_rows))
         if not deduped_rows:
             return
 
-        # ── 6. Conflict resolution ───────────────────────────────────────────
+        # ── 6. Conflict resolution (TUẦN TỰ, driver-side — xem BN-6) ─────────
         clean_rows, conflict_rows, conflict_c_rows = _resolve_conflicts(deduped_rows)
 
         # ── 7. Ghi conflict_log (A/B) ─────────────────────────────────────────
@@ -636,11 +816,25 @@ def main() -> None:
         handlers=[logging.StreamHandler(sys.stdout)],
     )
 
+    #: [BN-6] So luong "luong" local Spark dung -- nay MOI thuc su co y
+    #: nghia vi mapPartitions validate can nhieu worker subprocess song
+    #: song. Dat qua env SPARK_LOCAL_CORES de linh hoat theo may (vd 4
+    #: tren laptop yeu, 12 tren may nhieu nhan) MA KHONG can sua code --
+    #: nen dong bo voi VALIDATION_PARTITIONS o tren (nen bang hoac gan
+    #: bang nhau de khong "thua" partition khong co luong xu ly).
+    local_cores = os.getenv("SPARK_LOCAL_CORES", "8")
+    #: spark.executor.memory KHONG duoc dat o day vi VO NGHIA trong che
+    #: do local[N] (khong co executor process rieng, driver va "executor"
+    #: dung chung 1 JVM) -- chi spark.driver.memory co tac dung thuc te.
+    driver_memory = os.getenv("SPARK_DRIVER_MEMORY", "4G")
+
     builder = (
         SparkSession.builder
         .appName("Camara-Processing-Job")
-        .master("local[*]")
-        .config("spark.sql.shuffle.partitions", "4")
+        .master(f"local[{local_cores}]")
+        .config("spark.driver.memory", driver_memory)
+        .config("spark.sql.shuffle.partitions", str(VALIDATION_PARTITIONS))
+        .config("spark.default.parallelism", str(VALIDATION_PARTITIONS))
     )
     spark = configure_spark_jars(builder, KAFKA_PACKAGE).getOrCreate()
 
@@ -649,14 +843,20 @@ def main() -> None:
         CHECKPOINT_LOCATION,
     )
 
+    logger.info(
+        "Spark session: local[%s], driver.memory=%s, validation_partitions=%d",
+        local_cores, driver_memory, VALIDATION_PARTITIONS,
+    )
+
     query = (
         build_stream(spark)
         .writeStream
         .foreachBatch(make_callback(spark))
         .option("checkpointLocation", CHECKPOINT_LOCATION)
-        .trigger(processingTime="5 seconds")
+        .trigger(processingTime="2000 milliseconds")
         .start()
     )
+
 
     query.awaitTermination()
 

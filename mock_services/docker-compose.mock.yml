@@ -5,29 +5,42 @@ services:
       context: ..
       dockerfile: mock_services/gsma_tac/Dockerfile
     container_name: camara-mock-gsma-tac
+    command: ["python", "-m", "uvicorn", "mock_services.gsma_tac.app:app", "--host", "0.0.0.0", "--port", "8100", "--workers", "2"]
     volumes:
       - ..:/workspace
     working_dir: /workspace  # Đảm bảo app chạy từ thư mục gốc
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0' # Mỗi API tối đa 1 nhân
+          memory : 384m
     ports:
       - "8100:8100"          # Máy Windows vào qua localhost:8100
     networks:
       - camara-network
     restart: always
+    
 
   hlr-hss:
     build:
       context: ..
       dockerfile: mock_services/hlr_hss/Dockerfile
     container_name: camara-mock-hlr-hss
-    command: ["python", "-m", "uvicorn", "mock_services.hlr_hss.app:app", "--host", "0.0.0.0", "--port", "8200"]
+    command: ["python", "-m", "uvicorn", "mock_services.hlr_hss.app:app", "--host", "0.0.0.0", "--port", "8200", "--workers", "2"]
     volumes:
       - ..:/workspace
     working_dir: /workspace
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0' # Mỗi API tối đa 1 nhân
+          memory : 384m
     ports:
       - "8200:8200"          # Máy Windows vào qua localhost:8200 (map vào 8100 nội bộ)
     networks:
       - camara-network
     restart: always
+    
 
   itu-mock:
     build:
@@ -35,12 +48,16 @@ services:
       dockerfile: mock_services/itu_e164/Dockerfile
 
     container_name: camara-mock-itu-e164
-
+    command: ["python", "-m", "uvicorn", "mock_services.itu_e164.app:app", "--host", "0.0.0.0", "--port", "8300", "--workers", "2"]
     volumes:
       - ..:/workspace
 
     working_dir: /workspace
-
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0' # Mỗi API tối đa 1 nhân
+          memory : 384m
     ports:
       - "8300:8300"
 
@@ -48,6 +65,7 @@ services:
       - camara-network
 
     restart: always
+    
 networks:
   camara-network:
     external: true

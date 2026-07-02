@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+#pipeline\run_pipeline.py
 """
 run_pipeline.py
 
@@ -559,7 +560,7 @@ def main():
             DRAIN_TIMEOUT,
         )
 
-        s3_commit_grace = int(os.getenv("SPARK_COMMIT_INTERVAL_SECONDS", "30")) + 5
+        s3_commit_grace = int(os.getenv("SPARK_COMMIT_INTERVAL_SECONDS", "30")) + 10
         _log(f">>> Chờ S3 commit batch cuối ({s3_commit_grace}s)...")
         time.sleep(s3_commit_grace)
 

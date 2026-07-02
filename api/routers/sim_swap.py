@@ -7,16 +7,32 @@ Endpoints:
   POST /sim-swap/v0/check          → swapped: bool
   POST /sim-swap/v0/retrieve-date  → latestSimChange: datetime | null
 
-Query logic:
-  SELECT detected_at FROM swap_event
+[FIX - KHONG SUA SQL/INDEX] Query CU dung `detected_at` (tin hieu
+RADIUS tho, do swap_detector.py phat hien qua Conflict C) lam can cu
+tra ket qua, KHONG loc `confirmed_at IS NOT NULL`. `detected_at` chi
+la tin hieu so bo; `confirmed_at` moi la moc da duoc doi chieu voi
+HLR/HSS (nguon su that duy nhat ve SIM Swap that su xay ra hay
+khong -- xem mock_services/hlr_hss/README.md). Voi 1 API dung cho
+muc dich chong gian lan (fraud prevention), tra `swapped=true` dua
+tren su kien CHUA duoc xac nhan la sai nghiem trong ve nghiep vu.
+
+Query logic MOI:
+  SELECT confirmed_at FROM swap_event
   WHERE msisdn = $1
     AND swap_type = 'SIM_SWAP'
-    AND detected_at >= NOW() - $2 * INTERVAL '1 day'
-  ORDER BY detected_at DESC
+    AND confirmed_at IS NOT NULL
+    AND confirmed_at >= NOW() - $2 * INTERVAL '1 day'
+  ORDER BY confirmed_at DESC
   LIMIT 1
 
-SLA: p95 ≤ 200ms — đảm bảo bởi index idx_swap_msisdn
-(msisdn, detected_at DESC) trên bảng swap_event.
+[VE INDEX] KHONG can tao index moi. idx_swap_msisdn hien co
+(msisdn, detected_at DESC) van duoc planner dung de loc theo `msisdn`
+(cot dau tien cua index luon dung duoc du sort key con lai la
+detected_at chu khong phai confirmed_at) -- Postgres se dung index
+nay de tim nhanh cac dong cua thue bao nay, sau do loc/sort
+confirmed_at tren tap con da thu hep (thuong chi vai dong swap_event
+cho 1 msisdn), khong can quet toan bang. Chap nhan danh doi nay thay
+vi them index moi, vi so luong swap_event cho 1 msisdn rat nho.
 """
 
 from fastapi import APIRouter, Depends
@@ -36,14 +52,17 @@ router = APIRouter(
     dependencies=[Depends(verify_api_key)],
 )
 
-# SQL dùng chung cho cả 2 endpoint — khác nhau ở cách dùng kết quả
+# [FIX] Doi cot loc/sort/tra ve tu detected_at -> confirmed_at, them
+# dieu kien confirmed_at IS NOT NULL de loai bo cac su kien swap CHUA
+# duoc HLR xac nhan.
 _QUERY_LATEST_SWAP = """
-    SELECT detected_at
+    SELECT confirmed_at
     FROM swap_event
     WHERE msisdn = $1
       AND swap_type = 'SIM_SWAP'
-      AND detected_at >= NOW() - ($2 * INTERVAL '1 day')
-    ORDER BY detected_at DESC
+      AND confirmed_at IS NOT NULL
+      AND confirmed_at >= NOW() - ($2 * INTERVAL '1 day')
+    ORDER BY confirmed_at DESC
     LIMIT 1
 """
 
@@ -59,7 +78,8 @@ async def check_sim_swap(
 ) -> SimSwapCheckResponse:
     """
     Trả về swapped=True nếu số điện thoại đã được gán SIM mới
-    trong khoảng maxAge ngày gần nhất.
+    trong khoảng maxAge ngày gần nhất, VÀ sự kiện đó đã được
+    xác nhận qua HLR/HSS (confirmed_at IS NOT NULL).
 
     Args:
         body: phoneNumber (E.164) + maxAge (ngày, mặc định 30).
@@ -82,8 +102,9 @@ async def retrieve_sim_swap_date(
     db: asyncpg.Connection = Depends(get_db),
 ) -> SimSwapRetrieveDateResponse:
     """
-    Trả về thời điểm SIM Swap gần nhất trong khoảng maxAge ngày.
-    Nếu không có SIM Swap nào, latestSimChange = null.
+    Trả về thời điểm SIM Swap gần nhất ĐÃ ĐƯỢC XÁC NHẬN (confirmed_at)
+    trong khoảng maxAge ngày. Nếu không có SIM Swap nào đã xác nhận,
+    latestSimChange = null.
 
     Args:
         body: phoneNumber (E.164) + maxAge (ngày, mặc định 30).
@@ -94,5 +115,5 @@ async def retrieve_sim_swap_date(
     """
     row = await db.fetchrow(_QUERY_LATEST_SWAP, str(body.phoneNumber), body.maxAge)
     return SimSwapRetrieveDateResponse(
-        latestSimChange=row["detected_at"] if row else None
+        latestSimChange=row["confirmed_at"] if row else None
     )
