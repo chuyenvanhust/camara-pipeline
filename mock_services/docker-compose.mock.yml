@@ -8,14 +8,14 @@ services:
     command: ["python", "-m", "uvicorn", "mock_services.gsma_tac.app:app", "--host", "0.0.0.0", "--port", "8100", "--workers", "2"]
     volumes:
       - ..:/workspace
-    working_dir: /workspace  # Đảm bảo app chạy từ thư mục gốc
+    working_dir: /workspace  
     deploy:
       resources:
         limits:
-          cpus: '1.0' # Mỗi API tối đa 1 nhân
+          cpus: '1.0' 
           memory : 384m
     ports:
-      - "8100:8100"          # Máy Windows vào qua localhost:8100
+      - "8100:8100"        
     networks:
       - camara-network
     restart: always
@@ -33,10 +33,10 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '1.0' # Mỗi API tối đa 1 nhân
+          cpus: '1.0'
           memory : 384m
     ports:
-      - "8200:8200"          # Máy Windows vào qua localhost:8200 (map vào 8100 nội bộ)
+      - "8200:8200"        
     networks:
       - camara-network
     restart: always
@@ -56,7 +56,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '1.0' # Mỗi API tối đa 1 nhân
+          cpus: '1.0' 
           memory : 384m
     ports:
       - "8300:8300"

@@ -6,7 +6,7 @@ import argparse
 from datetime import datetime, timedelta
 from typing import List, Dict, Any
 
-# Chèn đường dẫn root vào để chạy script độc lập từ Terminal
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from simulator.config import SimulatorConfig
@@ -20,16 +20,12 @@ class RadiusSimulator:
         self.injector = ErrorInjector(config)
 
     def execute_simulation(self):
-        print("🚀 Starting RADIUS Accounting Log Simulator...")
+        print(" Starting RADIUS Accounting Log Simulator...")
         self.generator.fetch_tac_pool_from_mock()
 
         start_time = datetime(2026, 1, 1, 0, 0, 0)
 
-        # [FIX] Sinh theo CẶP session (Start + Stop CÙNG acct_session_id),
-        # thay vì mỗi record 1 session_id riêng như bản cũ — nếu không, Conflict A
-        # (dựa vào so sánh Start/Stop cùng session_id) không bao giờ có thể xảy ra,
-        # và Conflict B (double active theo imsi) cũng vô nghĩa vì không có khái
-        # niệm "session đang mở" nào tồn tại quá 1 bản ghi.
+   
         num_sessions = max(1, self.config.records // 2)
         records: List[Dict[str, Any]] = []
 
@@ -42,7 +38,7 @@ class RadiusSimulator:
             t_start = start_time + timedelta(
                 seconds=s * (86400 * self.config.days // num_sessions)
             )
-            duration_seconds = 60 + (s % 3600)  # thời lượng session, xác định deterministic theo seed s
+            duration_seconds = 60 + (s % 3600) 
             t_stop = t_start + timedelta(seconds=duration_seconds)
 
             common = {
@@ -73,8 +69,7 @@ class RadiusSimulator:
                 "ingest_timestamp": (t_stop + timedelta(seconds=2)).isoformat() + "Z",
             })
 
-        # 2. Tiêm lỗi/nghiệp vụ — inject_conflicts() BẮT BUỘC chạy TRƯỚC các injector
-        # khác, vì nó giả định records vẫn còn nguyên thứ tự cặp (Start, Stop) liên tiếp.
+        # 2. Tiêm lỗi/nghiệp vụ — inject_conflicts()
         records = self.injector.inject_conflicts(records)
         records = self.injector.inject_invalid_imei(records)
         records = self.injector.inject_late_arrivals(records)
@@ -101,17 +96,17 @@ class RadiusSimulator:
             for rec in records:
                 writer.writerow(rec)
                 
-        print(f"🎯 Simulation finished completely! {len(records)} records saved into file: {self.config.output}")
+        print(f" Simulation finished completely! {len(records)} records saved into file: {self.config.output}")
 
     def _stream_to_kafka(self, records: List[Dict[str, Any]]):
         """Dự phòng cấu hình Stream trực tiếp vào Kafka Broker (Sẽ kích hoạt ở Phase 4)"""
-        print(f"📡 Mock streaming {len(records)} records directly into Kafka topic '{self.config.kafka_topic}'...")
-        # Sử dụng mô phỏng in-terminal ở Phase 3 để tránh gãy chặn khi chưa cài Kafka hạ tầng
-        print("✅ Stream mock completed successfully.")
+        print(f" Mock streaming {len(records)} records directly into Kafka topic '{self.config.kafka_topic}'...")
+        
+        print(" Stream mock completed successfully.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="RADIUS Accounting Stream Log Simulator CLI Engine")
-    parser.add_argument("--records", type=int, default=1000) # Mặc định test nhỏ, production dùng 2000000
+    parser.add_argument("--records", type=int, default=1000) 
     parser.add_argument("--subscribers", type=int, default=100)
     parser.add_argument("--days", type=int, default=90)
     parser.add_argument("--seed", type=int, default=42)

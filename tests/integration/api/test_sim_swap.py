@@ -1,19 +1,20 @@
 import pytest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 pytestmark = [pytest.mark.sim_swap]
 
 async def _set_sim_swap(db, msisdn: str, age_days: float = None, age_minutes: float = None):
+    now = datetime.now(timezone.utc)
     if age_days is not None:
-        detected_at = datetime.utcnow() - timedelta(days=age_days)
+        confirmed_at = now - timedelta(days=age_days)
     elif age_minutes is not None:
-        detected_at = datetime.utcnow() - timedelta(minutes=age_minutes)
+        confirmed_at = now - timedelta(minutes=age_minutes)
     else:
-        detected_at = datetime.utcnow()
+        confirmed_at = now
         
     await db.execute(
-        "INSERT INTO swap_event (msisdn, swap_type, detected_at) VALUES ($1, 'SIM_SWAP', $2)",
-        msisdn, detected_at
+        "INSERT INTO swap_event (msisdn, swap_type, confirmed_at) VALUES ($1, 'SIM_SWAP', $2)",
+        msisdn, confirmed_at
     )
 
 @pytest.mark.happy_path
@@ -63,11 +64,8 @@ async def test_tc05_swap_less_than_1_minute_ago(api_client, db_client):
 async def test_tc06_swap_exact_boundary(api_client, db_client):
     msisdn = "+84901234566"
     db_now = await db_client.fetchval("SELECT NOW()")
-    detected_at = db_now - timedelta(days=30) + timedelta(minutes=1)  # giữ nguyên buffer gốc: 1 phút
-    await db_client.execute(
-        "INSERT INTO swap_event (msisdn, swap_type, detected_at) VALUES ($1, 'SIM_SWAP', $2)",
-        msisdn, detected_at
-    )
+    confirmed_at = db_now - timedelta(days=30) + timedelta(minutes=1)
+    await db_client.execute("INSERT INTO swap_event (msisdn, swap_type, confirmed_at) VALUES ($1, 'SIM_SWAP', $2)", msisdn, confirmed_at)
 
     response = await api_client.post(
         "/sim-swap/v0/check",

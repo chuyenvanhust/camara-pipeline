@@ -9,7 +9,7 @@ class DedupStateManager:
     """
     
     # Định nghĩa các hằng số cấu hình hệ thống
-    TTL_SECONDS = 3600  # 1 giờ
+    TTL_SECONDS = 3600  
     DEDUP_KEY_FIELDS = ["acct_session_id", "acct_status_type"]
 
     @staticmethod

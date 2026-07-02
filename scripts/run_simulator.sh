@@ -5,8 +5,7 @@ echo ">>> Đang chạy Simulator..."
 # Đảm bảo thư mục data tồn tại
 mkdir -p "$(pwd)/data"
 
-# Chạy container
-# Thay đổi quan trọng: Thêm -e PYTHONPATH=. để Python nhận thư mục hiện tại làm gốc
+
 docker run --rm \
   -v "$(pwd):/workspace" \
   -w /workspace \

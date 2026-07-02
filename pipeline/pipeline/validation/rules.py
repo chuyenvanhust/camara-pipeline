@@ -4,22 +4,6 @@
 Stage S2 -- Ap dung 6 validation rules tren moi record.
 Record hop le -> `radius.valid`. Record loi -> `radius.invalid` + ghi `invalid_log`.
 
-[CAP NHAT - HYBRID PREFETCH BATCH]
-File nay ho tro 2 che do:
-  1. Che do CU (single-call): moi rule tu goi API rieng cho tung record.
-     Van con giu lai de tuong thich nguoc / test don le.
-  2. Che do MOI (batch, khuyen dung): goi execute_validation_pipeline_batch()
-     cho ca mot List[Dict] records. Ham nay se:
-       - Loc TAC chua co trong TAC_CACHE -> goi POST /tac/batch (GSMA)
-       - Gom tat ca IMSI trong batch -> goi POST /subscribers/batch-lookup (HLR)
-       - Gom tat ca MSISDN trong batch -> goi POST /validate/batch (ITU)
-       - Goi ca 3 API tren dong thoi bang asyncio.gather
-       - Sau do chay validate tuan tu 6 rules cho tung record, nhung R2/R3/R4b
-         se tra cuu ket qua tu cac map da prefetch thay vi tu goi API.
-
-Cac rule van la pure async function; rule can du lieu tu batch (R2, R3, R4b)
-nhan them 1 tham so optional (itu_map / hlr_map) - neu duoc truyen vao thi
-uu tien tra cuu map, khong goi API don le nua.
 """
 
 import re
@@ -57,28 +41,12 @@ ITU_E164_SERVICE_URL = os.getenv("ITU_E164_SERVICE_URL", "http://camara-mock-itu
 HLR_HSS_SERVICE_URL = os.getenv("HLR_HSS_SERVICE_URL", "http://camara-mock-hlr-hss:8200")
 GSMA_TAC_SERVICE_URL = os.getenv("GSMA_TAC_SERVICE_URL", "http://camara-mock-gsma-tac:8100")
 
-# Gioi han so luong item toi da moi request Batch.
-# [FIX] Xac nhan thuc te qua log loi 422 cua tung mock (rat quan trong:
-# KHONG DUNG CHUNG 1 CON SO CHO CA 3, moi mock co gioi han rieng):
-#   - GSMA /tac/batch               : toi da 100 item/request
-#   - ITU  /validate/batch          : toi da 100 item/request
-#   - HLR  /subscribers/batch-lookup: toi da 200 item/request (RIENG, cao
-#     hon 2 cai tren -- da xac nhan qua log, luon "200 OK" voi 200 IMSI)
+
 GSMA_BATCH_MAX = 500     # POST /tac/batch
 HLR_BATCH_MAX = 500      # POST /subscribers/batch-lookup
-ITU_BATCH_MAX = 500      # POST /validate/batch -- RIENG BIET, thap hon GSMA/HLR
+ITU_BATCH_MAX = 500      # POST /validate/batch
 
-# [BUOC 4 - KE HOACH SONG SONG HOA] So luong request Batch (chunk) toi da
-# duoc phep chay DONG THOI cho 1 rule (GSMA/HLR/ITU) trong 1 micro-batch.
-# Khi so IMSI/MSISDN/TAC unique trong batch vuot xa gioi han moi request
-# (100-200), so chunk co the len toi vai chuc (vd maxOffsetsPerTrigger=5000
-# -> co the ~50 chunk cho 1 rule). Neu gui TAT CA chunk cung luc cho CA 3
-# rule (GSMA+HLR+ITU dung chung 1 httpx.AsyncClient), tong so ket noi dong
-# thoi co the vuot gioi han mac dinh cua httpx (max_connections=100),
-# gay xep hang cho ket noi thay vi loi that su -- nhung van nen gioi han
-# de tranh lam qua tai mock service / mang Docker. Dung asyncio.Semaphore
-# de gioi han so chunk chay dong thoi MOI RULE, khong gioi han tong so
-# chunk (moi rule co semaphore rieng).
+
 BATCH_FETCH_MAX_CONCURRENCY = int(os.getenv("BATCH_FETCH_MAX_CONCURRENCY", 8))
 
 # --- HA TANG RESILIENCE (RETRY BACKOFF & CIRCUIT BREAKER) ---
@@ -86,10 +54,7 @@ BATCH_FETCH_MAX_CONCURRENCY = int(os.getenv("BATCH_FETCH_MAX_CONCURRENCY", 8))
 #: So lan fail lien tiep toi da truoc khi circuit breaker mo (Open)
 CIRCUIT_BREAKER_LIMIT = 20
 
-#: Bo dem fail hien tai cho moi mock service. Reset ve 0 khi 1 request
-#: thanh cong (ke ca khi response la loi nghiep vu 400/404 -- van la
-#: "thanh cong ve mat ha tang"). Day la state GLOBAL, test phai reset
-#: truoc/sau moi test case (xem tests/.../README.md).
+
 failed_counters: Dict[str, int] = {
     "ITU_E164": 0,
     "HLR_HSS": 0,
@@ -131,8 +96,7 @@ async def invoke_external_api_with_resilience(
     if failed_counters[service_key] >= CIRCUIT_BREAKER_LIMIT:
         return None, "WARN_RULE_BYPASSED"
 
-    # Status code coi la FAULT HA TANG (mock gia lap qua x-mock-fault),
-    # KHONG PHAI loi nghiep vu -- xu ly giong timeout/conn-fail.
+
     INFRA_FAULT_STATUS_CODES = {500, 502, 503, 504}
 
     try:
@@ -141,7 +105,7 @@ async def invoke_external_api_with_resilience(
         else:
             response = await client.get(url, timeout=10.0, **kwargs)
 
-        # [FIX] Kiem tra status code TRUOC khi coi la thanh cong.
+       
         if response.status_code in INFRA_FAULT_STATUS_CODES:
             failed_counters[service_key] += 1
             return None, "ERR_EXTERNAL_TIMEOUT"
@@ -213,17 +177,6 @@ async def fetch_gsma_batch(tac_codes: List[str], client: httpx.AsyncClient) -> D
     execute_validation_pipeline_batch). Tu dong chia nho theo
     GSMA_BATCH_MAX (100 TAC/request, gioi han rieng cua GSMA) neu vuot gioi han.
 
-    [FIX] Phan biet ro 2 loai loi khi status != 200:
-      - Fault ha tang (mock tra ve 500/502/503/504 qua x-mock-fault, hoac
-        timeout/conn-fail o tang transport) -> da duoc
-        invoke_external_api_with_resilience() chan lai va tra ve
-        err="ERR_EXTERNAL_TIMEOUT"/"ERR_EXTERNAL_CONN_FAIL" o day, KHONG
-        con roi xuong nhanh else ben duoi nua -> gan mot ma loi CHUNG,
-        khong phan biet theo tung service.
-      - Loi validation THAT (mock tra ve 422 vi request body sai schema)
-        -> van la HTTP response hop le (status=422, response != None),
-        roi vao nhanh else -> gan ma loi rieng ERR_EXTERNAL_REQUEST_REJECTED
-        (khong con dat ten theo tung service nhu truoc).
 
     Args:
         tac_codes: danh sach TAC (6 chu so) can tra cuu, nen la list(set(...))
@@ -238,9 +191,7 @@ async def fetch_gsma_batch(tac_codes: List[str], client: httpx.AsyncClient) -> D
     if not tac_codes:
         return results
 
-    # Loc TAC dung dinh dang (6 chu so) TRUOC khi goi API -- 1 TAC sai
-    # dinh dang trong list se khien Pydantic tu choi CA REQUEST (422),
-    # nen loc truoc de tranh goi API vo ich.
+
     to_call: List[str] = []
     for tac in tac_codes:
         if re.match(r"^\d{6}$", tac):
@@ -263,17 +214,14 @@ async def fetch_gsma_batch(tac_codes: List[str], client: httpx.AsyncClient) -> D
             "GSMA_TAC", client, "POST", url, json={"tac_codes": chunk}
         )
 
-        # [FIX] err o day GIO CHI con la: WARN_RULE_BYPASSED (breaker mo)
-        # hoac ERR_EXTERNAL_TIMEOUT/ERR_EXTERNAL_CONN_FAIL (fault ha tang,
-        # bao gom ca 5xx tu x-mock-fault) -- vi invoke_external_api_with_resilience
-        # da chan 5xx tu tang duoi, khong con tra ve response=5xx nua.
+      
         if err == "WARN_RULE_BYPASSED":
             for tac in chunk:
                 chunk_results[tac] = ValidationResult(is_valid=True, warn_code="WARN_RULE_BYPASSED")
             return chunk_results
 
         if err:
-            # Fault ha tang CHUNG (khong phan biet GSMA/HLR/ITU trong ma loi)
+         
             for tac in chunk:
                 chunk_results[tac] = ValidationResult(
                     is_valid=False, error_code=err, error_message="GSMA service unavailable (infrastructure fault)"
@@ -291,11 +239,7 @@ async def fetch_gsma_batch(tac_codes: List[str], client: httpx.AsyncClient) -> D
                         is_valid=False, error_code="ERR_IMEI_TAC_UNKNOWN", error_message="Unknown TAC"
                     )
         else:
-            # [FIX] Nhanh nay GIO CHI con nhan status 4xx that (vd 422
-            # validation loi vi body sai schema) -- KHONG con the la 5xx
-            # fault-inject nua vi da bi chan o tang invoke_external_api_with_resilience.
-            # Doi ten ma loi thanh CHUNG (khong con "_GSMA_BATCH_INVALID"
-            # rieng theo service) de nhat quan voi HLR/ITU.
+           
             logger.error(
                 "GSMA /tac/batch tra ve HTTP %s (request bi tu choi, khong phai fault ha tang) "
                 "cho %d TAC. Body: %.1000s | tac_codes[0:3]=%s",
@@ -319,15 +263,6 @@ async def fetch_gsma_batch(tac_codes: List[str], client: httpx.AsyncClient) -> D
 async def fetch_hlr_batch(imsis: List[str], client: httpx.AsyncClient) -> Dict[str, ValidationResult]:
     """Tra cuu nhieu IMSI cung luc qua POST /subscribers/batch-lookup (HLR Mock).
 
-    Khong dung Cache cho HLR (du lieu thue bao la "dong" -- SIM Swap, khoa
-    thue bao co the xay ra bat ky luc nao), nen luon goi voi TOAN BO IMSI
-    unique trong Batch hien tai. Tu dong chia nho theo HLR_BATCH_MAX
-    (200 lookups/request).
-
-    [FIX] Xem docstring cua fetch_gsma_batch -- ap dung nguyen tac tuong tu:
-    fault ha tang (bao gom 5xx tu x-mock-fault) da duoc chan o tang
-    invoke_external_api_with_resilience va tra ve qua nhanh `if err:` voi
-    ma loi CHUNG; nhanh `else` ben duoi GIO CHI con nhan 4xx that.
 
     Args:
         imsis: danh sach IMSI can tra cuu, nen la list(set(...)).
@@ -350,22 +285,14 @@ async def fetch_hlr_batch(imsis: List[str], client: httpx.AsyncClient) -> Dict[s
             "HLR_HSS", client, "POST", url, json={"lookups": lookups}
         )
 
-        # [FIX] Gop lam 1 nhanh duy nhat cho MOI loai fault ha tang
-        # (timeout / conn-fail / 5xx tu x-mock-fault) -- truoc day tach
-        # rieng ("ERR_EXTERNAL_TIMEOUT"/"ERR_EXTERNAL_CONN_FAIL") voi
-        # "khong cache" con WARN_RULE_BYPASSED xu ly rieng; gio don gian
-        # hoa: ca 2 truong hop nay deu la ket qua tu
-        # invoke_external_api_with_resilience, khong can phan biet
-        # "khong cache" nua vi HLR/ITU von di khong dung cache.
+
         if err == "WARN_RULE_BYPASSED":
             for imsi in chunk:
                 chunk_results[imsi] = ValidationResult(is_valid=True, warn_code="WARN_RULE_BYPASSED")
             return chunk_results
 
         if err:
-            # Fault ha tang CHUNG (bao gom ca 5xx do x-mock-fault, gio da
-            # duoc invoke_external_api_with_resilience quy ve cung 1 loai
-            # voi timeout/conn-fail that su o tang transport).
+          
             for imsi in chunk:
                 chunk_results[imsi] = ValidationResult(
                     is_valid=False, error_code=err,
@@ -390,9 +317,7 @@ async def fetch_hlr_batch(imsis: List[str], client: httpx.AsyncClient) -> Dict[s
                         is_valid=False, error_code="ERR_IMSI_NOT_IN_HLR", error_message="IMSI not found in HLR"
                     )
         else:
-            # [FIX] Nhanh nay GIO CHI con nhan 4xx that (vd 422 validation
-            # loi body). Doi ten ma loi thanh CHUNG, khong con
-            # "_HLR_BATCH_INVALID" rieng theo service.
+          
             logger.error(
                 "HLR /subscribers/batch-lookup tra ve HTTP %s (request bi tu choi, khong phai fault ha tang) "
                 "cho %d IMSI. Body: %.1000s | imsis[0:3]=%s",
@@ -468,10 +393,7 @@ async def fetch_itu_batch(msisdns: List[str], client: httpx.AsyncClient) -> Dict
                 )
             return chunk_results
 
-        # Mock ITU thuc te tra ve "results" la DICT keyed theo chinh so
-        # dien thoai (giong cau truc /tac/batch cua GSMA):
-        #   {"results": {"+84971234567": {"valid": true, ...}, ...},
-        #    "total": N, "valid_count": X, "invalid_count": Y}
+     
         if res.status_code == 200:
             payload = res.json()
             result_map: Dict[str, Any] = payload.get("results", {})
@@ -488,10 +410,7 @@ async def fetch_itu_batch(msisdns: List[str], client: httpx.AsyncClient) -> Dict
                         is_valid=False, error_code="ERR_INVALID_MSISDN", error_message=detail
                     )
         else:
-            # [FIX] Nhanh nay GIO CHI con nhan 4xx that (vd 422
-            # Unprocessable Entity vi request body sai schema). Doi ten
-            # ma loi thanh CHUNG, khong con "_ITU_BATCH_INVALID" rieng
-            # theo service.
+       
             logger.error(
                 "ITU /validate/batch tra ve HTTP %s (request bi tu choi, khong phai fault ha tang) "
                 "cho %d so. Body: %.1000s | Payload da gui: phone_numbers[0:3]=%s",
@@ -576,14 +495,14 @@ async def validate_msisdn_format(
     if not re.match(r"^\+[1-9]\d{1,14}$", msisdn):
         return ValidationResult(is_valid=False, error_code="ERR_INVALID_MSISDN", error_message="Violate E.164 regex")
 
-    # --- Duong di MOI: tra cuu tu ket qua Batch da prefetch ---
+   
     if itu_map is not None:
         return itu_map.get(
             msisdn,
             ValidationResult(is_valid=False, error_code="ERR_INVALID_MSISDN", error_message="Missing in batch result"),
         )
 
-    # --- Duong di CU: goi API don le (fallback / tuong thich nguoc) ---
+
     url = f"{ITU_E164_SERVICE_URL}/validate"
     res, err = await invoke_external_api_with_resilience("ITU_E164", client, "POST", url, json={"phone_number": msisdn})
 
@@ -696,8 +615,6 @@ async def validate_imei_tac(record: Dict[str, Any], client: httpx.AsyncClient) -
     if tac in TAC_CACHE:
         return TAC_CACHE[tac]
 
-    # Fallback: goi API don le (chi xay ra neu TAC nay chua tung duoc
-    # prefetch -- vi du goi rule nay ngoai luong execute_validation_pipeline_batch)
     url = f"{GSMA_TAC_SERVICE_URL}/tac/{tac}"
     res, err = await invoke_external_api_with_resilience("GSMA_TAC", client, "GET", url)
 

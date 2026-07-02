@@ -13,10 +13,7 @@ bằng psycopg2 executemany + ON CONFLICT DO NOTHING (idempotent).
 Input : Kafka topic radius.clean
 Output: PostgreSQL bảng radius_sessions
 
-Giữ nguyên 3-layer pattern từ codebase gốc:
-  1. CONSTANTS   — export, đọc từ .env
-  2. PURE LOGIC  — build_dsn, build_upsert_sql, extract_rows_from_batch
-  3. SPARK I/O   — write_micro_batch (foreachBatch), start_storage_stream
+
 """
 
 import os
@@ -211,7 +208,7 @@ def start_storage_stream(spark: SparkSession):
             )
         )
         
-        # 3. BỔ SUNG: Chuyển ISO String của thời điểm nạp sang Timestamp chuẩn
+        
         .withColumn(
             "ingest_timestamp",
             F.when(
@@ -222,7 +219,7 @@ def start_storage_stream(spark: SparkSession):
             )
         )
         
-        # 4. Đảm bảo late_arrival không bị Null (gán False nếu không có)
+        
         .withColumn("late_arrival", F.coalesce(F.col("late_arrival"), F.lit(False)))
         .withColumn(
             "framed_ip",
@@ -250,15 +247,15 @@ def start_storage_stream(spark: SparkSession):
     return query
 
 def main() -> None:
-    s3_cores = os.getenv("SPARK_S3_LOCAL_CORES", "2")            # THÊM
-    s3_driver_memory = os.getenv("SPARK_S3_DRIVER_MEMORY", "512m")  # THÊM
+    s3_cores = os.getenv("SPARK_S3_LOCAL_CORES", "2")         
+    s3_driver_memory = os.getenv("SPARK_S3_DRIVER_MEMORY", "512m") 
 
     builder = (
         SparkSession.builder
         .appName("Camara-Storage-Job")
-        .master(f"local[{s3_cores}]")                             # SỬA: local[*] -> local[N] tường minh
-        .config("spark.driver.memory", s3_driver_memory)           # THÊM
-        .config("spark.sql.shuffle.partitions", "2")               # SỬA: 4 -> 2, S3 chỉ ghi tuần tự
+        .master(f"local[{s3_cores}]")                           
+        .config("spark.driver.memory", s3_driver_memory)         
+        .config("spark.sql.shuffle.partitions", "2")             
     )
     spark = configure_spark_jars(builder, KAFKA_PG_PACKAGES).getOrCreate()
 

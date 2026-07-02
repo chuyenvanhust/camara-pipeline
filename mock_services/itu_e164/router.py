@@ -9,14 +9,14 @@ router = APIRouter()
 
 def validate_e164_logic(phone: str) -> ValidationResult:
     """Hàm lõi xử lý thuật toán phân tách đầu số E.164"""
-    # 1. Kiểm tra format cơ bản
+
     if not phone.startswith("+") or not phone[1:].isdigit() or len(phone) < 11 or len(phone) > 16:
         return ValidationResult(phone_number=phone, valid=False, error_code="INVALID_FORMAT", error_detail="Number must start with '+' followed by 10-15 digits")
 
     raw_num = phone[1:]
     matched_cc = None
 
-    # 2. Tìm Country Code
+  
     for i in range(1, 4):
         possible_cc = raw_num[:i]
         if possible_cc in COUNTRY_DB:
@@ -30,7 +30,7 @@ def validate_e164_logic(phone: str) -> ValidationResult:
     if len(remains) < 7:
         return ValidationResult(phone_number=phone, valid=False, error_code="INVALID_FORMAT", error_detail="Subscriber number part is too short")
 
-    # 3. Phân tách nhà mạng
+
     allowed_prefixes = OPERATOR_DB.get(matched_cc, set())
     matched_prefix = None
 
@@ -55,7 +55,7 @@ def validate_e164_logic(phone: str) -> ValidationResult:
 
 @router.post("/validate", response_model=ValidationResult)
 def validate_single_number(payload: SingleValidationRequest):
-    # [Kế thừa Phase 1]: Hạ tầng sẽ tự động can thiệp X-Inject-Fault qua Shared Middleware ở app.py
+  
     result = validate_e164_logic(payload.phone_number)
     return result
 

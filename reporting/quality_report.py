@@ -8,22 +8,22 @@ from jinja2 import Environment, FileSystemLoader
 from dotenv import load_dotenv
 
 # File script nằm ở: camara-pipeline/reporting/quality_report.py
-# Thư mục cha (reporting/):
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-# Thư mục gốc (camara-pipeline/):
+
 BASE_DIR = os.path.dirname(SCRIPT_DIR)
 
-# Đường dẫn chuẩn xác đến file .env ngang hàng với thư mục reporting
+
 dotenv_path = os.path.join(BASE_DIR, '.env')
 
-# QUAN TRỌNG: Phải có override=True để ghi đè biến 'avnadmin' của Windows
+
 if os.path.exists(dotenv_path):
     load_dotenv(dotenv_path=dotenv_path, override=True)
 else:
     # Fallback nếu bạn đứng từ thư mục gốc chạy lệnh
     load_dotenv(dotenv_path=".env", override=True)
 def get_db_connection():
-    # Hệ thống sẽ ưu tiên đọc từ file .env trước, nếu không có sẽ dùng giá trị mặc định của Docker
+
     return psycopg2.connect(
         dbname=os.getenv("DB_NAME", "camara_db"),
         user=os.getenv("DB_USER", "postgres"),
@@ -40,19 +40,19 @@ def fetch_metrics():
 
     try:
         # --- SECTION 1: TỔNG QUAN ---
-        # SỬA ĐỔI: Query đúng bảng radius_sessions thay vì bảng log ảo
+        
         cur.execute("SELECT COUNT(*) as total FROM radius_sessions;")
         result = cur.fetchone()
         total_records = result['total'] if result and result['total'] is not None else 100
         
         metrics['overview'] = {
             "total_records": total_records,
-            "execution_time": "N/A", # Có thể thay bằng log từ file nếu cần
+            "execution_time": "N/A",
             "throughput": 0, 
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
 
-        # --- CÁC SECTION KHÁC (Đảm bảo tên bảng khớp với migration) ---
+       
         # Section 2: INVALID IMEI
         cur.execute("""
             SELECT 
@@ -71,7 +71,7 @@ def fetch_metrics():
         }
 
         # Section 3: DUPLICATE
-        # Lưu ý: Bảng duplicate_log cần có cột created_at (hoặc dùng cột khác bạn định nghĩa)
+        
         cur.execute("SELECT COUNT(*) as total FROM duplicate_log;")
         dup_total = cur.fetchone()['total']
         
@@ -79,7 +79,7 @@ def fetch_metrics():
             SELECT EXTRACT(HOUR FROM detected_at) as hour, COUNT(*) as count 
             FROM duplicate_log 
             GROUP BY hour ORDER BY hour;
-        """) # Giả sử dùng detected_at thay vì created_at theo thiết kế storage của bạn
+        """)
         dup_hourly = cur.fetchall()
         
         metrics['duplicate'] = {
@@ -90,7 +90,7 @@ def fetch_metrics():
         }
 
         # Section 4: CONFLICT
-        # Đảm bảo bảng conflict_log có cột conflict_type như query này
+        
         cur.execute("""
             SELECT 
                 COUNT(*) FILTER (WHERE conflict_type = 'A') as type_a,
@@ -111,8 +111,7 @@ def fetch_metrics():
     
 
         # --- SECTION 5: LATE ARRIVAL ---
-        # SỬA: Không có cột delay_minutes, chúng ta sẽ dùng sự khác biệt giữa event_timestamp và created_at (nếu có) 
-        # hoặc đếm trực tiếp dựa trên error_code
+        
         cur.execute("""
             SELECT COUNT(*) as total 
             FROM invalid_log 
@@ -120,8 +119,7 @@ def fetch_metrics():
         """)
         late_total = cur.fetchone()['total']
         
-        # Vì schema không có delay_minutes, ta không thể phân loại theo bucket 5-15m được.
-        # Tạm thời trả về count tổng để report không crash.
+       
         metrics['late_arrival'] = {
             "total": late_total,
             "rate": round((late_total / total_records * 100), 2) if total_records > 0 else 0,
@@ -133,7 +131,7 @@ def fetch_metrics():
         cur.execute("SELECT COUNT(*) as total FROM invalid_log WHERE error_code = 'ERR_MISSING_FIELD';")
         missing_total = cur.fetchone()['total']
         
-        # SỬA: Dùng 'details' khớp với SELECT phía dưới
+     
         cur.execute("""
             SELECT details, COUNT(*) as count 
             FROM invalid_log 
@@ -142,7 +140,7 @@ def fetch_metrics():
         """)
         top_missing = cur.fetchall()
 
-        # SỬA: Trích xuất đúng key 'details' thay vì 'missing_field_name'
+        
         metrics['missing_field'] = {
             "total": missing_total,
             "rate": round((missing_total / total_records * 100), 2) if total_records > 0 else 0,
@@ -152,7 +150,7 @@ def fetch_metrics():
 
     except Exception as e:
         print(f"Error gathering metrics from Postgres: {e}")
-        # Mock data phục vụ cho việc chạy test cô lập không có DB
+       
         metrics = get_mock_metrics()
     finally:
         cur.close()
@@ -174,7 +172,7 @@ def get_mock_metrics():
 def generate_html_report(output_path):
     metrics = fetch_metrics()
     
-    # Thiết lập Jinja2 Template environment
+
     template_dir = os.path.join(os.path.dirname(__file__), 'templates')
     env = Environment(loader=FileSystemLoader(template_dir))
     template = env.get_template('report.html.jinja2')
@@ -185,7 +183,7 @@ def generate_html_report(output_path):
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write(html_content)
-    print(f"🎉 Data Quality Report successfully generated at: {output_path}")
+    print(f" Data Quality Report successfully generated at: {output_path}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate Data Quality Report HTML.")

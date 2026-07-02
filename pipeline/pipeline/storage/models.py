@@ -54,12 +54,12 @@ class RadiusSession(Base):
     acct_session_id = Column(String(36), nullable=False)
     acct_status_type = Column(String(16), nullable=False)
     
-    # LỖI 1: Đổi 'acct_status_time' thành 'acct_session_time' để khớp với CSV và INSERT_COLUMNS
+    
     acct_session_time = Column(Integer, nullable=False) 
     
     event_timestamp = Column(DateTime(timezone=True), nullable=False)
     
-    # LỖI 2: ingest_timestamp nên cho phép Null hoặc nhận từ Spark truyền xuống
+    
     ingest_timestamp = Column(DateTime(timezone=True), nullable=True) 
     
     msisdn = Column(String(16), nullable=False)
@@ -71,13 +71,13 @@ class RadiusSession(Base):
     mcc_mnc = Column(String(6), nullable=True)
     late_arrival = Column(Boolean, default=False)
 
-    #: THỨ TỰ CẦN KHỚP 100% VỚI SCHEMA TRONG WRITER.PY
+  
     INSERT_COLUMNS = (
         "acct_session_id", 
         "acct_status_type",
         "acct_session_time", 
         "event_timestamp",
-        "ingest_timestamp", # Thêm vào để khớp với dữ liệu 12 cột
+        "ingest_timestamp", 
         "msisdn", 
         "imsi", 
         "imei",
@@ -88,7 +88,7 @@ class RadiusSession(Base):
         "late_arrival",
     )
 
-    #: Cột dùng để check trùng (Cho Partitioned table, bắt buộc phải có event_timestamp)
+   
     CONFLICT_COLUMNS = ("acct_session_id", "acct_status_type", "event_timestamp")
 
     def __repr__(self):
@@ -113,10 +113,10 @@ class SwapEvent(Base):
     new_imsi = Column(String(15), nullable=True)
     old_imei = Column(String(15), nullable=True)
     new_imei = Column(String(15), nullable=True)
-    swap_type = Column(String(16), nullable=False)    # SIM_SWAP | DEVICE_SWAP
+    swap_type = Column(String(16), nullable=False)    
     detected_at = Column(DateTime(timezone=True), nullable=False)
     confirmed_at = Column(DateTime(timezone=True), nullable=True)
-    source = Column(String(32), nullable=False)       # RADIUS_CONFLICT_C
+    source = Column(String(32), nullable=False)     
 
     VALID_SWAP_TYPES = ("SIM_SWAP", "DEVICE_SWAP")
 

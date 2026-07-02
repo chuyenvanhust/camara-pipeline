@@ -13,10 +13,7 @@ async def test_exact_duplicate_one_kept_one_dropped(db_client: asyncpg.Connectio
     Kết quả mong muốn: Hệ thống chỉ giữ lại 1 record chính thức,
     record còn lại bị trigger long-term dedup chặn và ghi vào duplicate_log.
 
-    (Sửa: bản cũ tự insert thẳng vào duplicate_log để giả lập kết quả,
-    không test logic thật. Từ khi có
-    storage/migrations/004_dedup_trigger.sql, test này verify hành vi
-    thật của fn_dedup_long_term_check.)
+    
     """
     session_id = uuid.uuid4()
     ts = datetime.utcnow()
@@ -26,8 +23,7 @@ async def test_exact_duplicate_one_kept_one_dropped(db_client: asyncpg.Connectio
         str(session_id), "Start", ts, "+84901234561", ts
     )
 
-    # Bản ghi thứ hai cùng session_id + status -> trigger chặn insert
-    # và tự ghi vào duplicate_log.
+   
     await db_client.execute(
         "INSERT INTO radius_sessions (acct_session_id, acct_status_type, event_timestamp, msisdn, ingest_timestamp) VALUES ($1, $2, $3, $4, $5)",
         str(session_id), "Start", ts, "+84901234561", ts

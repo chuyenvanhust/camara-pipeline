@@ -1,15 +1,14 @@
 import pytest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 pytestmark = [pytest.mark.device_swap]
 
 async def _set_device_swap(db, msisdn: str, age_days: float):
-    detected_at = datetime.utcnow() - timedelta(days=age_days)
+    confirmed_at = datetime.now(timezone.utc) - timedelta(days=age_days)
     await db.execute(
-        "INSERT INTO swap_event (msisdn, swap_type, detected_at) VALUES ($1, 'DEVICE_SWAP', $2)",
-        msisdn, detected_at
+        "INSERT INTO swap_event (msisdn, swap_type, confirmed_at) VALUES ($1, 'DEVICE_SWAP', $2)",
+        msisdn, confirmed_at
     )
-
 @pytest.mark.happy_path
 async def test_tc10_device_swap_1_day_ago(api_client, db_client):
     msisdn = "+84911234560"
@@ -39,7 +38,8 @@ async def test_tc12_device_swap_35_days_ago(api_client, db_client):
 async def test_tc13_device_swap_less_than_1_minute(api_client, db_client):
     msisdn = "+84911234563"
     detected_at = datetime.utcnow() - timedelta(seconds=30)
-    await db_client.execute("INSERT INTO swap_event (msisdn, swap_type, detected_at) VALUES ($1, 'DEVICE_SWAP', $2)", msisdn, detected_at)
+    confirmed_at = datetime.now(timezone.utc) - timedelta(seconds=30)
+    await db_client.execute("INSERT INTO swap_event (msisdn, swap_type, confirmed_at) VALUES ($1, 'DEVICE_SWAP', $2)", msisdn, confirmed_at)
     
     response = await api_client.post("/device-swap/v0/check", json={"phoneNumber": msisdn, "maxAge": 30}, headers={"X-API-Key": "test_key"})
     assert response.status_code == 200
@@ -61,10 +61,8 @@ async def test_tc15_device_boundary_exact(api_client, db_client):
     msisdn = "+84911234565"
     db_now = await db_client.fetchval("SELECT NOW()")
     detected_at = db_now - timedelta(days=30) + timedelta(seconds=10)  # giữ nguyên buffer gốc: 10s
-    await db_client.execute(
-        "INSERT INTO swap_event (msisdn, swap_type, detected_at) VALUES ($1, 'DEVICE_SWAP', $2)",
-        msisdn, detected_at
-    )
+    confirmed_at = db_now - timedelta(days=30) + timedelta(seconds=10)
+    await db_client.execute("INSERT INTO swap_event (msisdn, swap_type, confirmed_at) VALUES ($1, 'DEVICE_SWAP', $2)", msisdn, confirmed_at)
 
     response = await api_client.post(
         "/device-swap/v0/check",

@@ -4,10 +4,9 @@ import csv
 from typing import Dict, Set
 import argparse
 
-# In-memory Storage lưu cấu trúc định tuyến tĩnh
-# COUNTRY_DB: { "84": "Vietnam", "1": "USA/Canada" }
+
 COUNTRY_DB: Dict[str, str] = {}
-# OPERATOR_DB: { "84": { "91", "90", "98" }, "1": { "202", "703" } }
+
 OPERATOR_DB: Dict[str, Set[str]] = {}
 
 def generate_mock_itu_csv():
@@ -41,7 +40,7 @@ def generate_mock_itu_csv():
         
         writer.writerows(rows)
     
-    print("✅ ITU CSV files generated with full prefix coverage (30-99).")
+    print(" ITU CSV files generated with full prefix coverage (30-99).")
 
 def load_itu_data_to_memory(cc_path: str = "mock_services/itu_e164/data/country_codes.csv", 
                             op_path: str = "mock_services/itu_e164/data/operator_prefixes.csv"):
@@ -52,7 +51,7 @@ def load_itu_data_to_memory(cc_path: str = "mock_services/itu_e164/data/country_
     
     # Kiểm tra sự tồn tại của cả 2 file trước khi đọc
     if not os.path.exists(cc_path) or not os.path.exists(op_path):
-        print(f"⚠️ Warning: ITU CSV files not found at {cc_path} or {op_path}")
+        print(f" Warning: ITU CSV files not found at {cc_path} or {op_path}")
         return
     
     # Nạp dữ liệu Quốc gia (Country Codes)

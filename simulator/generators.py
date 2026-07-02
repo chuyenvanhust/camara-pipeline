@@ -26,16 +26,16 @@ class RadiusDataGenerator:
                     self.tac_pool = [item.get("tac") if isinstance(item, dict) else item for item in data]
                 elif isinstance(data, dict) and "records" in data:
                     self.tac_pool = [item["tac"] for item in data["records"]]
-                print(f"✅ [Simulator Generator] Synchronized {len(self.tac_pool)} valid TACs from GSMA Mock.")
+                print(f" [Simulator Generator] Synchronized {len(self.tac_pool)} valid TACs from GSMA Mock.")
             else:
                 self._fallback_tac_pool()
         except requests.RequestException:
-            print("⚠️ [Simulator Generator] GSMA Mock offline. Using deterministic fallback TAC pool.")
+            print(" [Simulator Generator] GSMA Mock offline. Using deterministic fallback TAC pool.")
             self._fallback_tac_pool()
 
     def _fallback_tac_pool(self):
         self.tac_pool = generate_tac_codes(self.seed, TAC_POOL_SIZE)
-        print(f"🔄 [Simulator] Generated {len(self.tac_pool)} deterministic fallback TACs "
+        print(f" [Simulator] Generated {len(self.tac_pool)} deterministic fallback TACs "
               f"(identical to gsma_tac seed, seed={self.seed}).")
 
     def generate_luhn_checksum(self, number_str: str) -> str:

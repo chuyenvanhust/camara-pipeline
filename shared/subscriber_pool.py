@@ -13,17 +13,8 @@ def base_subscriber(index: int) -> Dict[str, str]:
     }
 
 
-# [FIX Conflict C] Trước đây HLR/HSS seed.py quyết định subscriber nào có
-# SIM Swap bằng rng.random() < 0.02 -- một RNG RIÊNG, độc lập hoàn toàn với
-# RNG của simulator. Do đó simulator KHÔNG THỂ biết msisdn nào thực sự có
-# 2 dòng IMSI trong HLR mock -> imsi "swap" simulator tự bịa ra gần như
-# chắc chắn không khớp history thật -> swap_detector luôn trả None (false
-# positive 100%, swap_event luôn trống).
-#
-# Sửa: thay xác suất ngẫu nhiên bằng CÔNG THỨC XÁC ĐỊNH (modulo), đặt ở
-# đây (shared) để cả hlr_hss/seed.py và simulator dùng chung, đảm bảo
-# luôn đồng bộ 100% mà không cần gọi API qua lại lúc sinh dữ liệu.
-SWAP_MODULO = 50  # 1/50 = 2%, khớp tỷ lệ SIM Swap cũ trong seed.py
+
+SWAP_MODULO = 50
 
 
 def has_sim_swap(index: int) -> bool:

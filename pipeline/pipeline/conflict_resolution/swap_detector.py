@@ -90,8 +90,7 @@ class SwapDetector:
                 logger.debug("HLR/HSS không có history cho msisdn=%s", msisdn)
                 return None
 
-            # [FIX-1] Sort theo assigned_at để xác định đúng thứ tự thời gian,
-            # KHÔNG dựa vào thứ tự trả về của mock (có thể không đảm bảo).
+      
             sorted_history = sorted(history, key=lambda x: x["assigned_at"])
 
             matched_index = next(
@@ -100,8 +99,7 @@ class SwapDetector:
             )
 
             if matched_index is None:
-                # new_imsi không có trong lịch sử HLR -> không xác nhận swap,
-                # đây là false positive từ conflict detection ở pipeline.
+           
                 logger.debug(
                     "new_imsi=%s không tìm thấy trong HLR history của msisdn=%s",
                     new_imsi, msisdn,
@@ -110,10 +108,7 @@ class SwapDetector:
 
             confirmed_at = sorted_history[matched_index]["assigned_at"]
 
-            # [FIX-1] old_imsi = phần tử ngay trước trong history đã sort.
-            # Nếu new_imsi là phần tử ĐẦU TIÊN trong lịch sử (matched_index=0),
-            # nghĩa là đây là lần gán IMSI đầu tiên cho MSISDN này -> không có
-            # old_imsi thực sự (không phải swap, mà là activation lần đầu).
+       
             if matched_index == 0:
                 logger.debug(
                     "msisdn=%s: new_imsi=%s là lần gán đầu tiên, không phải SIM Swap",
@@ -150,13 +145,7 @@ class SwapDetector:
 
 def write_swap_events(events: List[Dict], db_dsn: Dict) -> None:
     """
-    [FIX-2] Ghi list swap_event dict (output của verify_and_emit_swap)
-    vào bảng swap_event.
-
-    Khớp đúng cột trong storage/migrations/001_init_schema.sql:
-        msisdn, old_imsi, new_imsi, swap_type, detected_at, confirmed_at, source
-    (old_imei, new_imei, imei không dùng cho SIM_SWAP — để NULL, dành cho
-    DEVICE_SWAP nếu sau này pipeline mở rộng phát hiện đổi thiết bị).
+    
 
     Args:
         events: list dict, mỗi phần tử có shape của verify_and_emit_swap()

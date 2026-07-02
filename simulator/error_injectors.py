@@ -89,17 +89,7 @@ class ErrorInjector:
                     conflict_type = self.rng.choices(["A", "B", "C"], weights=[50, 30, 20])[0]
 
                     if conflict_type == "A":
-                        # [FIX] Trước đây bịa chuỗi IMSI/MSISDN tuỳ ý
-                        # ("452010999xxxx" chỉ 13 số, "84999xxxxxx" thiếu "+")
-                        # -> sai định dạng E.164/IMSI thật VÀ không tồn tại
-                        # trong HLR -> bị bước validate R3 (IMSI/MSISDN có tồn
-                        # tại không) loại bỏ trước khi tới conflict resolution.
-                        #
-                        # Sửa: mutate sang identifier của MỘT SUBSCRIBER KHÁC
-                        # có thật trong HLR (dùng base_subscriber() - cùng công
-                        # thức HLR/HSS seed.py dùng) -> vẫn hợp lệ định dạng,
-                        # vẫn tồn tại trong HLR, nhưng khác với Start cùng
-                        # session_id -> đúng định nghĩa Session Inconsistency.
+                       
                         mutated_stop = dict(stop_rec)
                         cur_idx = start_rec.get("_sub_idx", 0)
                         other_idx = (cur_idx + 1) % SUBSCRIBER_POOL_SIZE
@@ -131,20 +121,9 @@ class ErrorInjector:
                     elif conflict_type == "C":
                         output.append(stop_rec)
 
-                        # [FIX] Trước đây dùng sub_idx của session HIỆN TẠI
-                        # (start_rec["_sub_idx"]) rồi check has_sim_swap(sub_idx)
-                        # -> chỉ đúng với ~2% subscriber (index % 50 == 0), mà
-                        # round-robin (s % config.subscribers) hiếm khi rơi vào
-                        # đúng các index đó -> hầu hết roll trúng "C" bị continue,
-                        # không sinh ra record nào (mất tích trong im lặng).
-                        #
-                        # Sửa: KHÔNG phụ thuộc sub_idx của session hiện tại nữa.
-                        # Chọn trực tiếp 1 subscriber từ SWAP_ELIGIBLE_INDICES
-                        # (đã biết chắc HLR có seed sẵn bản ghi swap) -> luôn
-                        # tạo được Conflict C hợp lệ mỗi khi roll trúng type C.
+                     
                         if not SWAP_ELIGIBLE_INDICES:
-                            # An toàn: nếu vì lý do gì đó pool rỗng, bỏ qua thay
-                            # vì crash.
+                            
                             i += 2
                             continue
 
@@ -160,11 +139,7 @@ class ErrorInjector:
                         except (ValueError, TypeError):
                             t_swap_start = t_swap_stop = None
 
-                        # [FIX kèm theo] swap_start/swap_stop phải dùng ĐÚNG
-                        # msisdn của subscriber được chọn (swap_msisdn), không
-                        # phải msisdn của start_rec/stop_rec gốc như bản cũ —
-                        # nếu không, Conflict C sẽ có 2 msisdn khác nhau trong
-                        # cùng 1 "sự kiện swap", vô nghĩa với swap_detector.py.
+                      
                         swap_start = dict(start_rec)
                         swap_start.update({
                             "acct_session_id": swap_session_id,

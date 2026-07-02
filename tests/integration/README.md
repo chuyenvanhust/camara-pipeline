@@ -33,17 +33,8 @@ docker compose -f docker-compose.test.yml up -d
 pip install -e ".[test]"
 
 # Chạy tất cả
-pytest tests/ -v
+pytest tests/integration -v
 
-# Theo nhóm
-pytest tests/api/ -v
-pytest tests/pipeline/ -v
-
-# Theo marker
-pytest -m edge_case -v
-pytest -m late_arrival -v
-pytest -m "sim_swap or device_swap" -v
-```
 
 ## Chiến lược inject test data
 

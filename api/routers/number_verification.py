@@ -65,11 +65,7 @@ router = APIRouter(
     dependencies=[Depends(verify_api_key)],
 )
 
-# Dùng EXISTS thay vì COUNT(*) — dừng scan ngay khi tìm thấy 1 row,
-# hiệu quả hơn khi index đã có, đảm bảo SLA 100ms p95.
-#
-# [FIX] Thêm `r2.msisdn = $1` và `r2.event_timestamp >= r1.event_timestamp`
-# để subquery r2 tận dụng được idx_msisdn_ts sẵn có, KHÔNG cần index mới.
+
 _QUERY_ACTIVE_SESSION = """
     SELECT EXISTS (
         SELECT 1

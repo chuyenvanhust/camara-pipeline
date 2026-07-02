@@ -79,10 +79,7 @@ async def setup_db_schema(db_pool):
                     print(f"Error seeding {filename}: {e}")
 
 # ── 3. DB Client — session scope ─────────────────────────────────────────────
-# THAY ĐỔI QUAN TRỌNG: scope="session" thay vì "function"
-# Lý do: function-scoped async fixture chạy trên loop khác với
-# session-scoped db_pool → "attached to different loop".
-# Clean DB được thực hiện qua clean_db fixture riêng (cũng session scope).
+
 @pytest.fixture(scope="session")
 async def db_client(db_pool):
     """
@@ -97,9 +94,7 @@ async def db_client(db_pool):
 # ── 4. API Client — session scope ────────────────────────────────────────────
 @pytest.fixture(scope="session")
 async def api_client(db_pool):
-    # Override auth: bypass verify_api_key cho toàn bộ integration test
-    # Integration test kiểm tra business logic, không kiểm tra auth
-    # (auth được test riêng trong test_tc35_api_key_invalid với key sai thật)
+    
     app.dependency_overrides[verify_api_key] = lambda: "test_key"
 
     async with AsyncClient(
@@ -138,6 +133,6 @@ async def clean_db(db_pool):
                 try:
                     await conn.execute(f"TRUNCATE TABLE {table} CASCADE;")
                 except asyncpg.UndefinedTableError:
-                    pass  # Bảng chưa tồn tại trong môi trường test
+                    pass  
     except Exception:
-        pass  # Không để clean_db fail làm crash teardown
+        pass 

@@ -23,7 +23,7 @@ class TacLookupResponse(BaseModel):
     status: str
 
 class BatchRequest(BaseModel):
-    tac_codes: List[str] = Field(..., max_length=500) # Đổi max_items thành max_length
+    tac_codes: List[str] = Field(..., max_length=500) 
 
 class BatchResultItem(BaseModel):
     found: bool

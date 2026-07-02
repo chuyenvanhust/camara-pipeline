@@ -1,1 +1,0 @@
-pytest tests/unit/mock_services/shared/ -v

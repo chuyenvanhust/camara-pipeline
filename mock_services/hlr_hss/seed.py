@@ -49,15 +49,10 @@ def generate_mock_subscribers_csv(output_path: str, count: int = SUBSCRIBER_POOL
                 reg_date.isoformat() + "Z", up_date.isoformat() + "Z",
             ])
 
-            # [FIX] SIM Swap: xác định bằng has_sim_swap(i), KHÔNG dùng
-            # rng.random() nữa -- simulator cần biết trước chính xác tập
-            # subscriber này để inject Conflict C khớp với HLR thật.
+          
             if has_sim_swap(i):
                 swap_sub = swap_new_imsi_subscriber(i, count)
-                # random.randint vẫn OK dùng ở đây vì chỉ ảnh hưởng timestamp,
-                # không ảnh hưởng việc CÓ swap hay KHÔNG (đã xác định ở trên)
-                # -- swap_detector không so khớp thời điểm chính xác, chỉ cần
-                # new_imsi đứng SAU old_imsi theo assigned_at.
+                
                 swap_date = RADIUS_SIMULATION_START - timedelta(days=rng.randint(1, 180))
                 writer.writerow([
                     swap_sub["imsi"], sub["msisdn"], "active", "452", "01", "Viettel",
@@ -65,8 +60,7 @@ def generate_mock_subscribers_csv(output_path: str, count: int = SUBSCRIBER_POOL
                     swap_date.isoformat() + "Z", swap_date.isoformat() + "Z",
                 ])
 
-            # Number Portability (~2%, độc lập SIM Swap, KHÔNG cần đồng bộ
-            # với simulator vì không liên quan Conflict C).
+        
             if rng.random() < 0.02:
                 port_sub = base_subscriber(count * 2 + i)
                 port_date = up_date + timedelta(days=rng.randint(30, 180))
@@ -83,7 +77,7 @@ def load_subscribers_to_memory(file_path: str = "mock_services/hlr_hss/data/subs
     SUBSCRIBERS_BY_MSISDN.clear()
 
     if not os.path.exists(file_path):
-        print(f"⚠️ Warning: Subscriber DB file not found at {file_path}")
+        print(f" Warning: Subscriber DB file not found at {file_path}")
         return
 
     with open(file_path, "r", encoding="utf-8") as f:
@@ -115,4 +109,4 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=MASTER_SEED)
     args = parser.parse_args()
     generate_mock_subscribers_csv("mock_services/hlr_hss/data/subscribers.csv", args.count, args.seed)
-    print(f"✅ Generated {args.count} mock subscribers (seed={args.seed})")
+    print(f" Generated {args.count} mock subscribers (seed={args.seed})")
