@@ -14,13 +14,8 @@ SUBSCRIBERS_BY_MSISDN: Dict[str, List[dict]] = {}
 def generate_mock_subscribers_csv(output_path: str, count: int = SUBSCRIBER_POOL_SIZE,
                                     seed_value: int = MASTER_SEED):
     """Sinh subscribers.csv. IMSI/MSISDN gốc dùng base_subscriber() (shared)
-    -> khớp 100% với simulator/generator.py.
+    
 
-    [FIX Conflict C] SIM Swap KHÔNG còn quyết định bằng rng.random() < 0.02
-    (RNG riêng, simulator không thể biết trước) -- thay bằng has_sim_swap(i),
-    công thức xác định dùng CHUNG với simulator, đảm bảo 2 bên luôn đồng bộ
-    100% subscriber nào có swap và IMSI mới là gì, không cần đọc file của
-    nhau lúc chạy.
 
     Number Portability vẫn giữ random (không liên quan Conflict C /
     SwapDetector, không cần đồng bộ với simulator)."""
@@ -53,7 +48,7 @@ def generate_mock_subscribers_csv(output_path: str, count: int = SUBSCRIBER_POOL
             if has_sim_swap(i):
                 swap_sub = swap_new_imsi_subscriber(i, count)
                 
-                swap_date = RADIUS_SIMULATION_START - timedelta(days=rng.randint(1, 180))
+                swap_date = RADIUS_SIMULATION_START + timedelta(days=rng.randint(1, 180))
                 writer.writerow([
                     swap_sub["imsi"], sub["msisdn"], "active", "452", "01", "Viettel",
                     "true", "false", "true",

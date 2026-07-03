@@ -8,6 +8,11 @@ from mock_services.hlr_hss.models import (
 )
 from mock_services.hlr_hss.seed import SUBSCRIBERS_BY_IMSI, SUBSCRIBERS_BY_MSISDN
 
+def clean_iso_date(date_str: Optional[str]) -> Optional[str]:
+    if isinstance(date_str, str) and date_str.endswith("Z"):
+        return date_str.rstrip("Z")
+    return date_str
+
 router = APIRouter(prefix="/subscribers")
 
 @router.get("/by-imsi/{imsi}", response_model=SubscriberProfile)
@@ -33,13 +38,15 @@ def get_imsi_history(msisdn: str):
     # Sắp xếp hồ sơ từ mới đến cũ dựa trên registered_at
     sorted_records = sorted(records, key=lambda x: x["registered_at"], reverse=True)
     
+
+
     history_entries = []
     latest_swap_at = None
     n = len(sorted_records)
     
     for idx, rec in enumerate(sorted_records):
         is_current = (idx == 0)
-        unassign_t = None if is_current else sorted_records[idx - 1]["registered_at"]
+        unassign_t = None if is_current else clean_iso_date(sorted_records[idx - 1]["registered_at"])
         
         if is_current and n > 1:
             latest_swap_at = rec["registered_at"]
@@ -50,7 +57,7 @@ def get_imsi_history(msisdn: str):
             
         history_entries.append(ImsiHistoryEntry(
             imsi=rec["imsi"],
-            assigned_at=rec["registered_at"],
+            assigned_at=clean_iso_date(rec["registered_at"]),
             unassigned_at=unassign_t,
             is_current=is_current,
             swap_reason=swap_reason
@@ -82,11 +89,11 @@ def get_msisdn_history(
     history_entries = []
     for idx, rec in enumerate(sorted_records):
         is_current = (idx == 0)
-        unassign_t = None if is_current else sorted_records[idx - 1]["registered_at"]
+        unassign_t = None if is_current else clean_iso_date(sorted_records[idx - 1]["registered_at"])
 
         history_entries.append(MsisdnHistoryEntry(
             msisdn=rec["msisdn"],
-            assigned_at=rec["registered_at"],
+            assigned_at=clean_iso_date(rec["registered_at"]),
             unassigned_at=unassign_t,
             is_current=is_current
         ))
