@@ -11,7 +11,7 @@ docker run --rm \
   -w /workspace \
   -e PYTHONPATH=/workspace \
   python:3.11-slim \
-  bash -c "pip install --quiet requests pydantic altair pandas asyncpg && python3 -m simulator.simulator --records 2000000 --subscribers 1000 --seed 42 --output data/radius_log.csv"
+  bash -c "pip install --quiet requests pydantic altair pandas asyncpg && python3 -m simulator.simulator --records 2000000 --subscribers 100000 --seed 42 --output data/radius_log.csv"
 
 # Kiểm tra file
 if [ -f "data/radius_log.csv" ]; then

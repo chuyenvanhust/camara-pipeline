@@ -66,112 +66,123 @@ class ErrorInjector:
         return records
 
     def inject_conflicts(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-            """
-            Tiêm Conflict A/B/C đúng định nghĩa README, theo conflict_rate,
-            phân bổ nội bộ 50/30/20.
-            """
-            if self.config.conflict_rate <= 0:
-                return records
+        """
+        Tiêm Conflict A/B/C ĐỘC LẬP, mỗi loại đúng 2% trên tổng số session,
+        không chia sẻ chung 1 ngân sách xác suất (fix rate).
+        """
+        CONFLICT_RATE_A = 0.02
+        CONFLICT_RATE_B = 0.02
+        CONFLICT_RATE_C = 0.02
 
-            output: List[Dict[str, Any]] = []
-            i, n = 0, len(records)
+        output: List[Dict[str, Any]] = []
+        i, n = 0, len(records)
 
-            while i < n:
-                start_rec = records[i]
-                stop_rec = records[i + 1] if i + 1 < n else None
-                output.append(start_rec)
+        while i < n:
+            start_rec = records[i]
+            stop_rec = records[i + 1] if i + 1 < n else None
+            output.append(start_rec)
 
-                if stop_rec is None:
+            if stop_rec is None:
+                i += 2
+                continue
+
+            # Roll 1 lần duy nhất, chia thành 3 khoảng KHÔNG chồng lấn
+            # -> mỗi loại đúng 2%, tổng 3 loại = 6%, loại trừ lẫn nhau
+            r = self.rng.random()
+            if r < CONFLICT_RATE_A:
+                conflict_type = "A"
+            elif r < CONFLICT_RATE_A + CONFLICT_RATE_B:
+                conflict_type = "B"
+            elif r < CONFLICT_RATE_A + CONFLICT_RATE_B + CONFLICT_RATE_C:
+                conflict_type = "C"
+            else:
+                conflict_type = None
+
+            if conflict_type == "A":
+                mutated_stop = dict(stop_rec)
+                cur_idx = start_rec.get("_sub_idx", 0)
+                other_idx = (cur_idx + 1) % SUBSCRIBER_POOL_SIZE
+                if other_idx == cur_idx:
+                    other_idx = (cur_idx + 2) % SUBSCRIBER_POOL_SIZE
+                other_sub = base_subscriber(other_idx)
+
+                if self.rng.random() < 0.5:
+                    mutated_stop["imsi"] = other_sub["imsi"]
+                else:
+                    mutated_stop["msisdn"] = other_sub["msisdn"]
+                output.append(mutated_stop)
+
+            elif conflict_type == "B":
+                extra_start = dict(start_rec)
+                extra_start["acct_session_id"] = f"SESS_B_{i:010d}"
+                extra_start["acct_session_time"] = "0"
+                try:
+                    t0 = datetime.fromisoformat(start_rec["event_timestamp"].replace("Z", ""))
+                    t1 = datetime.fromisoformat(stop_rec["event_timestamp"].replace("Z", ""))
+                    mid = t0 + (t1 - t0) / 2
+                    extra_start["event_timestamp"] = mid.isoformat() + "Z"
+                    extra_start["ingest_timestamp"] = (mid + timedelta(seconds=2)).isoformat() + "Z"
+                except (ValueError, TypeError):
+                    pass
+                output.append(extra_start)
+                output.append(stop_rec)
+
+            elif conflict_type == "C":
+                output.append(stop_rec)
+
+                # FIX: giữ NGUYÊN msisdn của chính session đang xét
+                # (đúng định nghĩa "cùng msisdn mapping sang imsi mới"),
+                # không lấy msisdn của 1 subscriber ngẫu nhiên khác nữa.
+                cur_idx = start_rec.get("_sub_idx", 0)
+                if cur_idx not in SWAP_ELIGIBLE_INDICES:
+                    # subscriber này không eligible cho SIM swap -> không ép,
+                    # coi như không có conflict, giữ nguyên rate cho các session khác
                     i += 2
                     continue
 
-                if self.rng.random() < self.config.conflict_rate:
-                    conflict_type = self.rng.choices(["A", "B", "C"], weights=[50, 30, 20])[0]
+                same_msisdn = start_rec["msisdn"]
+                new_imsi = swap_new_imsi_subscriber(cur_idx, SUBSCRIBER_POOL_SIZE)["imsi"]
+                swap_session_id = f"SESS_C_{i:010d}"
 
-                    if conflict_type == "A":
-                       
-                        mutated_stop = dict(stop_rec)
-                        cur_idx = start_rec.get("_sub_idx", 0)
-                        other_idx = (cur_idx + 1) % SUBSCRIBER_POOL_SIZE
-                        if other_idx == cur_idx:  # phòng khi pool size = 1
-                            other_idx = (cur_idx + 2) % SUBSCRIBER_POOL_SIZE
-                        other_sub = base_subscriber(other_idx)
+                try:
+                    t_stop = datetime.fromisoformat(stop_rec["event_timestamp"].replace("Z", ""))
+                    t_swap_start = t_stop + timedelta(minutes=10)  # sau khi session cũ kết thúc -> hợp lý
+                    t_swap_stop = t_swap_start + timedelta(seconds=60)
+                except (ValueError, TypeError):
+                    t_swap_start = t_swap_stop = None
 
-                        if self.rng.random() < 0.5:
-                            mutated_stop["imsi"] = other_sub["imsi"]
-                        else:
-                            mutated_stop["msisdn"] = other_sub["msisdn"]
-                        output.append(mutated_stop)
+                swap_start = dict(start_rec)
+                swap_start.update({
+                    "acct_session_id": swap_session_id,
+                    "acct_status_type": "Start",
+                    "acct_session_time": "0",
+                    "msisdn": same_msisdn,   # giữ nguyên MSISDN
+                    "imsi": new_imsi,        # đổi IMSI mới -> tín hiệu SIM Swap
+                    "_sub_idx": cur_idx,
+                })
+                swap_stop = dict(stop_rec)
+                swap_stop.update({
+                    "acct_session_id": swap_session_id,
+                    "acct_status_type": "Stop",
+                    "acct_session_time": "60",
+                    "msisdn": same_msisdn,
+                    "imsi": new_imsi,
+                    "_sub_idx": cur_idx,
+                })
+                if t_swap_start is not None:
+                    swap_start["event_timestamp"] = t_swap_start.isoformat() + "Z"
+                    swap_start["ingest_timestamp"] = (t_swap_start + timedelta(seconds=2)).isoformat() + "Z"
+                    swap_stop["event_timestamp"] = t_swap_stop.isoformat() + "Z"
+                    swap_stop["ingest_timestamp"] = (t_swap_stop + timedelta(seconds=2)).isoformat() + "Z"
 
-                    elif conflict_type == "B":
-                        extra_start = dict(start_rec)
-                        extra_start["acct_session_id"] = f"SESS_B_{i:010d}"
-                        extra_start["acct_session_time"] = "0"
-                        try:
-                            t0 = datetime.fromisoformat(start_rec["event_timestamp"].replace("Z", ""))
-                            t1 = datetime.fromisoformat(stop_rec["event_timestamp"].replace("Z", ""))
-                            mid = t0 + (t1 - t0) / 2
-                            extra_start["event_timestamp"] = mid.isoformat() + "Z"
-                            extra_start["ingest_timestamp"] = (mid + timedelta(seconds=2)).isoformat() + "Z"
-                        except (ValueError, TypeError):
-                            pass
-                        output.append(extra_start)
-                        output.append(stop_rec)
+                output.append(swap_start)
+                output.append(swap_stop)
+            else:
+                output.append(stop_rec)
 
-                    elif conflict_type == "C":
-                        output.append(stop_rec)
+            i += 2
 
-                     
-                        if not SWAP_ELIGIBLE_INDICES:
-                            
-                            i += 2
-                            continue
-
-                        swap_idx = self.rng.choice(SWAP_ELIGIBLE_INDICES)
-                        swap_msisdn = base_subscriber(swap_idx)["msisdn"]
-                        new_imsi = swap_new_imsi_subscriber(swap_idx, SUBSCRIBER_POOL_SIZE)["imsi"]
-                        swap_session_id = f"SESS_C_{i:010d}"
-
-                        try:
-                            t_stop = datetime.fromisoformat(stop_rec["event_timestamp"].replace("Z", ""))
-                            t_swap_start = t_stop + timedelta(minutes=10)
-                            t_swap_stop = t_swap_start + timedelta(seconds=60)
-                        except (ValueError, TypeError):
-                            t_swap_start = t_swap_stop = None
-
-                      
-                        swap_start = dict(start_rec)
-                        swap_start.update({
-                            "acct_session_id": swap_session_id,
-                            "acct_status_type": "Start",
-                            "acct_session_time": "0",
-                            "msisdn": swap_msisdn,
-                            "imsi": new_imsi,
-                            "_sub_idx": swap_idx,
-                        })
-                        swap_stop = dict(stop_rec)
-                        swap_stop.update({
-                            "acct_session_id": swap_session_id,
-                            "acct_status_type": "Stop",
-                            "acct_session_time": "60",
-                            "msisdn": swap_msisdn,
-                            "imsi": new_imsi,
-                            "_sub_idx": swap_idx,
-                        })
-                        if t_swap_start is not None:
-                            swap_start["event_timestamp"] = t_swap_start.isoformat() + "Z"
-                            swap_start["ingest_timestamp"] = (t_swap_start + timedelta(seconds=2)).isoformat() + "Z"
-                            swap_stop["event_timestamp"] = t_swap_stop.isoformat() + "Z"
-                            swap_stop["ingest_timestamp"] = (t_swap_stop + timedelta(seconds=2)).isoformat() + "Z"
-
-                        output.append(swap_start)
-                        output.append(swap_stop)
-                else:
-                    output.append(stop_rec)
-
-                i += 2
-
-            return output
+        return output
 
     def inject_missing_fields(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Xóa ngẫu nhiên 1 trong các trường bắt buộc theo tỷ lệ missing_field_rate"""

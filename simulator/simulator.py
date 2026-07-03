@@ -106,8 +106,8 @@ class RadiusSimulator:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="RADIUS Accounting Stream Log Simulator CLI Engine")
-    parser.add_argument("--records", type=int, default=1000) 
-    parser.add_argument("--subscribers", type=int, default=100)
+    parser.add_argument("--records", type=int, default=2_000_000)
+    parser.add_argument("--subscribers", type=int, default=100_000)
     parser.add_argument("--days", type=int, default=90)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--duplicate-rate", type=float, default=0.03)
