@@ -23,6 +23,7 @@ class ErrorInjector:
     def __init__(self, config):
         self.config = config
         self.rng = random.Random(config.seed)
+        self._swap_cursor = 0
 
     def inject_duplicates(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Nhân bản bản ghi giữ nguyên Session ID và Timestamp theo tỷ lệ duplicate_rate"""
@@ -133,14 +134,10 @@ class ErrorInjector:
                 # FIX: giữ NGUYÊN msisdn của chính session đang xét
                 # (đúng định nghĩa "cùng msisdn mapping sang imsi mới"),
                 # không lấy msisdn của 1 subscriber ngẫu nhiên khác nữa.
-                cur_idx = start_rec.get("_sub_idx", 0)
-                if cur_idx not in SWAP_ELIGIBLE_INDICES:
-                    # subscriber này không eligible cho SIM swap -> không ép,
-                    # coi như không có conflict, giữ nguyên rate cho các session khác
-                    i += 2
-                    continue
+                cur_idx = SWAP_ELIGIBLE_INDICES[self._swap_cursor % len(SWAP_ELIGIBLE_INDICES)]
+                self._swap_cursor += 1
 
-                same_msisdn = start_rec["msisdn"]
+                same_msisdn = base_subscriber(cur_idx)["msisdn"]
                 new_imsi = swap_new_imsi_subscriber(cur_idx, SUBSCRIBER_POOL_SIZE)["imsi"]
                 swap_session_id = f"SESS_C_{i:010d}"
 

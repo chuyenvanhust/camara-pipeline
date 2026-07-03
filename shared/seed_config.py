@@ -9,7 +9,7 @@ RADIUS_SIMULATION_START = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
 MASTER_SEED: int = 42
 
 
-SUBSCRIBER_POOL_SIZE: int = 1_000_000
+SUBSCRIBER_POOL_SIZE: int = 100_000
 
 
 TAC_POOL_SIZE: int = 2_000

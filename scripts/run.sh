@@ -36,7 +36,7 @@ case "$1" in
         echo ">>> Seeding mock services qua Docker Exec..."
         # Dùng docker exec để chạy bên trong container, tránh lỗi ModuleNotFoundError
         docker exec -e PYTHONPATH=. -w /workspace camara-mock-gsma-tac python -m mock_services.gsma_tac.seed --count 2000 --seed 42 || { echo "Lỗi seed GSMA"; exit 1; }
-        docker exec -e PYTHONPATH=. -w /workspace camara-mock-hlr-hss python -m mock_services.hlr_hss.seed --count 1000000 --seed 42 || { echo "Lỗi seed HLR"; exit 1; }
+        docker exec -e PYTHONPATH=. -w /workspace camara-mock-hlr-hss python -m mock_services.hlr_hss.seed --count 100000 --seed 42 || { echo "Lỗi seed HLR"; exit 1; }
         
         docker exec -e PYTHONPATH=. -w /workspace camara-mock-itu-e164 python -m mock_services.itu_e164.seed --count 1000 --seed 42 || { echo "Lỗi seed ITU"; exit 1; }
         

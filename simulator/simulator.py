@@ -46,7 +46,7 @@ class RadiusSimulator:
                 "imsi": sub["imsi"],
                 "imei": imei,
                 "rat_type": "E-UTRAN",
-                "framed_ip": f"10.100.{sub_idx // 254}.{sub_idx % 254 + 1}",
+                "framed_ip": f"10.100.{(sub_idx // 256) % 256}.{sub_idx % 256}",
                 "nas_ip": "192.168.1.1",
                 "mcc_mnc": "452-01",
                 "_sub_idx": sub_idx,
@@ -124,7 +124,7 @@ if __name__ == "__main__":
     config = SimulatorConfig(
         records=args.records, subscribers=args.subscribers, days=args.days, seed=args.seed,
         duplicate_rate=args.duplicate_rate, late_arrival_rate=args.late_arrival_rate,
-        invalid_imei_rate=args.invalid_imei_rate, conflict_rate=args.conflict_rate,
+        invalid_imei_rate=args.invalid_imei_rate, 
         missing_field_rate=args.missing_field_rate, output=args.output,
         kafka=args.kafka, kafka_topic=args.kafka_topic
     )
