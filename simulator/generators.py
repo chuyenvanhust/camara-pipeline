@@ -15,27 +15,33 @@ class RadiusDataGenerator:
 
     def fetch_tac_pool_from_mock(self):
         try:
-            response = requests.get(f"{self.gsma_url}/tac", timeout=5)
+            response = requests.get(
+                f"{self.gsma_url}/tac",
+                params={"page": 1, "page_size": TAC_POOL_SIZE},  # lấy đủ cả pool, không chỉ trang đầu
+                timeout=5,
+            )
             if response.status_code == 200:
                 data = response.json()
-                # Sửa logic lấy TAC ở đây để khớp với seed.py
                 records = []
                 if isinstance(data, list):
                     records = data
-                elif isinstance(data, dict) and "records" in data:
-                    records = data["records"]
-                
-                # Kiểm tra cả 'tac_code' và 'tac' cho chắc chắn
+                elif isinstance(data, dict) and "items" in data:   # FIX: đúng key theo PaginatedTacResponse
+                    records = data["items"]
+
                 self.tac_pool = [
-                    (item.get("tac_code") or item.get("tac")) 
-                    for item in records 
+                    (item.get("tac_code") or item.get("tac"))
+                    for item in records
                     if isinstance(item, dict)
                 ]
-                
-                # Loại bỏ các giá trị None nếu có
                 self.tac_pool = [t for t in self.tac_pool if t]
-                
-                print(f" [Simulator Generator] Synchronized {len(self.tac_pool)} valid TACs from GSMA Mock.")
+
+                if not self.tac_pool:
+                    # FIX: sync "thành công" (200 OK) nhưng rỗng vẫn phải fallback,
+                    # tránh im lặng sinh TAC ngẫu nhiên không khớp GSMA DB
+                    print(" [Simulator Generator] GSMA trả về 0 TAC hợp lệ, dùng fallback deterministic.")
+                    self._fallback_tac_pool()
+                else:
+                    print(f" [Simulator Generator] Synchronized {len(self.tac_pool)} valid TACs from GSMA Mock.")
             else:
                 self._fallback_tac_pool()
         except requests.RequestException:
