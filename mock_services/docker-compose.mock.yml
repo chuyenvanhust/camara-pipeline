@@ -1,0 +1,72 @@
+version: '3.8'
+services:
+  gsma-tac:
+    build:
+      context: ..
+      dockerfile: mock_services/gsma_tac/Dockerfile
+    container_name: camara-mock-gsma-tac
+    command: ["python", "-m", "uvicorn", "mock_services.gsma_tac.app:app", "--host", "0.0.0.0", "--port", "8100", "--workers", "2"]
+    volumes:
+      - ..:/workspace
+    working_dir: /workspace  
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5' 
+          memory : 128m
+    ports:
+      - "8100:8100"        
+    networks:
+      - camara-network
+    restart: always
+    
+
+  hlr-hss:
+    build:
+      context: ..
+      dockerfile: mock_services/hlr_hss/Dockerfile
+    container_name: camara-mock-hlr-hss
+    command: ["python", "-m", "uvicorn", "mock_services.hlr_hss.app:app", "--host", "0.0.0.0", "--port", "8200", "--workers", "2"]
+    volumes:
+      - ..:/workspace
+    working_dir: /workspace
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory : 1792m
+    ports:
+      - "8200:8200"        
+    networks:
+      - camara-network
+    restart: always
+    
+
+  itu-mock:
+    build:
+      context: ..
+      dockerfile: mock_services/itu_e164/Dockerfile
+
+    container_name: camara-mock-itu-e164
+    command: ["python", "-m", "uvicorn", "mock_services.itu_e164.app:app", "--host", "0.0.0.0", "--port", "8300", "--workers", "2"]
+    volumes:
+      - ..:/workspace
+
+    working_dir: /workspace
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5' 
+          memory : 128m
+    ports:
+      - "8300:8300"
+
+    networks:
+      - camara-network
+
+    restart: always
+    
+networks:
+  camara-network:
+    external: true
+    name: camara-network
