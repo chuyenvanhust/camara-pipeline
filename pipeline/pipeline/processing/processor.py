@@ -97,8 +97,10 @@ HLR_HSS_URL = os.getenv("HLR_HSS_SERVICE_URL", "http://camara-mock-hlr-hss:8200"
 # Singleton SwapDetector — tái sử dụng giữa các batch, tránh tạo lại
 # HTTP session mỗi lần (xem swap_detector.py). Chỉ dùng ở driver (bước
 # conflict C xử lý tuần tự), KHÔNG dùng trong mapPartitions.
-_swap_detector = SwapDetector(hlr_mock_url=HLR_HSS_URL)
+from pipeline.conflict_resolution.swap_detector import SwapDetector, write_swap_events
 
+_sim_swap_detector = SwapDetector(identity_type="imsi", hlr_mock_url=HLR_HSS_URL)
+_device_swap_detector = SwapDetector(identity_type="imei", hlr_mock_url=HLR_HSS_URL)
 
 VALIDATION_PARTITIONS = int(os.getenv("VALIDATION_PARTITIONS", "8"))
 
@@ -289,17 +291,17 @@ def _dedup_filter(records: List[Dict]) -> List[Dict]:
 
 # ── 2d. Conflict resolution (pandas, driver-side, BẮT BUỘC tuần tự) ────────
 
-def _resolve_conflicts(records: List[Dict]) -> Tuple[List[Dict], List[Dict], List[Dict]]:
+def _resolve_conflicts(records: List[Dict]) -> Tuple[List[Dict], List[Dict], List[Dict], List[Dict]]:
     """
-    Phân loại conflict A/B/C bằng pandas (đã collect() rồi, batch nhỏ).
+    Phân loại conflict A/B/C/D bằng pandas (đã collect() rồi, batch nhỏ).
 
     Conflict A: cùng session, imsi/msisdn thay đổi sau Start.
     Conflict B: cùng imsi có 2+ Start chưa Stop.
     Conflict C: cùng msisdn nhưng imsi thay đổi (SIM Swap signal).
-
+    Conflict D: cùng msisdn nhưng imei thay đổi (Device Swap signal).
     """
     if not records:
-        return [], [], []
+        return [], [], [], []
 
     df = pd.DataFrame(records)
 
@@ -326,8 +328,6 @@ def _resolve_conflicts(records: List[Dict]) -> Tuple[List[Dict], List[Dict], Lis
     )
 
     # ── Conflict B ──────────────────────────────────────────────────────────
-# ── Conflict B ──────────────────────────────────────────────────────────
- 
     def _flag_conflict_b(group: pd.DataFrame) -> pd.Series:
         open_sessions: set = set()
         flags = []
@@ -338,9 +338,9 @@ def _resolve_conflicts(records: List[Dict]) -> Tuple[List[Dict], List[Dict], Lis
             status, sess_id = row["acct_status_type"], row["acct_session_id"]
             if status == "Start":
                 if sess_id in open_sessions:
-                    flags.append(False)  
+                    flags.append(False)
                 elif len(open_sessions) > 0:
-                    flags.append(True) 
+                    flags.append(True)
                 else:
                     flags.append(False)
                     open_sessions.add(sess_id)
@@ -355,14 +355,13 @@ def _resolve_conflicts(records: List[Dict]) -> Tuple[List[Dict], List[Dict], Lis
         df["is_conflict_b"] = False
     else:
         df["is_conflict_b"] = (
-            df.groupby("msisdn" if False else "imsi", group_keys=False)  # group theo imsi (đúng README B)
+            df.groupby("imsi", group_keys=False)
               .apply(_flag_conflict_b)
               .reindex(df.index)
               .fillna(False)
         )
 
-    # ── Conflict C ──────────────────────────────────────────────────────────
- 
+    # ── Conflict C (SIM Swap — theo IMSI) ────────────────────────────────────
     legit_mask = (~df["is_conflict_a"]) & (~df["is_conflict_b"])
     df["prev_imsi"] = df[legit_mask].groupby("msisdn")["imsi"].shift(1)
     df["is_conflict_c"] = (
@@ -371,34 +370,38 @@ def _resolve_conflicts(records: List[Dict]) -> Tuple[List[Dict], List[Dict], Lis
         (df["imsi"] != df["prev_imsi"])
     )
 
-    # ── Tách 3 nhóm ───────────────────────────────────────────────────────────
-    is_conflicted_ab = df["is_conflict_a"] | df["is_conflict_b"]
+    # ── Conflict D (Device Swap — theo IMEI) ─────────────────────────────────
+    # CHỈ tính trên `df` — `clean` CHƯA TỒN TẠI ở đây, không được đụng vào.
+    df["prev_imei"] = df[legit_mask].groupby("msisdn")["imei"].shift(1)
+    df["is_conflict_d"] = (
+        legit_mask &
+        df["prev_imei"].notna() &
+        (df["imei"] != df["prev_imei"])
+    )
 
+    # ── Tách nhóm (clean được GÁN ở đây, mọi thứ dùng `clean` phải nằm SAU dòng này) ─
+    is_conflicted_ab = df["is_conflict_a"] | df["is_conflict_b"]
     clean = df[~is_conflicted_ab].copy()
 
-    # Conflict C nằm TRONG clean (giữ nguyên thiết kế) — lấy riêng ra để
-   
+    _DROP_COLS = [
+        "first_imsi", "first_msisdn", "is_conflict_a", "is_conflict_b",
+        "_imsi_start_rank", "prev_imsi", "is_conflict_c",
+        "prev_imei", "is_conflict_d", "event_timestamp_ts",
+    ]
+
     conflict_c_records: List[Dict] = []
     if "is_conflict_c" in clean.columns:
         c_only = clean[clean["is_conflict_c"] == True].copy()
         if not c_only.empty:
-            conflict_c_records = c_only.drop(
-                columns=[
-                    "first_imsi", "first_msisdn", "is_conflict_a",
-                    "is_conflict_b", "_imsi_start_rank", "prev_imsi",
-                    "is_conflict_c", "event_timestamp_ts",
-                ],
-                errors="ignore",
-            ).to_dict(orient="records")
+            conflict_c_records = c_only.drop(columns=_DROP_COLS, errors="ignore").to_dict(orient="records")
 
-    clean = clean.drop(
-        columns=[
-            "first_imsi", "first_msisdn", "is_conflict_a",
-            "is_conflict_b", "_imsi_start_rank", "prev_imsi", "is_conflict_c",
-            "event_timestamp_ts",
-        ],
-        errors="ignore",
-    )
+    conflict_d_records: List[Dict] = []
+    if "is_conflict_d" in clean.columns:
+        d_only = clean[clean["is_conflict_d"] == True].copy()
+        if not d_only.empty:
+            conflict_d_records = d_only.drop(columns=_DROP_COLS, errors="ignore").to_dict(orient="records")
+
+    clean = clean.drop(columns=_DROP_COLS, errors="ignore")
 
     conflicted_ab = df[is_conflicted_ab].copy()
     conflict_records: List[Dict] = []
@@ -414,15 +417,13 @@ def _resolve_conflicts(records: List[Dict]) -> Tuple[List[Dict], List[Dict], Lis
             ),
             axis=1,
         )
-        conflicted_ab["error_code"] = conflicted_ab["conflict_type"].apply(
-            lambda t: f"CONFLICT_{t}"
-        )
+        conflicted_ab["error_code"] = conflicted_ab["conflict_type"].apply(lambda t: f"CONFLICT_{t}")
         conflicted_ab = conflicted_ab.rename(columns={"acct_session_id": "session_id"})
         conflict_records = conflicted_ab[
             ["session_id", "conflict_type", "details", "error_code"]
         ].to_dict(orient="records")
 
-    return clean.to_dict(orient="records"), conflict_records, conflict_c_records
+    return clean.to_dict(orient="records"), conflict_records, conflict_c_records, conflict_d_records
 
 
 # ── 2e. PostgreSQL writers (invalid_log, conflict_log) ─────────────────────
@@ -500,42 +501,24 @@ def _write_conflict_log(rows: List[Dict]) -> None:
         conn.close()
 
 
-def _process_sim_swap_signals(conflict_c_rows: List[Dict]) -> None:
-    """
-    [GAP-4] Với mỗi record conflict C, gọi HLR/HSS xác nhận lịch sử IMSI
-    qua SwapDetector, ghi swap_event nếu được xác nhận.
+def _process_swap_signals(conflict_c_rows: List[Dict], conflict_d_rows: List[Dict]) -> None:
+    """Xác minh Conflict C + D — 2 request batch (không phải N request/record)."""
+    confirmed: List[Dict] = []
+    try:
+        confirmed += _sim_swap_detector.verify_batch(conflict_c_rows)
+    except Exception:
+        logger.exception("SIM Swap batch verify failed (%d rows)", len(conflict_c_rows))
+    try:
+        confirmed += _device_swap_detector.verify_batch(conflict_d_rows)
+    except Exception:
+        logger.exception("Device Swap batch verify failed (%d rows)", len(conflict_d_rows))
 
-    I/O đồng bộ (requests, không async) — chạy tuần tự, chấp nhận được
-    vì conflict C hiếm trong dataset (xem README: tổng conflict mặc định
-    1%, trong đó C chỉ là 1 phần của 3 loại A/B/C).
-    """
-    if not conflict_c_rows:
-        return
-
-    confirmed_events: List[Dict] = []
-    for row in conflict_c_rows:
-        try:
-            event = _swap_detector.verify_and_emit_swap(row)
-            if event:
-                confirmed_events.append(event)
-        except Exception:
-            logger.exception(
-                "SwapDetector failed for msisdn=%s imsi=%s",
-                row.get("msisdn"), row.get("imsi"),
-            )
-
-    if confirmed_events:
-        write_swap_events(confirmed_events, DB_DSN)
-        logger.info(
-            "Confirmed %d/%d SIM Swap events -> swap_event",
-            len(confirmed_events), len(conflict_c_rows),
-        )
-    else:
-        logger.info(
-            "0/%d conflict C records confirmed by HLR/HSS (false positive or "
-            "HLR unreachable)",
-            len(conflict_c_rows),
-        )
+    if confirmed:
+        write_swap_events(confirmed, DB_DSN)
+    logger.info(
+        "Swap verify: confirmed=%d (candidate C=%d, D=%d)",
+        len(confirmed), len(conflict_c_rows), len(conflict_d_rows),
+    )
 
 
 # ==============================================================================
@@ -618,7 +601,7 @@ def make_callback(spark: SparkSession):
             return
 
         # ── 6. Conflict resolution (TUẦN TỰ, driver-side — xem BN-6) ─────────
-        clean_rows, conflict_rows, conflict_c_rows = _resolve_conflicts(deduped_rows)
+        clean_rows, conflict_rows, conflict_c_rows, conflict_d_rows = _resolve_conflicts(deduped_rows)
 
         # ── 7. Ghi conflict_log (A/B) ─────────────────────────────────────────
         if conflict_rows:
@@ -628,13 +611,11 @@ def make_callback(spark: SparkSession):
                 logger.error("Batch %d | Failed to write conflict_log: %s", batch_id, e)
 
         # ── 8. Xác minh SIM Swap (C) qua HLR/HSS, ghi swap_event ──────────────
-        if conflict_c_rows:
+        if conflict_c_rows or conflict_d_rows:
             try:
-                _process_sim_swap_signals(conflict_c_rows)
+                _process_swap_signals(conflict_c_rows, conflict_d_rows)
             except Exception as e:
-                logger.error(
-                    "Batch %d | Failed to process SIM Swap signals: %s", batch_id, e
-                )
+                logger.error("Batch %d | Failed to process swap signals: %s", batch_id, e)
 
         if not clean_rows:
             return
@@ -652,9 +633,9 @@ def make_callback(spark: SparkSession):
         )
 
         logger.info(
-            "Batch %d | -> clean=%d conflict_ab=%d conflict_c=%d invalid=%d "
+            "Batch %d | -> clean=%d conflict_ab=%d conflict_c=%d conflict_d=%d invalid=%d "
             "late=%d (total %.0fms)",
-            batch_id, len(clean_rows), len(conflict_rows), len(conflict_c_rows),
+            batch_id, len(clean_rows), len(conflict_rows), len(conflict_c_rows), len(conflict_d_rows),
             len(invalid_rows), len(late_rows), (time.time() - t0) * 1000,
         )
 

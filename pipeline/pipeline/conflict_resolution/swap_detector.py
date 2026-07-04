@@ -1,22 +1,16 @@
 #!/usr/bin/env python3
 # pipeline/conflict_resolution/swap_detector.py
 """
-Module phụ trách xử lý hậu kỳ riêng cho Conflict loại C (SIM Swap signal).
-Chứa logic nghiệp vụ tương tác Network I/O: gọi HLR/HSS Mock để xác minh
-lịch sử IMSI, và ghi kết quả vào bảng swap_event (PostgreSQL).
+Xác minh Conflict C (SIM Swap, identity_type="imsi") và Conflict D
+(Device Swap, identity_type="imei") qua HLR/HSS Mock — dùng endpoint
+BATCH /subscribers/batch-history thay vì gọi từng record một.
 
-Được gọi từ pipeline/processing/processor.py::_process_sim_swap_signals(),
-với danh sách record đã được _resolve_conflicts() xác định là conflict C.
-
-Lịch sử sửa lỗi (xem docs/adr/ hoặc commit log):
-  [FIX-1] old_imsi trước đây lấy từ hlr_data.get("old_imsi") — field này
-          KHÔNG tồn tại trong response thực tế của HLR/HSS Mock API (xem
-          mock_services/hlr_hss/README.md: response chỉ có `history` array,
-          không có field `old_imsi` ở top-level). Sửa: tự suy old_imsi từ
-          phần tử ngay trước trong history đã sort theo assigned_at.
-  [FIX-2] verify_and_emit_swap() trước đây chỉ trả về dict, không có cơ
-          chế ghi DB nào gọi nó từ processor.py. Thêm hàm write_swap_events()
-          ở cuối file để ghi list kết quả vào bảng swap_event.
+Lịch sử sửa lỗi:
+  [FIX-1] old_imsi suy từ history array (mock không có field top-level).
+  [FIX-2] write_swap_events() ghi list kết quả vào swap_event.
+  [FIX-3] Chuyển sang batch API — trước đây N request tuần tự/mỗi-thread
+          riêng lẻ mỗi micro-batch (~160 req/batch) là nguyên nhân chính
+          Spark báo "Current batch is falling behind".
 """
 
 import logging
@@ -29,150 +23,106 @@ logger = logging.getLogger(__name__)
 
 
 class SwapDetector:
-    """
-    Xác minh tín hiệu SIM Swap (conflict C) bằng cách đối chiếu với
-    HLR/HSS Mock API — nguồn sự thật về lịch sử gán IMSI cho từng MSISDN.
-    """
-
     def __init__(
         self,
+        identity_type: str,                       # "imsi" (Conflict C) | "imei" (Conflict D)
         hlr_mock_url: str = "http://camara-mock-hlr-hss:8200",
-        db_connection=None,
-        timeout_seconds: float = 5.0,
+        timeout_seconds: float = 10.0,
+        batch_size: int = 500,                     # khớp max_length của BatchHistoryRequest
     ):
+        assert identity_type in ("imsi", "imei")
+        self.identity_type = identity_type
+        self.swap_type = "SIM_SWAP" if identity_type == "imsi" else "DEVICE_SWAP"
         self.hlr_url = hlr_mock_url
-        self.db = db_connection
         self.timeout_seconds = timeout_seconds
+        self.batch_size = batch_size
 
-    def verify_and_emit_swap(self, conflict_c_row: Dict) -> Optional[Dict]:
+    def verify_batch(self, conflict_rows: List[Dict]) -> List[Dict]:
         """
-        Xử lý 1 record nghi ngờ SIM Swap (conflict C từ pipeline).
-
-        Quy trình:
-            1. Gọi HLR/HSS Mock: GET /subscribers/{msisdn}/imsi-history
-            2. Sort history theo assigned_at, tìm vị trí của new_imsi
-            3. old_imsi = phần tử NGAY TRƯỚC new_imsi trong history đã sort
-               (không dùng field "old_imsi" không tồn tại trong response)
-            4. Nếu new_imsi không có trong history -> false positive, return None
-
-        Args:
-            conflict_c_row: dict chứa msisdn, imsi (= new_imsi), event_timestamp.
-                Có thể là dict thuần (từ pandas .to_dict()) hoặc pyspark.sql.Row
-                (cả 2 đều hỗ trợ __getitem__ theo key).
-
-        Returns:
-            dict: payload chuẩn hóa khớp schema bảng swap_event nếu HLR xác
-                nhận (msisdn, old_imsi, new_imsi, swap_type, detected_at,
-                confirmed_at, source).
-            None: nếu HLR/HSS không xác nhận, lỗi mạng, hoặc response không
-                hợp lệ — coi là false positive, không ghi swap_event.
+        Args: conflict_rows — mỗi phần tử có msisdn, event_timestamp, và
+            field identity tương ứng (imsi hoặc imei) = giá trị MỚI nghi ngờ.
+        Returns: list swap_event đã được HLR/HSS xác nhận thật.
         """
-        msisdn = conflict_c_row["msisdn"]
-        new_imsi = conflict_c_row["imsi"]
-        detected_at = conflict_c_row["event_timestamp"]
+        if not conflict_rows:
+            return []
 
-        try:
-            response = requests.get(
-                f"{self.hlr_url}/subscribers/{msisdn}/imsi-history",
-                timeout=self.timeout_seconds,
-            )
-            if response.status_code != 200:
-                logger.debug(
-                    "HLR/HSS trả status %d cho msisdn=%s -> bỏ qua",
-                    response.status_code, msisdn,
+        by_msisdn: Dict[str, List[Dict]] = {}
+        for row in conflict_rows:
+            by_msisdn.setdefault(row["msisdn"], []).append(row)
+
+        msisdns = list(by_msisdn.keys())
+        history_by_msisdn: Dict[str, Optional[Dict]] = {}
+
+        for i in range(0, len(msisdns), self.batch_size):
+            chunk = msisdns[i:i + self.batch_size]
+            try:
+                resp = requests.post(
+                    f"{self.hlr_url}/subscribers/batch-history",
+                    json={"msisdns": chunk, "identity_type": self.identity_type},
+                    timeout=self.timeout_seconds,
                 )
-                return None
-
-            hlr_data = response.json()
-            history = hlr_data.get("history", [])
-
-            if not history:
-                logger.debug("HLR/HSS không có history cho msisdn=%s", msisdn)
-                return None
-
-      
-            sorted_history = sorted(history, key=lambda x: x["assigned_at"])
-
-            matched_index = next(
-                (i for i, item in enumerate(sorted_history) if item["imsi"] == new_imsi),
-                None,
-            )
-
-            if matched_index is None:
-           
-                logger.debug(
-                    "new_imsi=%s không tìm thấy trong HLR history của msisdn=%s",
-                    new_imsi, msisdn,
+                resp.raise_for_status()
+                data = resp.json()
+            except requests.RequestException:
+                logger.warning(
+                    "HLR/HSS batch-history không phản hồi cho %d msisdn (identity=%s) — "
+                    "bỏ qua chunk.", len(chunk), self.identity_type,
                 )
-                return None
+                continue
+            except ValueError:
+                logger.exception("HLR/HSS batch-history trả JSON không hợp lệ")
+                continue
 
-            confirmed_at = sorted_history[matched_index]["assigned_at"]
+            for item in data.get("results", []):
+                history_by_msisdn[item["msisdn"]] = item.get("history") if item.get("found") else None
 
-       
-            if matched_index == 0:
-                logger.debug(
-                    "msisdn=%s: new_imsi=%s là lần gán đầu tiên, không phải SIM Swap",
-                    msisdn, new_imsi,
-                )
-                return None
+        confirmed_events: List[Dict] = []
+        id_key = self.identity_type
+        old_key, new_key = f"old_{id_key}", f"new_{id_key}"
+        source_tag = "RADIUS_CONFLICT_C" if id_key == "imsi" else "RADIUS_CONFLICT_D"
 
-            old_imsi = sorted_history[matched_index - 1]["imsi"]
+        for msisdn, rows in by_msisdn.items():
+            history_resp = history_by_msisdn.get(msisdn)
+            if not history_resp:
+                continue
+            entries = history_resp.get("history", [])
+            if len(entries) < 2:
+                continue  # chỉ 1 lần gán -> không phải swap
 
-        except requests.RequestException:
-            logger.warning(
-                "HLR/HSS Mock không phản hồi cho msisdn=%s (timeout/connection error)",
-                msisdn,
-            )
-            return None
-        except (KeyError, ValueError, TypeError):
-            logger.exception(
-                "HLR/HSS Mock trả response không đúng format cho msisdn=%s", msisdn
-            )
-            return None
+            new_value = entries[-1]["value"]       # ASCENDING, phần tử cuối = mới nhất
+            old_value = entries[-2]["value"]
+            confirmed_at = entries[-1]["assigned_at"]
 
-        swap_event = {
-            "msisdn": msisdn,
-            "old_imsi": old_imsi,
-            "new_imsi": new_imsi,
-            "swap_type": "SIM_SWAP",
-            "detected_at": str(detected_at),
-            "confirmed_at": str(confirmed_at),
-            "source": "RADIUS_CONFLICT_C",
-        }
+            for row in rows:
+                if row.get(id_key) != new_value:
+                    continue
+                confirmed_events.append({
+                    "msisdn": msisdn,
+                    old_key: old_value,
+                    new_key: new_value,
+                    "swap_type": self.swap_type,
+                    "detected_at": str(row["event_timestamp"]),
+                    "confirmed_at": str(confirmed_at),
+                    "source": source_tag,
+                })
 
-        return swap_event
+        return confirmed_events
 
 
 def write_swap_events(events: List[Dict], db_dsn: Dict) -> None:
-    """
-    
-
-    Args:
-        events: list dict, mỗi phần tử có shape của verify_and_emit_swap()
-            trả về (không None — caller phải filter None trước khi gọi).
-        db_dsn: dict connection params cho psycopg2.connect(**db_dsn).
-
-    Raises:
-        Exception: nếu INSERT thất bại — caller (processor.py) chịu trách
-            nhiệm catch và log, không để crash toàn bộ batch.
-    """
     if not events:
         return
 
     sql = """
         INSERT INTO swap_event
-            (msisdn, old_imsi, new_imsi, swap_type, detected_at, confirmed_at, source)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
+            (msisdn, old_imsi, new_imsi, old_imei, new_imei, swap_type, detected_at, confirmed_at, source)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
     data = [
         (
-            e["msisdn"],
-            e["old_imsi"],
-            e["new_imsi"],
-            e["swap_type"],
-            e["detected_at"],
-            e["confirmed_at"],
-            e["source"],
+            e["msisdn"], e.get("old_imsi"), e.get("new_imsi"),
+            e.get("old_imei"), e.get("new_imei"),
+            e["swap_type"], e["detected_at"], e["confirmed_at"], e["source"],
         )
         for e in events
     ]

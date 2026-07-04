@@ -4,9 +4,14 @@ from typing import List, Dict, Any
 from datetime import datetime, timedelta
 
 from shared.seed_config import SUBSCRIBER_POOL_SIZE
-from shared.subscriber_pool import base_subscriber, has_sim_swap, swap_new_imsi_subscriber
+from shared.subscriber_pool import (
+    base_subscriber, has_sim_swap, swap_new_imsi_subscriber,
+    has_device_swap, device_swap_new_imei_subscriber,
+)
+
 
 SWAP_ELIGIBLE_INDICES = [i for i in range(SUBSCRIBER_POOL_SIZE) if has_sim_swap(i)]
+DEVICE_SWAP_ELIGIBLE_INDICES = [i for i in range(SUBSCRIBER_POOL_SIZE) if has_device_swap(i)]
 class ErrorInjector:
     """
     Tiêm lỗi/kịch bản nghiệp vụ vào dữ liệu RADIUS đã sinh sạch.
@@ -24,6 +29,7 @@ class ErrorInjector:
         self.config = config
         self.rng = random.Random(config.seed)
         self._swap_cursor = 0
+        self._device_swap_cursor = 0
 
     def inject_duplicates(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Nhân bản bản ghi giữ nguyên Session ID và Timestamp theo tỷ lệ duplicate_rate"""
@@ -74,6 +80,7 @@ class ErrorInjector:
         CONFLICT_RATE_A = 0.02
         CONFLICT_RATE_B = 0.02
         CONFLICT_RATE_C = 0.02
+        CONFLICT_RATE_D = 0.02
 
         output: List[Dict[str, Any]] = []
         i, n = 0, len(records)
@@ -96,6 +103,8 @@ class ErrorInjector:
                 conflict_type = "B"
             elif r < CONFLICT_RATE_A + CONFLICT_RATE_B + CONFLICT_RATE_C:
                 conflict_type = "C"
+            elif r < CONFLICT_RATE_A + CONFLICT_RATE_B + CONFLICT_RATE_C + CONFLICT_RATE_D:
+                conflict_type = "D"
             else:
                 conflict_type = None
 
@@ -165,6 +174,44 @@ class ErrorInjector:
                     "msisdn": same_msisdn,
                     "imsi": new_imsi,
                     "_sub_idx": cur_idx,
+                })
+                if t_swap_start is not None:
+                    swap_start["event_timestamp"] = t_swap_start.isoformat() + "Z"
+                    swap_start["ingest_timestamp"] = (t_swap_start + timedelta(seconds=2)).isoformat() + "Z"
+                    swap_stop["event_timestamp"] = t_swap_stop.isoformat() + "Z"
+                    swap_stop["ingest_timestamp"] = (t_swap_stop + timedelta(seconds=2)).isoformat() + "Z"
+
+                output.append(swap_start)
+                output.append(swap_stop)
+
+            elif conflict_type == "D":
+                output.append(stop_rec)
+                cur_idx = DEVICE_SWAP_ELIGIBLE_INDICES[self._device_swap_cursor % len(DEVICE_SWAP_ELIGIBLE_INDICES)]
+                self._device_swap_cursor += 1
+
+                same_msisdn = start_rec.get("msisdn")
+                same_imsi = start_rec.get("imsi")
+                new_imei = device_swap_new_imei_subscriber(cur_idx, SUBSCRIBER_POOL_SIZE)
+                swap_session_id = f"SESS_D_{i:010d}"
+
+                try:
+                    t_stop = datetime.fromisoformat(stop_rec["event_timestamp"].replace("Z", ""))
+                    t_swap_start = t_stop + timedelta(minutes=10)
+                    t_swap_stop = t_swap_start + timedelta(seconds=60)
+                except (ValueError, TypeError):
+                    t_swap_start = t_swap_stop = None
+
+                swap_start = dict(start_rec)
+                swap_start.update({
+                    "acct_session_id": swap_session_id, "acct_status_type": "Start",
+                    "acct_session_time": "0", "msisdn": same_msisdn, "imsi": same_imsi,
+                    "imei": new_imei,   # đổi IMEI -> tín hiệu Device Swap
+                })
+                swap_stop = dict(stop_rec)
+                swap_stop.update({
+                    "acct_session_id": swap_session_id, "acct_status_type": "Stop",
+                    "acct_session_time": "60", "msisdn": same_msisdn, "imsi": same_imsi,
+                    "imei": new_imei,
                 })
                 if t_swap_start is not None:
                     swap_start["event_timestamp"] = t_swap_start.isoformat() + "Z"

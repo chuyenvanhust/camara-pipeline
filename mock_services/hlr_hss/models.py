@@ -61,3 +61,33 @@ class BatchLookupResponse(BaseModel):
     total: int
     found: int
     not_found: int
+
+class IdentityHistoryEntry(BaseModel):
+    value: str  # imsi hoặc imei tùy identity_type
+    assigned_at: datetime
+    unassigned_at: Optional[datetime] = None
+    is_current: bool
+    swap_reason: str = "initial_activation"
+
+class IdentityHistoryResponse(BaseModel):
+    msisdn: str
+    identity_type: Literal["imsi", "imei"]
+    history: List[IdentityHistoryEntry]
+    total: int
+    swap_count: int
+    latest_swap_at: Optional[datetime] = None
+
+class BatchHistoryRequest(BaseModel):
+    msisdns: List[str] = Field(..., max_length=1000)
+    identity_type: Literal["imsi", "imei"]
+
+class BatchHistoryItemResult(BaseModel):
+    msisdn: str
+    found: bool
+    history: Optional[IdentityHistoryResponse] = None
+
+class BatchHistoryResponse(BaseModel):
+    results: List[BatchHistoryItemResult]
+    total: int
+    found: int
+    not_found: int
