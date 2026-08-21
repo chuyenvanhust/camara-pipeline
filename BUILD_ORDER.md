@@ -1,11 +1,25 @@
-# Thứ tự Code & Bản đồ Phụ thuộc (Build Order & Dependency Map)
-## CAMARA Network API Data Pipeline — 7 Phase · 20 Modules
+﻿# Thá»© tá»± Code & Báº£n Ä‘á»“ Phá»¥ thuá»™c (Build Order & Dependency Map)
+## CAMARA Network API Data Pipeline â€” 7 Phase Â· 20 Modules
 
-Tài liệu này hướng dẫn chi tiết thứ tự phát triển (build order) và sơ đồ phụ thuộc giữa các module trong hệ thống **CAMARA Network API Data Pipeline**. Các module được thiết kế và sắp xếp theo lộ trình tối ưu hóa khả năng test độc lập, giảm thiểu phụ thuộc chéo và hỗ trợ phát triển song song hiệu quả.
+
+> **TÀI LIỆU LỖI THỜI — Phase 4 đã thay đổi hoàn toàn**
+>
+> Kiến trúc Spark Streaming 5-stage (S1 Ingestion → S2 Validation → S3 Deduplication
+> → S4 Conflict → S5 Storage) và toàn bộ Phase 2 (mock services) đã bị loại bỏ.
+> Pipeline hiện tại dùng **3 Kafka consumer modules** chạy song song:
+> cg-ip-msisdn, cg-device-swap, cg-sim-swap.
+>
+> - Kiến trúc mới: xem README.md section 0
+> - Lý do bỏ Spark: xem docs/adr/0001-drop-spark-use-kafka-consumer.md
+> - Tài liệu này được giữ lại để tham khảo lịch sử — Phase 1, 5, 6, 7 vẫn có giá trị,
+>   chỉ Phase 2 và 4 không còn đúng.
+
+
+TĂ i liá»‡u nĂ y hÆ°á»›ng dáº«n chi tiáº¿t thá»© tá»± phĂ¡t triá»ƒn (build order) vĂ  sÆ¡ Ä‘á»“ phá»¥ thuá»™c giá»¯a cĂ¡c module trong há»‡ thá»‘ng **CAMARA Network API Data Pipeline**. CĂ¡c module Ä‘Æ°á»£c thiáº¿t káº¿ vĂ  sáº¯p xáº¿p theo lá»™ trĂ¬nh tá»‘i Æ°u hĂ³a kháº£ nÄƒng test Ä‘á»™c láº­p, giáº£m thiá»ƒu phá»¥ thuá»™c chĂ©o vĂ  há»— trá»£ phĂ¡t triá»ƒn song song hiá»‡u quáº£.
 
 ---
 
-## 🗺️ Sơ đồ phụ thuộc tổng quan (Dependency Graph)
+## đŸ—ºï¸ SÆ¡ Ä‘á»“ phá»¥ thuá»™c tá»•ng quan (Dependency Graph)
 
 ```mermaid
 graph TD
@@ -105,121 +119,121 @@ graph TD
 
 ---
 
-## ⚡ Khả năng làm song song (Parallel Tracks)
+## â¡ Kháº£ nÄƒng lĂ m song song (Parallel Tracks)
 
 > [!TIP]
-> Để tăng tốc độ phát triển dự án, các phần sau có thể triển khai song song:
-> - **Các module trong Phase 1** chạy song song độc lập hoàn toàn.
-> - **Các mock services ở Phase 2** phát triển song song sau khi hoàn thành `mock_services/shared/` của Phase 1.
-> - **Storage models** (`pipeline/storage/models.py`) có thể viết song song với **SQL migrations** (`storage/migrations/`).
-> - **FastAPI Schema & Dependency** (`api/schemas/` và `api/dependencies/`) có thể viết song song trong khi đang code Phase 4.
-> - **Hạ tầng giám sát** (`infra/` Grafana, Prometheus) có thể cấu hình song song khi làm Phase 5.
+> Äá»ƒ tÄƒng tá»‘c Ä‘á»™ phĂ¡t triá»ƒn dá»± Ă¡n, cĂ¡c pháº§n sau cĂ³ thá»ƒ triá»ƒn khai song song:
+> - **CĂ¡c module trong Phase 1** cháº¡y song song Ä‘á»™c láº­p hoĂ n toĂ n.
+> - **CĂ¡c mock services á»Ÿ Phase 2** phĂ¡t triá»ƒn song song sau khi hoĂ n thĂ nh `mock_services/shared/` cá»§a Phase 1.
+> - **Storage models** (`pipeline/storage/models.py`) cĂ³ thá»ƒ viáº¿t song song vá»›i **SQL migrations** (`storage/migrations/`).
+> - **FastAPI Schema & Dependency** (`api/schemas/` vĂ  `api/dependencies/`) cĂ³ thá»ƒ viáº¿t song song trong khi Ä‘ang code Phase 4.
+> - **Háº¡ táº§ng giĂ¡m sĂ¡t** (`infra/` Grafana, Prometheus) cĂ³ thá»ƒ cáº¥u hĂ¬nh song song khi lĂ m Phase 5.
 
 ---
 
-## 📋 Chi tiết từng giai đoạn (Phase Details)
+## đŸ“‹ Chi tiáº¿t tá»«ng giai Ä‘oáº¡n (Phase Details)
 
-### Phase 1: Zero Dependency — Code & Test hoàn toàn độc lập
-*Giai đoạn nền tảng, chứa các utility thuần túy và cấu hình, không phụ thuộc vào database hay network.*
+### Phase 1: Zero Dependency â€” Code & Test hoĂ n toĂ n Ä‘á»™c láº­p
+*Giai Ä‘oáº¡n ná»n táº£ng, chá»©a cĂ¡c utility thuáº§n tĂºy vĂ  cáº¥u hĂ¬nh, khĂ´ng phá»¥ thuá»™c vĂ o database hay network.*
 
-| Module | Đường dẫn / Tên file | Lý do có thể code trước | Cách test | Output cho module sau |
+| Module | ÄÆ°á»ng dáº«n / TĂªn file | LĂ½ do cĂ³ thá»ƒ code trÆ°á»›c | CĂ¡ch test | Output cho module sau |
 |---|---|---|---|---|
-| **shared** | `mock_services/shared/`<br>↳ `health.py`, `pagination.py`, `errors.py` | Tiện ích dùng chung thuần (pure utility) — không import gì từ project. | `pytest unit`: test error format, test Page[T] generic, test fault-injection header parse. | Shared library sử dụng bởi 3 mock services ở Phase 2. |
-| **config_models** | `simulator/config.py` + `api/schemas/common.py`<br>↳ `SimulatorConfig`, `PhoneNumber`, `ErrorResponse` | Cấu hình dạng Dataclass và Pydantic model thuần — zero external dependencies. | `pytest unit`: validate PhoneNumber chuẩn E.164, validate SimulatorConfig bounds. | Type contracts dùng xuyên suốt project. |
-| **storage_migrations** | `storage/migrations/`<br>↳ `001_init_schema.sql`, `002_indexes.sql`, `003_partitions.sql` | SQL DDL thuần — viết và review offline, không cần service nào chạy. | Chạy trên PostgreSQL Docker đơn lẻ, kiểm tra `EXPLAIN ANALYZE` cho 3 query pattern chính. | Database Schema đã kiểm chứng — tất cả module sau đều build trên schema này. |
+| **shared** | `mock_services/shared/`<br>â†³ `health.py`, `pagination.py`, `errors.py` | Tiá»‡n Ă­ch dĂ¹ng chung thuáº§n (pure utility) â€” khĂ´ng import gĂ¬ tá»« project. | `pytest unit`: test error format, test Page[T] generic, test fault-injection header parse. | Shared library sá»­ dá»¥ng bá»Ÿi 3 mock services á»Ÿ Phase 2. |
+| **config_models** | `simulator/config.py` + `api/schemas/common.py`<br>â†³ `SimulatorConfig`, `PhoneNumber`, `ErrorResponse` | Cáº¥u hĂ¬nh dáº¡ng Dataclass vĂ  Pydantic model thuáº§n â€” zero external dependencies. | `pytest unit`: validate PhoneNumber chuáº©n E.164, validate SimulatorConfig bounds. | Type contracts dĂ¹ng xuyĂªn suá»‘t project. |
+| **storage_migrations** | `storage/migrations/`<br>â†³ `001_init_schema.sql`, `002_indexes.sql`, `003_partitions.sql` | SQL DDL thuáº§n â€” viáº¿t vĂ  review offline, khĂ´ng cáº§n service nĂ o cháº¡y. | Cháº¡y trĂªn PostgreSQL Docker Ä‘Æ¡n láº», kiá»ƒm tra `EXPLAIN ANALYZE` cho 3 query pattern chĂ­nh. | Database Schema Ä‘Ă£ kiá»ƒm chá»©ng â€” táº¥t cáº£ module sau Ä‘á»u build trĂªn schema nĂ y. |
 
 ---
 
-### Phase 2: Mock Services — Độc lập với pipeline, test với dữ liệu tĩnh
-*Mô phỏng các API bên ngoài của bên thứ ba, chạy độc lập và không phụ thuộc vào Kafka/Spark.*
+### Phase 2: Mock Services â€” Äá»™c láº­p vá»›i pipeline, test vá»›i dá»¯ liá»‡u tÄ©nh
+*MĂ´ phá»ng cĂ¡c API bĂªn ngoĂ i cá»§a bĂªn thá»© ba, cháº¡y Ä‘á»™c láº­p vĂ  khĂ´ng phá»¥ thuá»™c vĂ o Kafka/Spark.*
 
-| Module | Đường dẫn / Tên file | Phụ thuộc | Lý do có thể code | Cách test | Output cho module sau |
+| Module | ÄÆ°á»ng dáº«n / TĂªn file | Phá»¥ thuá»™c | LĂ½ do cĂ³ thá»ƒ code | CĂ¡ch test | Output cho module sau |
 |---|---|---|---|---|---|
-| **gsma_tac** | `mock_services/gsma_tac/`<br>↳ `models.py`, `seed.py`, `router.py`, `app.py` | `shared` | Chỉ cần shared utility + file CSV tĩnh. Không cần database hay Kafka. | `pytest`: GET `/tac/{tac}` found/not-found, POST `/batch`, pagination, fault-injection. | HTTP API `:8100` — Dùng bởi simulator (Phase 3) và pipeline/validation (Phase 4). |
-| **itu_e164** | `mock_services/itu_e164/`<br>↳ `models.py`, `seed.py`, `router.py`, `app.py` | `shared` | Chỉ cần shared + 2 CSV tĩnh (country codes, operator prefixes). Không lưu state. | `pytest`: POST `/validate` (valid/invalid/unknown CC, short number), POST `/validate/batch`. | HTTP API `:8300` — Dùng cho quy trình kiểm tra validation Rule R2 ở Phase 4. |
-| **hlr_hss** | `mock_services/hlr_hss/`<br>↳ `models.py`, `seed.py`, `router.py`, `app.py` | `shared` | Chỉ cần shared + `subscribers.csv`. Cần dùng `seed=42` để khớp bộ sinh dữ liệu. | `pytest`: by-imsi/by-msisdn found/404, imsi-history length, batch-lookup mixed. | HTTP API `:8200` — Dùng cho Rule R3 và luồng conflict_resolution (Phase 4+). |
+| **gsma_tac** | `mock_services/gsma_tac/`<br>â†³ `models.py`, `seed.py`, `router.py`, `app.py` | `shared` | Chá»‰ cáº§n shared utility + file CSV tÄ©nh. KhĂ´ng cáº§n database hay Kafka. | `pytest`: GET `/tac/{tac}` found/not-found, POST `/batch`, pagination, fault-injection. | HTTP API `:8100` â€” DĂ¹ng bá»Ÿi simulator (Phase 3) vĂ  pipeline/validation (Phase 4). |
+| **itu_e164** | `mock_services/itu_e164/`<br>â†³ `models.py`, `seed.py`, `router.py`, `app.py` | `shared` | Chá»‰ cáº§n shared + 2 CSV tÄ©nh (country codes, operator prefixes). KhĂ´ng lÆ°u state. | `pytest`: POST `/validate` (valid/invalid/unknown CC, short number), POST `/validate/batch`. | HTTP API `:8300` â€” DĂ¹ng cho quy trĂ¬nh kiá»ƒm tra validation Rule R2 á»Ÿ Phase 4. |
+| **hlr_hss** | `mock_services/hlr_hss/`<br>â†³ `models.py`, `seed.py`, `router.py`, `app.py` | `shared` | Chá»‰ cáº§n shared + `subscribers.csv`. Cáº§n dĂ¹ng `seed=42` Ä‘á»ƒ khá»›p bá»™ sinh dá»¯ liá»‡u. | `pytest`: by-imsi/by-msisdn found/404, imsi-history length, batch-lookup mixed. | HTTP API `:8200` â€” DĂ¹ng cho Rule R3 vĂ  luá»“ng conflict_resolution (Phase 4+). |
 
 > [!WARNING]
-> Kịch bản seed dữ liệu (`seed.py` của HLR/HSS) phải được chạy TRƯỚC KHI khởi động bộ sinh dữ liệu của simulator để đảm bảo chúng có chung tệp thuê bao (subscriber pool).
+> Ká»‹ch báº£n seed dá»¯ liá»‡u (`seed.py` cá»§a HLR/HSS) pháº£i Ä‘Æ°á»£c cháº¡y TRÆ¯á»C KHI khá»Ÿi Ä‘á»™ng bá»™ sinh dá»¯ liá»‡u cá»§a simulator Ä‘á»ƒ Ä‘áº£m báº£o chĂºng cĂ³ chung tá»‡p thuĂª bao (subscriber pool).
 
 ---
 
-### Phase 3: Simulator — Bộ giả lập sinh log
-*Tạo lập log thô mô phỏng các sự kiện mạng GGSN RADIUS.*
+### Phase 3: Simulator â€” Bá»™ giáº£ láº­p sinh log
+*Táº¡o láº­p log thĂ´ mĂ´ phá»ng cĂ¡c sá»± kiá»‡n máº¡ng GGSN RADIUS.*
 
-| Module | Đường dẫn / Tên file | Phụ thuộc | Lý do có thể code | Cách test | Output cho module sau |
+| Module | ÄÆ°á»ng dáº«n / TĂªn file | Phá»¥ thuá»™c | LĂ½ do cĂ³ thá»ƒ code | CĂ¡ch test | Output cho module sau |
 |---|---|---|---|---|---|
-| **simulator** | `simulator/`<br>↳ `generators.py`, `error_injectors.py`, `simulator.py` | `gsma_tac`, `config_models` | Cần gọi GET `/tac` của GSMA TAC Mock để tải danh sách mã TAC hợp lệ lúc khởi động. | **Integration test**: Chạy với `--records 10000 --seed 42`, kiểm tra file CSV đầu ra có đúng schema, tỷ lệ lỗi nằm trong khoảng ±1% so với config, mọi IMEI hợp lệ đều có TAC trong mock. | `data/radius_log.csv` — File log thô làm dữ liệu đầu vào cho pipeline xử lý. |
+| **simulator** | `simulator/`<br>â†³ `generators.py`, `error_injectors.py`, `simulator.py` | `gsma_tac`, `config_models` | Cáº§n gá»i GET `/tac` cá»§a GSMA TAC Mock Ä‘á»ƒ táº£i danh sĂ¡ch mĂ£ TAC há»£p lá»‡ lĂºc khá»Ÿi Ä‘á»™ng. | **Integration test**: Cháº¡y vá»›i `--records 10000 --seed 42`, kiá»ƒm tra file CSV Ä‘áº§u ra cĂ³ Ä‘Ăºng schema, tá»· lá»‡ lá»—i náº±m trong khoáº£ng Â±1% so vá»›i config, má»i IMEI há»£p lá»‡ Ä‘á»u cĂ³ TAC trong mock. | `data/radius_log.csv` â€” File log thĂ´ lĂ m dá»¯ liá»‡u Ä‘áº§u vĂ o cho pipeline xá»­ lĂ½. |
 
 > [!NOTE]
-> Module `error_injectors.py` có thể được code độc lập trước `generators.py` vì nó chỉ biến đổi bản ghi (record) đã được tạo sẵn để nhồi lỗi.
+> Module `error_injectors.py` cĂ³ thá»ƒ Ä‘Æ°á»£c code Ä‘á»™c láº­p trÆ°á»›c `generators.py` vĂ¬ nĂ³ chá»‰ biáº¿n Ä‘á»•i báº£n ghi (record) Ä‘Ă£ Ä‘Æ°á»£c táº¡o sáºµn Ä‘á»ƒ nhá»“i lá»—i.
 
 ---
 
-### Phase 4: Pipeline Core — Luồng xử lý dữ liệu Spark Streaming
-*Xây dựng và kiểm thử tuần tự từng stage của luồng xử lý chính.*
+### Phase 4: Pipeline Core â€” Luá»“ng xá»­ lĂ½ dá»¯ liá»‡u Spark Streaming
+*XĂ¢y dá»±ng vĂ  kiá»ƒm thá»­ tuáº§n tá»± tá»«ng stage cá»§a luá»“ng xá»­ lĂ½ chĂ­nh.*
 
-| Module | Đường dẫn / Tên file | Phụ thuộc | Lý do có thể code | Cách test | Output cho module sau |
+| Module | ÄÆ°á»ng dáº«n / TĂªn file | Phá»¥ thuá»™c | LĂ½ do cĂ³ thá»ƒ code | CĂ¡ch test | Output cho module sau |
 |---|---|---|---|---|---|
-| **s1_ingestion** | `pipeline/ingestion/`<br>↳ `csv_reader.py`, `producer.py` | `simulator` | Chỉ cần Kafka đang chạy + file CSV từ simulator. Không cần DB hay mock API. | **Integration**: Đẩy 1,000 records → consume từ topic `radius.raw` → kiểm tra số lượng và phân vùng (partition key). | Topic Kafka `radius.raw` được đẩy dữ liệu thô liên tục. |
-| **s2_validation** | `pipeline/validation/`<br>↳ `rules.py`, `validator.py` | `s1_ingestion`, `gsma_tac`, `hlr_hss`, `itu_e164`, `storage_migrations` | Chứa logic kiểm thử các luật nghiệp vụ (Rules). `rules.py` gọi 3 mock services, `validator.py` cần Kafka + Spark. | **Unit test `rules.py`**: Mock HTTP client bằng `httpx.MockTransport` để kiểm tra các rule độc lập mà không cần chạy mock API thật.<br>**Integration test `validator.py`**: Cần chạy Kafka + 3 mock APIs. | Dữ liệu chia luồng và lưu vào database: `radius.valid`, `radius.invalid`, `invalid_log`. |
-| **s3_dedup** | `pipeline/deduplication/`<br>↳ `state_manager.py`, `dedup_job.py` | `s2_validation` | Chỉ xử lý lọc trùng từ topic `radius.valid` qua Spark RocksDB State Store. Không gọi API ngoài. | **Integration**: Nhồi dữ liệu trùng hoàn toàn và trùng mấp mé (near-duplicate) vào `radius.valid` → kiểm tra chỉ 1 record đi tiếp vào `radius.dedup`, bảng `duplicate_log` ghi đúng số lượng. | Topic Kafka `radius.dedup` sạch dữ liệu trùng lặp. |
-| **s4_conflict** | `pipeline/conflict_resolution/`<br>↳ `resolver.py`, `swap_detector.py` | `s3_dedup`, `hlr_hss`, `storage_migrations` | Xác định các xung đột SIM/Device. `swap_detector.py` cần gọi HLR/HSS mock lấy lịch sử IMSI. | **Unit test `resolver.py`**: Tạo dữ liệu giả lập conflict A/B/C → xác nhận kết quả định tuyến.<br>**Integration**: Chạy kèm HLR/HSS mock + Kafka + Postgres. | Topic Kafka `radius.clean` + Bảng ghi nhận hoán đổi thiết bị `swap_event` + `conflict_log`. |
-| **s5_storage** | `pipeline/storage/`<br>↳ `models.py`, `writer.py` | `s4_conflict`, `storage_migrations` | Ghi dữ liệu sạch cuối cùng vào cơ sở dữ liệu PostgreSQL đã được chạy migration. | **Integration**: Consume từ `radius.clean` → kiểm tra bảng `radius_sessions`, phân vùng tháng chuẩn, check câu lệnh query có tối ưu. | Bảng dữ liệu `radius_sessions` sẵn sàng để API truy vấn. |
+| **s1_ingestion** | `pipeline/ingestion/`<br>â†³ `csv_reader.py`, `producer.py` | `simulator` | Chá»‰ cáº§n Kafka Ä‘ang cháº¡y + file CSV tá»« simulator. KhĂ´ng cáº§n DB hay mock API. | **Integration**: Äáº©y 1,000 records â†’ consume tá»« topic `radius.raw` â†’ kiá»ƒm tra sá»‘ lÆ°á»£ng vĂ  phĂ¢n vĂ¹ng (partition key). | Topic Kafka `radius.raw` Ä‘Æ°á»£c Ä‘áº©y dá»¯ liá»‡u thĂ´ liĂªn tá»¥c. |
+| **s2_validation** | `pipeline/validation/`<br>â†³ `rules.py`, `validator.py` | `s1_ingestion`, `gsma_tac`, `hlr_hss`, `itu_e164`, `storage_migrations` | Chá»©a logic kiá»ƒm thá»­ cĂ¡c luáº­t nghiá»‡p vá»¥ (Rules). `rules.py` gá»i 3 mock services, `validator.py` cáº§n Kafka + Spark. | **Unit test `rules.py`**: Mock HTTP client báº±ng `httpx.MockTransport` Ä‘á»ƒ kiá»ƒm tra cĂ¡c rule Ä‘á»™c láº­p mĂ  khĂ´ng cáº§n cháº¡y mock API tháº­t.<br>**Integration test `validator.py`**: Cáº§n cháº¡y Kafka + 3 mock APIs. | Dá»¯ liá»‡u chia luá»“ng vĂ  lÆ°u vĂ o database: `radius.valid`, `radius.invalid`, `invalid_log`. |
+| **s3_dedup** | `pipeline/deduplication/`<br>â†³ `state_manager.py`, `dedup_job.py` | `s2_validation` | Chá»‰ xá»­ lĂ½ lá»c trĂ¹ng tá»« topic `radius.valid` qua Spark RocksDB State Store. KhĂ´ng gá»i API ngoĂ i. | **Integration**: Nhá»“i dá»¯ liá»‡u trĂ¹ng hoĂ n toĂ n vĂ  trĂ¹ng máº¥p mĂ© (near-duplicate) vĂ o `radius.valid` â†’ kiá»ƒm tra chá»‰ 1 record Ä‘i tiáº¿p vĂ o `radius.dedup`, báº£ng `duplicate_log` ghi Ä‘Ăºng sá»‘ lÆ°á»£ng. | Topic Kafka `radius.dedup` sáº¡ch dá»¯ liá»‡u trĂ¹ng láº·p. |
+| **s4_conflict** | `pipeline/conflict_resolution/`<br>â†³ `resolver.py`, `swap_detector.py` | `s3_dedup`, `hlr_hss`, `storage_migrations` | XĂ¡c Ä‘á»‹nh cĂ¡c xung Ä‘á»™t SIM/Device. `swap_detector.py` cáº§n gá»i HLR/HSS mock láº¥y lá»‹ch sá»­ IMSI. | **Unit test `resolver.py`**: Táº¡o dá»¯ liá»‡u giáº£ láº­p conflict A/B/C â†’ xĂ¡c nháº­n káº¿t quáº£ Ä‘á»‹nh tuyáº¿n.<br>**Integration**: Cháº¡y kĂ¨m HLR/HSS mock + Kafka + Postgres. | Topic Kafka `radius.clean` + Báº£ng ghi nháº­n hoĂ¡n Ä‘á»•i thiáº¿t bá»‹ `swap_event` + `conflict_log`. |
+| **s5_storage** | `pipeline/storage/`<br>â†³ `models.py`, `writer.py` | `s4_conflict`, `storage_migrations` | Ghi dá»¯ liá»‡u sáº¡ch cuá»‘i cĂ¹ng vĂ o cÆ¡ sá»Ÿ dá»¯ liá»‡u PostgreSQL Ä‘Ă£ Ä‘Æ°á»£c cháº¡y migration. | **Integration**: Consume tá»« `radius.clean` â†’ kiá»ƒm tra báº£ng `radius_sessions`, phĂ¢n vĂ¹ng thĂ¡ng chuáº©n, check cĂ¢u lá»‡nh query cĂ³ tá»‘i Æ°u. | Báº£ng dá»¯ liá»‡u `radius_sessions` sáºµn sĂ ng Ä‘á»ƒ API truy váº¥n. |
 
 ---
 
-### Phase 5: API Layer — FastAPI phục vụ CAMARA API
-*Tầng phục vụ ứng dụng, cung cấp các endpoint SIM Swap, Device Swap và Number Verification.*
+### Phase 5: API Layer â€” FastAPI phá»¥c vá»¥ CAMARA API
+*Táº§ng phá»¥c vá»¥ á»©ng dá»¥ng, cung cáº¥p cĂ¡c endpoint SIM Swap, Device Swap vĂ  Number Verification.*
 
-| Module | Đường dẫn / Tên file | Phụ thuộc | Lý do có thể code | Cách test | Output cho module sau |
+| Module | ÄÆ°á»ng dáº«n / TĂªn file | Phá»¥ thuá»™c | LĂ½ do cĂ³ thá»ƒ code | CĂ¡ch test | Output cho module sau |
 |---|---|---|---|---|---|
-| **api_deps** | `api/dependencies/` & `api/schemas/`<br>↳ `auth.py`, `database.py`, `sim_swap.py`,... | `storage_migrations`, `config_models` | Thiết lập xác thực API key (auth) và pool kết nối database (`asyncpg`), định nghĩa Pydantic schemas. | **Unit test**: Kiểm tra tính hợp lệ của API Key, các định dạng đầu vào (phoneNumber E.164, maxAge range). | Dependencies và schemas sẵn sàng nhúng vào routers. |
-| **api_routers** | `api/routers/` + `api/main.py`<br>↳ `sim_swap.py`, `device_swap.py`, `health.py`,... | `s5_storage`, `api_deps` | Các router truy vấn dữ liệu trực tiếp từ PostgreSQL (bảng `radius_sessions` & `swap_event`). | **Integration test**: Tạo trước dữ liệu mẫu (mock data) trong Postgres test DB để chạy test suite độc lập mà không cần chờ pipeline chạy thực tế. | 3 endpoints CAMARA hoạt động tại cổng `:8000`. |
+| **api_deps** | `api/dependencies/` & `api/schemas/`<br>â†³ `auth.py`, `database.py`, `sim_swap.py`,... | `storage_migrations`, `config_models` | Thiáº¿t láº­p xĂ¡c thá»±c API key (auth) vĂ  pool káº¿t ná»‘i database (`asyncpg`), Ä‘á»‹nh nghÄ©a Pydantic schemas. | **Unit test**: Kiá»ƒm tra tĂ­nh há»£p lá»‡ cá»§a API Key, cĂ¡c Ä‘á»‹nh dáº¡ng Ä‘áº§u vĂ o (phoneNumber E.164, maxAge range). | Dependencies vĂ  schemas sáºµn sĂ ng nhĂºng vĂ o routers. |
+| **api_routers** | `api/routers/` + `api/main.py`<br>â†³ `sim_swap.py`, `device_swap.py`, `health.py`,... | `s5_storage`, `api_deps` | CĂ¡c router truy váº¥n dá»¯ liá»‡u trá»±c tiáº¿p tá»« PostgreSQL (báº£ng `radius_sessions` & `swap_event`). | **Integration test**: Táº¡o trÆ°á»›c dá»¯ liá»‡u máº«u (mock data) trong Postgres test DB Ä‘á»ƒ cháº¡y test suite Ä‘á»™c láº­p mĂ  khĂ´ng cáº§n chá» pipeline cháº¡y thá»±c táº¿. | 3 endpoints CAMARA hoáº¡t Ä‘á»™ng táº¡i cá»•ng `:8000`. |
 
 ---
 
-### Phase 6: Reporting & Observability — Báo cáo & Giám sát vận hành
-*Các công cụ hỗ trợ báo cáo chất lượng dữ liệu và giám sát hệ thống thời gian thực.*
+### Phase 6: Reporting & Observability â€” BĂ¡o cĂ¡o & GiĂ¡m sĂ¡t váº­n hĂ nh
+*CĂ¡c cĂ´ng cá»¥ há»— trá»£ bĂ¡o cĂ¡o cháº¥t lÆ°á»£ng dá»¯ liá»‡u vĂ  giĂ¡m sĂ¡t há»‡ thá»‘ng thá»i gian thá»±c.*
 
-| Module | Đường dẫn / Tên file | Phụ thuộc | Mô tả hoạt động | Cách test | Output / Kết quả |
+| Module | ÄÆ°á»ng dáº«n / TĂªn file | Phá»¥ thuá»™c | MĂ´ táº£ hoáº¡t Ä‘á»™ng | CĂ¡ch test | Output / Káº¿t quáº£ |
 |---|---|---|---|---|---|
-| **reporting** | `reporting/`<br>↳ `metrics_collector.py`, `quality_report.py`, Jinja2 template | `s5_storage` | Tổng hợp số liệu từ các bảng log (`invalid_log`, `duplicate_log`, `conflict_log`) để xuất báo cáo. | Tạo dữ liệu log giả lập trong Postgres → Chạy `quality_report.py` → Kiểm tra file báo cáo HTML. | Báo cáo HTML Data Quality Report hoàn chỉnh. |
-| **infra_monitoring** | `infra/` (Prometheus & Grafana)<br>↳ `prometheus.yml`, `pipeline_dashboard.json` | `api_routers`, `s5_storage` | Thu thập metrics hiệu năng từ FastAPI, Spark và PostgreSQL. | Kiểm tra trạng thái Prometheus targets, verify giao diện Grafana hiển thị đầy đủ biểu đồ. | Dashboard hiển thị lượng throughput/latency trực tiếp. |
+| **reporting** | `reporting/`<br>â†³ `metrics_collector.py`, `quality_report.py`, Jinja2 template | `s5_storage` | Tá»•ng há»£p sá»‘ liá»‡u tá»« cĂ¡c báº£ng log (`invalid_log`, `duplicate_log`, `conflict_log`) Ä‘á»ƒ xuáº¥t bĂ¡o cĂ¡o. | Táº¡o dá»¯ liá»‡u log giáº£ láº­p trong Postgres â†’ Cháº¡y `quality_report.py` â†’ Kiá»ƒm tra file bĂ¡o cĂ¡o HTML. | BĂ¡o cĂ¡o HTML Data Quality Report hoĂ n chá»‰nh. |
+| **infra_monitoring** | `infra/` (Prometheus & Grafana)<br>â†³ `prometheus.yml`, `pipeline_dashboard.json` | `api_routers`, `s5_storage` | Thu tháº­p metrics hiá»‡u nÄƒng tá»« FastAPI, Spark vĂ  PostgreSQL. | Kiá»ƒm tra tráº¡ng thĂ¡i Prometheus targets, verify giao diá»‡n Grafana hiá»ƒn thá»‹ Ä‘áº§y Ä‘á»§ biá»ƒu Ä‘á»“. | Dashboard hiá»ƒn thá»‹ lÆ°á»£ng throughput/latency trá»±c tiáº¿p. |
 
 ---
 
 ### Phase 7: End-to-End Integration & Load Test
-*Đánh giá toàn diện hệ thống dưới tải trọng cao và kiểm thử tích hợp đầu cuối.*
+*ÄĂ¡nh giĂ¡ toĂ n diá»‡n há»‡ thá»‘ng dÆ°á»›i táº£i trá»ng cao vĂ  kiá»ƒm thá»­ tĂ­ch há»£p Ä‘áº§u cuá»‘i.*
 
-| Module | Đường dẫn / Tên file | Phụ thuộc | Mô tả kịch bản | Kết quả mong đợi |
+| Module | ÄÆ°á»ng dáº«n / TĂªn file | Phá»¥ thuá»™c | MĂ´ táº£ ká»‹ch báº£n | Káº¿t quáº£ mong Ä‘á»£i |
 |---|---|---|---|---|
-| **e2e_tests** | `tests/pipeline/` (TC23–TC33)<br>↳ `test_deduplication.py`, `test_validation.py`,... | `s5_storage`, `gsma_tac`, `hlr_hss`, `itu_e164` | Chạy toàn bộ stack hệ thống, đẩy bản ghi vào Kafka raw, đợi Spark xử lý và assert dữ liệu cuối trong Postgres. | Kiểm chứng tính chính xác của toàn bộ luồng pipeline. |
-| **load_test** | `scripts/run_load_test.sh`<br>↳ Kịch bản k6 cho 3 endpoints | `api_routers`, `s5_storage` | Chạy thử nghiệm với 100 Virtual Users (VU) trong vòng 60s, kiểm tra hiệu năng khi PostgreSQL đã được nạp sẵn ~2M dòng dữ liệu. | Đảm bảo SLA: p95 SIM/Device Swap ≤ 200ms, Number Verification ≤ 100ms. |
+| **e2e_tests** | `tests/pipeline/` (TC23â€“TC33)<br>â†³ `test_deduplication.py`, `test_validation.py`,... | `s5_storage`, `gsma_tac`, `hlr_hss`, `itu_e164` | Cháº¡y toĂ n bá»™ stack há»‡ thá»‘ng, Ä‘áº©y báº£n ghi vĂ o Kafka raw, Ä‘á»£i Spark xá»­ lĂ½ vĂ  assert dá»¯ liá»‡u cuá»‘i trong Postgres. | Kiá»ƒm chá»©ng tĂ­nh chĂ­nh xĂ¡c cá»§a toĂ n bá»™ luá»“ng pipeline. |
+| **load_test** | `scripts/run_load_test.sh`<br>â†³ Ká»‹ch báº£n k6 cho 3 endpoints | `api_routers`, `s5_storage` | Cháº¡y thá»­ nghiá»‡m vá»›i 100 Virtual Users (VU) trong vĂ²ng 60s, kiá»ƒm tra hiá»‡u nÄƒng khi PostgreSQL Ä‘Ă£ Ä‘Æ°á»£c náº¡p sáºµn ~2M dĂ²ng dá»¯ liá»‡u. | Äáº£m báº£o SLA: p95 SIM/Device Swap â‰¤ 200ms, Number Verification â‰¤ 100ms. |
 
 ---
 
-## 📊 Tóm tắt khả năng Test độc lập (Mock / Dependency Table)
+## đŸ“ TĂ³m táº¯t kháº£ nÄƒng Test Ä‘á»™c láº­p (Mock / Dependency Table)
 
-Bảng dưới đây thống kê mức độ độc lập khi kiểm thử của từng module, giúp các kỹ sư phát triển có thể xác định cần chuẩn bị những thành phần hạ tầng (infrastructure) nào khi phát triển module đó:
+Báº£ng dÆ°á»›i Ä‘Ă¢y thá»‘ng kĂª má»©c Ä‘á»™ Ä‘á»™c láº­p khi kiá»ƒm thá»­ cá»§a tá»«ng module, giĂºp cĂ¡c ká»¹ sÆ° phĂ¡t triá»ƒn cĂ³ thá»ƒ xĂ¡c Ä‘á»‹nh cáº§n chuáº©n bá»‹ nhá»¯ng thĂ nh pháº§n háº¡ táº§ng (infrastructure) nĂ o khi phĂ¡t triá»ƒn module Ä‘Ă³:
 
-| Module | Mức độ kiểm thử độc lập | Thành phần hạ tầng cần thiết |
+| Module | Má»©c Ä‘á»™ kiá»ƒm thá»­ Ä‘á»™c láº­p | ThĂ nh pháº§n háº¡ táº§ng cáº§n thiáº¿t |
 |---|---|---|
-| **mock_services/shared/** | ✔ Hoàn toàn độc lập | Không cần |
-| **simulator/config.py + api/schemas/common.py** | ✔ Hoàn toàn độc lập | Không cần |
-| **storage/migrations/** | ✔ Gần như độc lập | Chỉ cần PostgreSQL (Docker đơn lẻ) |
-| **mock_services/gsma_tac/** | ✔ Độc lập | Không cần (dùng dữ liệu CSV) |
-| **mock_services/itu_e164/** | ✔ Độc lập | Không cần (dùng dữ liệu CSV) |
-| **mock_services/hlr_hss/** | ✔ Độc lập | Không cần (dùng dữ liệu CSV) |
-| **simulator/** | ⚠ Phụ thuộc Mock API | Cần chạy **GSMA TAC mock** (`:8100`) |
-| **pipeline/ingestion/** | ⚠ Phụ thuộc Kafka | Cần chạy **Kafka broker** và file CSV giả lập |
-| **pipeline/validation/ rules.py** | ✔ Unit test độc lập được | Sử dụng `httpx.MockTransport` (không cần Mock API thực) |
-| **pipeline/validation/ (tích hợp)** | ⚠ Cần tích hợp | Cần Kafka + 3 Mock APIs + PostgreSQL |
-| **pipeline/deduplication/** | ⚠ Cần Spark + Kafka | Cần Kafka + Spark Engine + PostgreSQL |
-| **pipeline/conflict_resolution/** | ⚠ Cần tích hợp | Cần Kafka + Spark + HLR/HSS mock + PostgreSQL |
-| **pipeline/storage/** | ⚠ Cần Storage | Cần Kafka + Spark + PostgreSQL |
-| **api/ (unit test: auth & schemas)** | ✔ Hoàn toàn độc lập | Không cần |
-| **api/ (integration test)** | ⚠ Cần Database | Chỉ cần PostgreSQL đã được nạp dữ liệu mẫu |
-| **reporting/** | ⚠ Cần Database | Chỉ cần PostgreSQL chứa dữ liệu log |
-| **tests/pipeline/ (E2E)** | ✗ Không độc lập | Phải chạy **toàn bộ stack hệ thống** |
-| **load test (k6)** | ✗ Không độc lập | Toàn bộ stack đang chạy + nạp sẵn ~2M dòng dữ liệu |
+| **mock_services/shared/** | âœ” HoĂ n toĂ n Ä‘á»™c láº­p | KhĂ´ng cáº§n |
+| **simulator/config.py + api/schemas/common.py** | âœ” HoĂ n toĂ n Ä‘á»™c láº­p | KhĂ´ng cáº§n |
+| **storage/migrations/** | âœ” Gáº§n nhÆ° Ä‘á»™c láº­p | Chá»‰ cáº§n PostgreSQL (Docker Ä‘Æ¡n láº») |
+| **mock_services/gsma_tac/** | âœ” Äá»™c láº­p | KhĂ´ng cáº§n (dĂ¹ng dá»¯ liá»‡u CSV) |
+| **mock_services/itu_e164/** | âœ” Äá»™c láº­p | KhĂ´ng cáº§n (dĂ¹ng dá»¯ liá»‡u CSV) |
+| **mock_services/hlr_hss/** | âœ” Äá»™c láº­p | KhĂ´ng cáº§n (dĂ¹ng dá»¯ liá»‡u CSV) |
+| **simulator/** | â  Phá»¥ thuá»™c Mock API | Cáº§n cháº¡y **GSMA TAC mock** (`:8100`) |
+| **pipeline/ingestion/** | â  Phá»¥ thuá»™c Kafka | Cáº§n cháº¡y **Kafka broker** vĂ  file CSV giáº£ láº­p |
+| **pipeline/validation/ rules.py** | âœ” Unit test Ä‘á»™c láº­p Ä‘Æ°á»£c | Sá»­ dá»¥ng `httpx.MockTransport` (khĂ´ng cáº§n Mock API thá»±c) |
+| **pipeline/validation/ (tĂ­ch há»£p)** | â  Cáº§n tĂ­ch há»£p | Cáº§n Kafka + 3 Mock APIs + PostgreSQL |
+| **pipeline/deduplication/** | â  Cáº§n Spark + Kafka | Cáº§n Kafka + Spark Engine + PostgreSQL |
+| **pipeline/conflict_resolution/** | â  Cáº§n tĂ­ch há»£p | Cáº§n Kafka + Spark + HLR/HSS mock + PostgreSQL |
+| **pipeline/storage/** | â  Cáº§n Storage | Cáº§n Kafka + Spark + PostgreSQL |
+| **api/ (unit test: auth & schemas)** | âœ” HoĂ n toĂ n Ä‘á»™c láº­p | KhĂ´ng cáº§n |
+| **api/ (integration test)** | â  Cáº§n Database | Chá»‰ cáº§n PostgreSQL Ä‘Ă£ Ä‘Æ°á»£c náº¡p dá»¯ liá»‡u máº«u |
+| **reporting/** | â  Cáº§n Database | Chá»‰ cáº§n PostgreSQL chá»©a dá»¯ liá»‡u log |
+| **tests/pipeline/ (E2E)** | âœ— KhĂ´ng Ä‘á»™c láº­p | Pháº£i cháº¡y **toĂ n bá»™ stack há»‡ thá»‘ng** |
+| **load test (k6)** | âœ— KhĂ´ng Ä‘á»™c láº­p | ToĂ n bá»™ stack Ä‘ang cháº¡y + náº¡p sáºµn ~2M dĂ²ng dá»¯ liá»‡u |

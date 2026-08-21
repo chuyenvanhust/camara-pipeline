@@ -1,5 +1,4 @@
-#docker-compose.yml
-version: '3.8'
+name: camara-pipeline
 
 networks:
   camara-network:
@@ -48,6 +47,9 @@ services:
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_HEAP_OPTS: "-Xmx768m -Xms768m"   # THÊM: bound JVM heap Kafka rõ ràng
     mem_limit: 1g
     healthcheck:
@@ -62,11 +64,13 @@ services:
     container_name: camara-postgres
     command: [
       "postgres",
-      "-c", "synchronous_commit=off",      # Tăng tốc ghi gấp 5 lần
-      "-c", "max_connections=200",         # Phục vụ ghi đa luồng từ Spark
+      "-c", "synchronous_commit=off",
+      "-c", "max_connections=200",
       "-c", "shared_buffers=512MB",
-      "-c", "max_wal_size=1GB",
-      "-c", "checkpoint_timeout=10min"
+      "-c", "work_mem=8MB",
+      "-c", "max_wal_size=2GB",
+      "-c", "wal_buffers=16MB",
+      "-c", "checkpoint_timeout=15min"
     ]
     mem_limit: 768m
     networks:
@@ -89,9 +93,11 @@ services:
   redis:
     image: redis:7-alpine
     container_name: camara-redis
-    # Global State Store cho Conflict C/D (SIM/Device Swap) — thay thế
-    # logic pandas .shift() chỉ so sánh trong 1 micro-batch (~2s). Xem
-    # pipeline/pipeline/state/redis_state_manager.py.
+    # Cache layer cho 3 consumer modules:
+    #   - cg-ip-msisdn: ip-ggsn:<framed_ip>, ggsn-ips:<nas_id>
+    #   - cg-device-swap: device:<msisdn>
+    #   - cg-sim-swap: sim:<msisdn>
+    # Xem pipeline/modules/{ip_msisdn,device_swap,sim_swap}/consumer.py
     command: ["redis-server", "--appendonly", "yes", "--maxmemory", "512mb", "--maxmemory-policy", "allkeys-lru"]
     networks:
       - camara-network
@@ -133,40 +139,34 @@ services:
       timeout: 5s
       retries: 5
 
-  spark-master:
+  pipeline:
     build:
       context: .
-      dockerfile: spark/Dockerfile
-    container_name: camara-spark-master
+      dockerfile: pipeline/Dockerfile
+    container_name: camara-pipeline
     depends_on:
       kafka:
         condition: service_healthy
       redis:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
     networks:
       - camara-network
-    image: camara-spark-custom:latest
-    volumes:
-      - .:/workspace
-    ports:
-      - "4040:4040"
-      - "7077:7077"
-      - "8080:8080" # Thêm cổng này để truy cập Master Web UI
     environment:
-      - SPARK_MODE=master
-      - SPARK_MASTER_HOST=camara-spark-master
-      - SPARK_DRIVER_MEMORY=4G       # SỬA: 4G -> 1536m (S2 dùng local mode, không cần quá lớn)
-      - SPARK_LOCAL_CORES=8             # THÊM: đồng bộ với VALIDATION_PARTITIONS
-      - VALIDATION_PARTITIONS=8         # THÊM: khớp SPARK_LOCAL_CORES, tránh dư thừa
-      - SPARK_S3_LOCAL_CORES=2          # THÊM
-      - SPARK_S3_DRIVER_MEMORY=512m     # THÊM
-      # Redis Global State Store — Conflict C/D (SIM/Device Swap) xuyên-batch
+      - KAFKA_BOOTSTRAP_SERVERS=camara-kafka:9092
+      - KAFKA_TOPIC_RAW=radius.accounting.raw
       - REDIS_HOST=camara-redis
       - REDIS_PORT=6379
-      - REDIS_DB=0
-      - REDIS_BATCH_SIZE=300            # kẹp cứng 200-500 trong RedisStateManager
-    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master", "--host", "0.0.0.0", "--port", "7077"]
-    mem_limit: 3g    
+      - DB_HOST=camara-postgres
+      - DB_PORT=5432
+      - DB_USER=postgres
+      - DB_PASSWORD=camara
+      - DB_NAME=camara_db
+    volumes:
+      - .:/workspace
+    command: ["python", "-m", "pipeline.run_pipeline"]
+
     
  
   prometheus:
