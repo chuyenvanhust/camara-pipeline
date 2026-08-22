@@ -14,13 +14,13 @@ REPORT_NAME_IN_CONTAINER="/workspace/${REPORT_NAME}"
 echo ">>> Đang sinh báo cáo chất lượng dữ liệu tại: $REPORT_NAME"
 
 # Chạy trong container (tránh lỗi thiếu psycopg2/thư viện trên host)
-docker exec camara-spark-master \
+docker exec camara-pipeline \
     python3 /workspace/reporting/quality_report.py \
     --output "$REPORT_NAME_IN_CONTAINER"
 
 # Copy từ container ra host nếu script không tự ghi vào mount
 if ! [ -f "$REPORT_NAME" ]; then
-    docker cp "camara-spark-master:${REPORT_NAME_IN_CONTAINER}" "$REPORT_NAME" 2>/dev/null
+    docker cp "camara-pipeline:${REPORT_NAME_IN_CONTAINER}" "$REPORT_NAME" 2>/dev/null
 fi
 
 echo ">>> Báo cáo đã hoàn tất tại: $REPORT_NAME"

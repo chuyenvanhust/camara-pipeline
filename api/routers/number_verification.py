@@ -69,20 +69,11 @@ router = APIRouter(
 _QUERY_ACTIVE_SESSION = """
     SELECT EXISTS (
         SELECT 1
-        FROM radius_sessions r1
-        WHERE r1.msisdn = $1
-          AND r1.acct_status_type = 'Start'
-          AND r1.event_timestamp >= NOW() - INTERVAL '24 hours'
-          AND NOT EXISTS (
-              SELECT 1
-              FROM radius_sessions r2
-              WHERE r2.msisdn = $1
-                AND r2.acct_session_id = r1.acct_session_id
-                AND r2.acct_status_type = 'Stop'
-                AND r2.event_timestamp >= r1.event_timestamp
-          )
+        FROM msisdn_sim
+        WHERE msisdn = $1
     ) AS has_active_session
 """
+
 
 
 @router.post(

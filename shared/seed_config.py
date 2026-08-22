@@ -13,5 +13,3 @@ SUBSCRIBER_POOL_SIZE: int = 100_000
 
 
 TAC_POOL_SIZE: int = 2_000
-
-GSMA_MOCK_URL: str = "http://localhost:8100"

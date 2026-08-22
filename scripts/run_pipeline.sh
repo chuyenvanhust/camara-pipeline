@@ -66,30 +66,15 @@ until docker exec camara-redis redis-cli ping 2>/dev/null | grep -q PONG; do
 done
 echo "[OK] Redis sẵn sàng"
 
-# 5. Đợi Spark Cluster sẵn sàng
-echo ">>> Đợi Spark Cluster sẵn sàng..."
-until nc -z localhost 7077 > /dev/null 2>&1; do
-    echo "    ... Đợi Spark Master (port 7077)..."
-    sleep 3
-done
-
-
-
-# 7. Khởi động mock services (S2 validation cần HTTP tới GSMA/HLR/ITU)
-echo ">>> Khởi động mock services..."
-docker compose -f mock_services/docker-compose.mock.yml up -d 2>/dev/null || true
-sleep 5
-
-# 8. Khởi động pipeline (truyền .env + unbuffered stdout)
-echo ">>> Khởi động pipeline trong spark-master container..."
+# 5. Khởi động pipeline
+echo ">>> Khởi động pipeline..."
 docker exec \
     --env-file "$ROOT_DIR/.env" \
     -e PYTHONUNBUFFERED=1 \
-    -e HOME=/opt/spark/work-dir \
-    -e SPARK_IVY_DIR=/tmp/ivy2 \
     -w /workspace \
-    camara-spark-master \
+    camara-pipeline \
     python3 -u -m pipeline.run_pipeline --input "$INPUT_FILE"
+
 
 EXIT_CODE=$?
 # 9. Kết thúc (Đã tách rời gen_report)

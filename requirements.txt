@@ -16,6 +16,6 @@ python-dotenv
 httpx
 sqlalchemy
 pydantic-settings
-#redis
-pyspark==3.5.1
+redis
+
 

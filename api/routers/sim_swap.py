@@ -56,15 +56,14 @@ router = APIRouter(
 # dieu kien confirmed_at IS NOT NULL de loai bo cac su kien swap CHUA
 # duoc HLR xac nhan.
 _QUERY_LATEST_SWAP = """
-    SELECT confirmed_at
-    FROM swap_event
+    SELECT changed_at AS confirmed_at
+    FROM sim_swap_history
     WHERE msisdn = $1
-      AND swap_type = 'SIM_SWAP'
-      AND confirmed_at IS NOT NULL
-      AND confirmed_at >= NOW() - ($2 * INTERVAL '1 day')
-    ORDER BY confirmed_at DESC
+      AND changed_at >= NOW() - ($2 * INTERVAL '1 day')
+    ORDER BY changed_at DESC
     LIMIT 1
 """
+
 
 
 @router.post(

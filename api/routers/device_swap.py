@@ -59,15 +59,14 @@ router = APIRouter(
 # [FIX] Doi detected_at -> confirmed_at, them confirmed_at IS NOT NULL,
 # dong bo voi sim_swap.py.
 _QUERY_LATEST_DEVICE_SWAP = """
-    SELECT confirmed_at
-    FROM swap_event
+    SELECT changed_at AS confirmed_at
+    FROM device_swap_history
     WHERE msisdn = $1
-      AND swap_type = 'DEVICE_SWAP'
-      AND confirmed_at IS NOT NULL
-      AND confirmed_at >= NOW() - ($2 * INTERVAL '1 day')
-    ORDER BY confirmed_at DESC
+      AND changed_at >= NOW() - ($2 * INTERVAL '1 day')
+    ORDER BY changed_at DESC
     LIMIT 1
 """
+
 
 
 @router.post(

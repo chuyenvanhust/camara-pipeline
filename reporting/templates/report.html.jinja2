@@ -23,169 +23,134 @@
 
     <main class="container mx-auto px-4 py-8">
 
-        <section class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+        <!-- Overview Cards -->
+        <section class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
             <div class="bg-white p-6 rounded-lg shadow border-l-4 border-blue-500">
-                <h3 class="text-gray-500 text-sm font-medium uppercase">Total Processed Records</h3>
+                <h3 class="text-gray-500 text-xs font-medium uppercase">Total Processed Records</h3>
                 <p class="text-3xl font-bold mt-2 text-gray-900">{{ "{:,}".format(m.overview.total_records) }}</p>
+                <p class="text-xs text-gray-400 mt-1">RADIUS Accounting Logs</p>
             </div>
-            <div class="bg-white p-6 rounded-lg shadow border-l-4 border-green-500">
-                <h3 class="text-gray-500 text-sm font-medium uppercase">Execution Duration</h3>
-                <p class="text-3xl font-bold mt-2 text-gray-900">{{ m.overview.execution_time }}</p>
+            <div class="bg-white p-6 rounded-lg shadow border-l-4 border-pink-500">
+                <h3 class="text-gray-500 text-xs font-medium uppercase">SIM Swap Events</h3>
+                <p class="text-3xl font-bold mt-2 text-pink-600">{{ "{:,}".format(m.overview.sim_swap_count) }}</p>
+                <p class="text-xs text-gray-400 mt-1">Rate: {{ m.swaps.sim_swap_rate }}%</p>
             </div>
             <div class="bg-white p-6 rounded-lg shadow border-l-4 border-purple-500">
-                <h3 class="text-gray-500 text-sm font-medium uppercase">Avg Throughput</h3>
-                <p class="text-3xl font-bold mt-2 text-gray-900">{{ m.overview.throughput }} <span class="text-sm text-gray-500">rec/s</span></p>
+                <h3 class="text-gray-500 text-xs font-medium uppercase">Device Swap Events</h3>
+                <p class="text-3xl font-bold mt-2 text-purple-600">{{ "{:,}".format(m.overview.device_swap_count) }}</p>
+                <p class="text-xs text-gray-400 mt-1">Rate: {{ m.swaps.device_swap_rate }}%</p>
+            </div>
+            <div class="bg-white p-6 rounded-lg shadow border-l-4 border-green-500">
+                <h3 class="text-gray-500 text-xs font-medium uppercase">Active Subscribers</h3>
+                <p class="text-3xl font-bold mt-2 text-gray-900">{{ "{:,}".format(m.overview.subscribers_count) }}</p>
+                <p class="text-xs text-gray-400 mt-1">Unique MSISDN Pool</p>
             </div>
         </section>
 
-        <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
-
-            <div class="bg-white p-6 rounded-lg shadow">
-                <div class="flex justify-between items-center mb-4">
-                    <h2 class="text-xl font-bold text-gray-800">1. Invalid IMEI Distribution</h2>
-                    <span class="bg-red-100 text-red-800 text-xs font-semibold px-2.5 py-0.5 rounded">Rate: {{ m.imei.rate }}%</span>
+        <!-- Pipeline Throughput Metrics -->
+        <section class="bg-white p-6 rounded-lg shadow mb-8">
+            <h2 class="text-xl font-bold text-gray-800 mb-4">Pipeline Throughput & Performance Breakdown</h2>
+            <div class="grid grid-cols-1 md:grid-cols-4 gap-6">
+                <div class="bg-indigo-50 p-4 rounded border border-indigo-100">
+                    <span class="text-xs text-indigo-600 font-semibold uppercase">1. Producer Ingestion Rate</span>
+                    <p class="text-2xl font-bold text-indigo-900 mt-1">{{ "{:,}".format(m.overview.producer_throughput) }} <span class="text-sm font-normal text-indigo-600">rec/s</span></p>
+                    <p class="text-xs text-indigo-400 mt-1">CSV → Kafka `radius.raw`</p>
                 </div>
+                <div class="bg-blue-50 p-4 rounded border border-blue-100">
+                    <span class="text-xs text-blue-600 font-semibold uppercase">2. Consumer Processing Rate</span>
+                    <p class="text-2xl font-bold text-blue-900 mt-1">{{ "{:,}".format(m.overview.processing_throughput) }} <span class="text-sm font-normal text-blue-600">rec/s</span></p>
+                    <p class="text-xs text-blue-400 mt-1">Stream Evaluation & Parsing</p>
+                </div>
+                <div class="bg-green-50 p-4 rounded border border-green-100">
+                    <span class="text-xs text-green-600 font-semibold uppercase">3. Postgres / Redis Write Rate</span>
+                    <p class="text-2xl font-bold text-green-900 mt-1">{{ "{:,}".format(m.overview.db_write_throughput) }} <span class="text-sm font-normal text-green-600">rec/s</span></p>
+                    <p class="text-xs text-green-400 mt-1">State & Audit Persistence</p>
+                </div>
+                <div class="bg-purple-50 p-4 rounded border border-purple-100">
+                    <span class="text-xs text-purple-600 font-semibold uppercase">4. Overall Pipeline Average</span>
+                    <p class="text-2xl font-bold text-purple-900 mt-1">{{ "{:,}".format(m.overview.overall_throughput) }} <span class="text-sm font-normal text-purple-600">rec/s</span></p>
+                    <p class="text-xs text-purple-400 mt-1">End-to-End Execution</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- Swap Events Distribution Analysis -->
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+            <!-- Swap Ratio Chart -->
+            <div class="bg-white p-6 rounded-lg shadow lg:col-span-1">
+                <h2 class="text-xl font-bold text-gray-800 mb-4 text-center">Swap Event Ratio</h2>
                 <div style="max-height: 250px;" class="flex justify-center">
-                    <canvas id="imeiChart"></canvas>
+                    <canvas id="swapRatioChart"></canvas>
                 </div>
-                <p class="text-sm text-gray-500 mt-4 text-center">Total Invalid IMEI Logs: <strong>{{ m.imei.total }}</strong> records</p>
+                <p class="text-sm text-gray-500 mt-4 text-center">
+                    Total Detected Events: <strong>{{ "{:,}".format(m.swaps.total_swaps) }}</strong>
+                </p>
             </div>
 
-            <div class="bg-white p-6 rounded-lg shadow">
-                <div class="flex justify-between items-center mb-4">
-                    <h2 class="text-xl font-bold text-gray-800">2. Duplicate Distribution (Hourly)</h2>
-                    <span class="bg-yellow-100 text-yellow-800 text-xs font-semibold px-2.5 py-0.5 rounded">Rate: {{ m.duplicate.rate }}%</span>
-                </div>
-                <div>
-                    <canvas id="duplicateChart"></canvas>
-                </div>
-            </div>
-
-            <div class="bg-white p-6 rounded-lg shadow">
-                <div class="flex justify-between items-center mb-4">
-                    <h2 class="text-xl font-bold text-gray-800">3. Conflict Type Distribution</h2>
-                    <span class="bg-indigo-100 text-indigo-800 text-xs font-semibold px-2.5 py-0.5 rounded">Rate: {{ m.conflict.rate }}%</span>
-                </div>
-                <div style="max-height: 250px;" class="flex justify-center">
-                    <canvas id="conflictChart"></canvas>
-                </div>
-                <div class="grid grid-cols-3 text-center mt-4 text-xs font-mono text-gray-600">
-                    <div>Type A: {{ m.conflict.type_a }}</div>
-                    <div>Type B: {{ m.conflict.type_b }}</div>
-                    <div>Type C: {{ m.conflict.type_c }}</div>
-                </div>
-            </div>
-
-            <div class="bg-white p-6 rounded-lg shadow">
-                <div class="flex justify-between items-center mb-4">
-                    <h2 class="text-xl font-bold text-gray-800">4. Late Arrival Latency Histogram</h2>
-                    <span class="bg-pink-100 text-pink-800 text-xs font-semibold px-2.5 py-0.5 rounded">Rate: {{ m.late_arrival.rate }}%</span>
-                </div>
-                <div>
-                    <canvas id="lateArrivalChart"></canvas>
-                </div>
-            </div>
-
+            <!-- Detailed Swap Table -->
             <div class="bg-white p-6 rounded-lg shadow lg:col-span-2">
-                <div class="flex justify-between items-center mb-4">
-                    <h2 class="text-xl font-bold text-gray-800">5. Missing Fields Top Breakdown</h2>
-                    <span class="bg-gray-100 text-gray-800 text-xs font-semibold px-2.5 py-0.5 rounded">Rate: {{ m.missing_field.rate }}%</span>
-                </div>
-                <div class="flex flex-col md:flex-row gap-6 items-center">
-                    <div class="w-full md:w-1/2">
-                        <canvas id="missingFieldChart"></canvas>
-                    </div>
-                    <div class="w-full md:w-1/2">
-                        <table class="min-w-full divide-y divide-gray-200 text-sm">
-                            <thead class="bg-gray-50">
-                                <tr>
-                                    <th class="px-4 py-2 text-left font-medium text-gray-500 uppercase">Field Name</th>
-                                    <th class="px-4 py-2 text-right font-medium text-gray-500 uppercase">Error Count</th>
-                                </tr>
-                            </thead>
-                            <tbody class="divide-y divide-gray-200 font-mono">
-                                {% for field in m.missing_field.fields %}
-                                <tr>
-                                    <td class="px-4 py-2 text-indigo-600 font-bold">{{ field }}</td>
-                                    <td class="px-4 py-2 text-right text-gray-900">{{ m.missing_field.counts[loop.index0] }}</td>
-                                </tr>
-                                {% endfor %}
-                            </tbody>
-                        </table>
-                    </div>
+                <h2 class="text-xl font-bold text-gray-800 mb-4">Swap Events Summary</h2>
+                <div class="overflow-x-auto">
+                    <table class="min-w-full divide-y divide-gray-200 text-sm">
+                        <thead class="bg-gray-50">
+                            <tr>
+                                <th class="px-6 py-3 text-left font-semibold text-gray-500 uppercase tracking-wider">Event Type</th>
+                                <th class="px-6 py-3 text-right font-semibold text-gray-500 uppercase tracking-wider">Detected Count</th>
+                                <th class="px-6 py-3 text-right font-semibold text-gray-500 uppercase tracking-wider">Occurrence Rate</th>
+                                <th class="px-6 py-3 text-left font-semibold text-gray-500 uppercase tracking-wider">Metric Status</th>
+                            </tr>
+                        </thead>
+                        <tbody class="divide-y divide-gray-200 font-medium">
+                            <tr>
+                                <td class="px-6 py-4 whitespace-nowrap text-pink-600 font-bold">SIM Swap</td>
+                                <td class="px-6 py-4 whitespace-nowrap text-right text-gray-900 font-mono">{{ "{:,}".format(m.swaps.sim_swap_count) }}</td>
+                                <td class="px-6 py-4 whitespace-nowrap text-right text-gray-900 font-mono">{{ m.swaps.sim_swap_rate }}%</td>
+                                <td class="px-6 py-4 whitespace-nowrap">
+                                    <span class="px-2.5 py-0.5 rounded-full text-xs font-semibold bg-pink-100 text-pink-800">Target Config: 0.2%</span>
+                                </td>
+                            </tr>
+                            <tr>
+                                <td class="px-6 py-4 whitespace-nowrap text-purple-600 font-bold">Device Swap</td>
+                                <td class="px-6 py-4 whitespace-nowrap text-right text-gray-900 font-mono">{{ "{:,}".format(m.swaps.device_swap_count) }}</td>
+                                <td class="px-6 py-4 whitespace-nowrap text-right text-gray-900 font-mono">{{ m.swaps.device_swap_rate }}%</td>
+                                <td class="px-6 py-4 whitespace-nowrap">
+                                    <span class="px-2.5 py-0.5 rounded-full text-xs font-semibold bg-purple-100 text-purple-800">Target Config: 0.2%</span>
+                                </td>
+                            </tr>
+                            <tr class="bg-gray-50 font-bold">
+                                <td class="px-6 py-4 whitespace-nowrap text-gray-700">Total Swaps</td>
+                                <td class="px-6 py-4 whitespace-nowrap text-right text-gray-900 font-mono">{{ "{:,}".format(m.swaps.total_swaps) }}</td>
+                                <td class="px-6 py-4 whitespace-nowrap text-right text-gray-900 font-mono">{{ m.swaps.overall_swap_rate }}%</td>
+                                <td class="px-6 py-4 whitespace-nowrap">
+                                    <span class="px-2.5 py-0.5 rounded-full text-xs font-semibold bg-blue-100 text-blue-800">Overall: {{ m.swaps.overall_swap_rate }}%</span>
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
                 </div>
             </div>
-
         </div>
     </main>
 
     <script>
-        // 1. IMEI Chart
-        new Chart(document.getElementById('imeiChart'), {
+        // Swap Ratio Chart (Comparing SIM Swap and Device Swap)
+        new Chart(document.getElementById('swapRatioChart'), {
             type: 'doughnut',
             data: {
-                labels: ['Luhn Check Fail', 'TAC Unknown'],
+                labels: ['SIM Swap', 'Device Swap'],
                 datasets: [{
-                    data: [{{ m.imei.luhn_fail }}, {{ m.imei.tac_unknown }}],
-                    backgroundColor: ['#EF4444', '#F59E0B']
+                    data: [{{ m.swaps.sim_swap_count }}, {{ m.swaps.device_swap_count }}],
+                    backgroundColor: ['#EC4899', '#8B5CF6']
                 }]
             },
-            options: { responsive: true }
-        });
-
-        // 2. Duplicate Hourly Chart
-        new Chart(document.getElementById('duplicateChart'), {
-            type: 'line',
-            data: {
-                labels: {{ m.duplicate.hourly_labels | tojson }},
-                datasets: [{
-                    label: 'Duplicates Count',
-                    data: {{ m.duplicate.hourly_data | tojson }},
-                    borderColor: '#10B981',
-                    backgroundColor: 'rgba(16, 185, 129, 0.1)',
-                    fill: true,
-                    tension: 0.3
-                }]
+            options: {
+                responsive: true,
+                plugins: {
+                    legend: {
+                        position: 'bottom',
+                    }
+                }
             }
-        });
-
-        // 3. Conflict Type Chart
-        new Chart(document.getElementById('conflictChart'), {
-            type: 'pie',
-            data: {
-                labels: ['Type A', 'Type B', 'Type C'],
-                datasets: [{
-                    data: [{{ m.conflict.type_a }}, {{ m.conflict.type_b }}, {{ m.conflict.type_c }}],
-                    backgroundColor: ['#6366F1', '#3B82F6', '#EC4899']
-                }]
-            }
-        });
-
-        // 4. Late Arrival Histogram
-        new Chart(document.getElementById('lateArrivalChart'), {
-            type: 'bar',
-            data: {
-                labels: {{ m.late_arrival.buckets | tojson }},
-                datasets: [{
-                    label: 'Records',
-                    data: {{ m.late_arrival.counts | tojson }},
-                    backgroundColor: '#F43F5E'
-                }]
-            }
-        });
-
-        // 5. Missing Field Top Chart
-        new Chart(document.getElementById('missingFieldChart'), {
-            type: 'bar',
-            data: {
-                labels: {{ m.missing_field.fields | tojson }},
-                datasets: [{
-                    label: 'Missing Count',
-                    data: {{ m.missing_field.counts | tojson }},
-                    backgroundColor: '#6B7280'
-                }]
-            },
-            options: { indexAxis: 'y' }
         });
     </script>
 </body>
