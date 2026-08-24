@@ -37,12 +37,13 @@ services:
     networks:
       - camara-network
     ports:
+      # WARNING (F-12): Trong production, hạn chế hoặc xoá port expose ra host.
+      # Giữ lại cho dev/lab. Production nên dùng SSH tunnel/bastion.
       - "9092:9092"
-      - "29092:29092" # Thêm cổng này
+      - "29092:29092"
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: camara-zookeeper:2181
-      # Sửa lại phần này:
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://camara-kafka:9092,PLAINTEXT_HOST://localhost:29092
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
@@ -50,7 +51,7 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      KAFKA_HEAP_OPTS: "-Xmx768m -Xms768m"   # THÊM: bound JVM heap Kafka rõ ràng
+      KAFKA_HEAP_OPTS: "-Xmx768m -Xms768m"
     mem_limit: 1g
     healthcheck:
       test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list || exit 1"]
@@ -62,11 +63,12 @@ services:
   postgres:
     image: postgres:15-alpine
     container_name: camara-postgres
+    # F-09: Giảm shared_buffers và max_connections cho phù hợp mem_limit 768m
     command: [
       "postgres",
       "-c", "synchronous_commit=off",
-      "-c", "max_connections=200",
-      "-c", "shared_buffers=512MB",
+      "-c", "max_connections=100",
+      "-c", "shared_buffers=256MB",
       "-c", "work_mem=8MB",
       "-c", "max_wal_size=2GB",
       "-c", "wal_buffers=16MB",
@@ -76,6 +78,8 @@ services:
     networks:
       - camara-network
     ports:
+      # WARNING (F-12): Trong production, xoá mục ports này.
+      # Service khác trong cùng network vẫn kết nối qua container_name:5432.
       - "5432:5432"
     environment:
       POSTGRES_USER: postgres
@@ -90,18 +94,17 @@ services:
       timeout: 5s
       retries: 5
 
+  # F-07: Redis — đổi maxmemory-policy sang noeviction
+  # Khi đầy, ghi mới sẽ lỗi rõ ràng (OOM command not allowed)
+  # thay vì âm thầm evict state quan trọng (sim:*, device:*, ip-ggsn:*)
   redis:
     image: redis:7-alpine
     container_name: camara-redis
-    # Cache layer cho 3 consumer modules:
-    #   - cg-ip-msisdn: ip-ggsn:<framed_ip>, ggsn-ips:<nas_id>
-    #   - cg-device-swap: device:<msisdn>
-    #   - cg-sim-swap: sim:<msisdn>
-    # Xem pipeline/modules/{ip_msisdn,device_swap,sim_swap}/consumer.py
-    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "512mb", "--maxmemory-policy", "allkeys-lru"]
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "512mb", "--maxmemory-policy", "noeviction"]
     networks:
       - camara-network
     ports:
+      # WARNING (F-12): Trong production, xoá mục ports này.
       - "6379:6379"
     volumes:
       - redis_data:/data
@@ -133,8 +136,10 @@ services:
       - DB_USER=postgres
       - DB_PASSWORD=camara
       - DB_NAME=camara_db
+      - ENVIRONMENT=${ENVIRONMENT:-dev}
+      - API_KEY=${API_KEY:-dev-secret}
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health/live || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -165,10 +170,31 @@ services:
       - DB_NAME=camara_db
     volumes:
       - .:/workspace
-    command: ["python", "-m", "pipeline.run_pipeline"]
+    command: ["sleep", "infinity"]
 
-    
- 
+  # F-03: Notification Dispatcher — outbox pattern, chạy như service riêng
+  notification-dispatcher:
+    build:
+      context: .
+      dockerfile: pipeline/Dockerfile
+    container_name: camara-notification-dispatcher
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - camara-network
+    environment:
+      - DB_HOST=camara-postgres
+      - DB_PORT=5432
+      - DB_USER=postgres
+      - DB_PASSWORD=camara
+      - DB_NAME=camara_db
+      - DISPATCHER_BATCH_SIZE=50
+      - DISPATCHER_POLL_INTERVAL=2.0
+      - DISPATCHER_MAX_ATTEMPTS=5
+    command: ["python", "-m", "pipeline.dispatcher.notification_dispatcher"]
+    mem_limit: 256m
+
   prometheus:
     image: prom/prometheus:v2.45.0
     container_name: camara-prometheus
@@ -181,6 +207,7 @@ services:
     volumes:
       - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
     mem_limit: 256m
+
   grafana:
     image: grafana/grafana:10.0.0
     container_name: camara-grafana
@@ -191,9 +218,10 @@ services:
     ports:
       - "3000:3000"
     environment:
-      - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-      - GF_AUTH_ANONYMOUS_ENABLED=true
+      # F-12: Không hardcode credentials — bắt buộc set qua .env
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_AUTH_ANONYMOUS_ENABLED=false
     volumes:
       - grafana_data:/var/lib/grafana
       - ./infra/grafana/dashboards:/var/lib/grafana/dashboards

@@ -33,6 +33,7 @@ if PROJECT_ROOT not in sys.path:
 from pipeline.modules.ip_msisdn.consumer import IPMsisdnConsumer
 from pipeline.modules.device_swap.consumer import DeviceSwapConsumer
 from pipeline.modules.sim_swap.consumer import SimSwapConsumer
+from pipeline.modules.shared.db import DatabasePool
 from pipeline.ingestion.producer import RadiusLogProducer
 
 
@@ -101,16 +102,36 @@ async def run_pipeline_async(input_file: str = None, duration: int = None):
     _log(f"Topic        : {raw_topic}")
     _log("==================================================")
 
+    # F-08: Start Prometheus metrics HTTP server
+    try:
+        from prometheus_client import start_http_server
+        metrics_port = int(os.getenv("METRICS_PORT", "9200"))
+        start_http_server(metrics_port)
+        _log(f">>> Prometheus metrics server started on :{metrics_port}/metrics")
+    except ImportError:
+        _log(">>> prometheus_client not installed — metrics endpoint disabled")
+    except Exception as exc:
+        _log(f">>> Warning: Could not start metrics server: {exc}")
+
     await ensure_kafka_topics(bootstrap_servers, [raw_topic], num_partitions=4)
 
-    ip_consumer = IPMsisdnConsumer(topic=raw_topic, group_id="cg-ip-msisdn")
-    device_consumer = DeviceSwapConsumer(topic=raw_topic, group_id="cg-device-swap")
-    sim_consumer = SimSwapConsumer(topic=raw_topic, group_id="cg-sim-swap")
+    # F-09: Create shared DB pool — 1 pool for all 3 consumers instead of 3 separate pools
+    shared_db = DatabasePool()
+    await shared_db.connect()
+    _log(">>> Shared database pool initialized")
+
+    ip_consumer = IPMsisdnConsumer(topic=raw_topic, group_id="cg-ip-msisdn", db=shared_db)
+    device_consumer = DeviceSwapConsumer(topic=raw_topic, group_id="cg-device-swap", db=shared_db)
+    sim_consumer = SimSwapConsumer(topic=raw_topic, group_id="cg-sim-swap", db=shared_db)
+
+    consumers = [ip_consumer, device_consumer, sim_consumer]
 
     _log(">>> Starting 3 parallel processing modules...")
-    c1_task = asyncio.create_task(ip_consumer.run())
-    c2_task = asyncio.create_task(device_consumer.run())
-    c3_task = asyncio.create_task(sim_consumer.run())
+    # F-06: Named tasks for better error reporting
+    tasks = {
+        asyncio.create_task(c.run(), name=c.group_id): c
+        for c in consumers
+    }
 
     # Chờ consumer khởi động
     await asyncio.sleep(2)
@@ -128,6 +149,35 @@ async def run_pipeline_async(input_file: str = None, duration: int = None):
     _log("   1. cg-ip-msisdn  -> IP-MSISDN Redis Table")
     _log("   2. cg-device-swap -> Device Swap History & Callbacks")
     _log("   3. cg-sim-swap    -> SIM Swap History & Callbacks\n")
+
+    # F-06: Centralized signal handling — only orchestrator catches signals
+    shutdown_event = asyncio.Event()
+
+    def _handle_signal():
+        _log(">>> Nhận tín hiệu dừng, bắt đầu graceful shutdown...")
+        shutdown_event.set()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _handle_signal)
+        except NotImplementedError:
+            # Signal handlers not implemented on Windows for some loops
+            pass
+
+    # F-06: Supervisor — fail-fast if any task dies unexpectedly
+    async def supervise():
+        """Nếu 1 task chết ngoài ý muốn, dừng toàn bộ ngay."""
+        done, pending = await asyncio.wait(
+            [asyncio.create_task(shutdown_event.wait()), *tasks.keys()],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for t in done:
+            if t in tasks and t.exception() is not None:
+                _log(f">>> Consumer '{t.get_name()}' chết ngoài ý muốn: {t.exception()}")
+                shutdown_event.set()
+
+    supervisor_task = asyncio.create_task(supervise())
 
     # Initialize tracking variables for throughput calculation
     last_ip = 0
@@ -165,28 +215,44 @@ async def run_pipeline_async(input_file: str = None, duration: int = None):
         elapsed = 0
         interval = 5
         try:
-            while elapsed < duration:
+            while elapsed < duration and not shutdown_event.is_set():
                 sleep_time = min(interval, duration - elapsed)
                 await asyncio.sleep(sleep_time)
                 elapsed += sleep_time
                 await log_heartbeat()
         except asyncio.CancelledError:
             pass
-        _log(">>> Time limit reached. Stopping consumers...")
-        ip_consumer.running = False
-        device_consumer.running = False
-        sim_consumer.running = False
+        if not shutdown_event.is_set():
+            _log(">>> Time limit reached. Stopping consumers...")
     else:
-        # Loop until interrupted
+        # Loop until interrupted or shutdown_event set
         try:
-            while True:
+            while not shutdown_event.is_set():
                 await asyncio.sleep(5)
                 await log_heartbeat()
         except asyncio.CancelledError:
             pass
 
-    await asyncio.gather(c1_task, c2_task, c3_task, return_exceptions=True)
-    _log(">>> All pipeline modules stopped successfully.")
+    # Graceful shutdown
+    for c in consumers:
+        c.running = False
+
+    results = await asyncio.gather(*tasks.keys(), return_exceptions=True)
+    supervisor_task.cancel()
+
+    # F-09: Close shared DB pool after all consumers stopped
+    await shared_db.close()
+    _log(">>> Shared database pool closed")
+
+    # F-06: Exit code reflects actual errors
+    failures = [r for r in results if isinstance(r, Exception)]
+    if failures:
+        _log(f">>> Pipeline dừng với {len(failures)} lỗi.")
+        for f in failures:
+            _log(f"    - {f}")
+        sys.exit(1)
+    else:
+        _log(">>> All pipeline modules stopped successfully.")
 
 
 def main():

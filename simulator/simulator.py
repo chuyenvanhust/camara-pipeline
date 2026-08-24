@@ -56,14 +56,22 @@ class RadiusSimulator:
                 r_sim = self.generator.rng.random()
                 if r_sim < self.config.sim_swap_rate:
                     new_imsi = swap_new_imsi_subscriber(sub_idx, self.config.subscribers)["imsi"]
+                    # new_imsi là giá trị CỐ ĐỊNH theo sub_idx (không đổi giữa các lần
+                    # swap của cùng subscriber) -- nếu subscriber đã swap trước đó,
+                    # lần roll thành công thứ 2 trở đi sẽ ra đúng giá trị đang active,
+                    # tức KHÔNG có thay đổi thực trong dữ liệu. Chỉ đếm khi giá trị
+                    # thực sự khác, để ground-truth khớp với số lần detection có thể
+                    # phát hiện được từ so sánh imsi_old != imsi_new.
+                    if new_imsi != active_imsi[sub_idx]:
+                        sim_swaps_count += 1
                     active_imsi[sub_idx] = new_imsi
-                    sim_swaps_count += 1
 
                 r_dev = self.generator.rng.random()
                 if r_dev < self.config.device_swap_rate:
                     new_imei = device_swap_new_imei_subscriber(sub_idx, self.config.subscribers)
+                    if new_imei != active_imei[sub_idx]:
+                        device_swaps_count += 1
                     active_imei[sub_idx] = new_imei
-                    device_swaps_count += 1
 
             sessions_count[sub_idx] = sub_sessions + 1
 

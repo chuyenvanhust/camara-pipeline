@@ -1,38 +1,21 @@
 # infra/prometheus/prometheus.yml
+# F-08: Chỉ giữ target thật tồn tại trong docker-compose.yml hiện tại.
+# Đã xoá: spark-pipeline, postgres-exporter, gsma-tac-mock, hlr-hss-mock, itu-e164-mock
+# — không container nào phục vụ các target này.
+
 global:
-  scrape_interval:     15s # Tần suất cào metrics mặc định
-  evaluation_interval: 15s # Tần suất đánh giá các rule alert
+  scrape_interval:     15s
+  evaluation_interval: 15s
 
 scrape_configs:
-  # 1. Target FastAPI (Ứng dụng chính của Phase 5)
+  # 1. FastAPI — CAMARA Network API
   - job_name: 'fastapi-app'
     metrics_path: '/metrics'
     static_configs:
       - targets: ['fastapi:8000']
 
-  # 2. Target Spark Structured Streaming (Phase 4)
-  - job_name: 'spark-pipeline'
-    metrics_path: '/metrics/prometheus'
-    static_configs:
-      - targets: ['spark-master:4040']
-
-  # 3. Target PostgreSQL Exporter (Giám sát DB logs)
-  - job_name: 'postgres-db'
-    static_configs:
-      - targets: ['postgres-exporter:9187']
-
-  # 4. Target Các Core Mock API Services 
-  - job_name: 'gsma-tac-mock'
+  # 2. Pipeline consumers — Prometheus metrics server (F-08)
+  - job_name: 'pipeline'
     metrics_path: '/metrics'
     static_configs:
-      - targets: ['gsma-tac-mock:8100']
-
-  - job_name: 'hlr-hss-mock'
-    metrics_path: '/metrics'
-    static_configs:
-      - targets: ['hlr-hss-mock:8200']
-
-  - job_name: 'itu-e164-mock'
-    metrics_path: '/metrics'
-    static_configs:
-      - targets: ['itu-e164-mock:8300']
+      - targets: ['pipeline:9200']

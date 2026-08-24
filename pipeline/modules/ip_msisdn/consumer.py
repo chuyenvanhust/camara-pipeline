@@ -2,9 +2,10 @@
 import json
 import logging
 import os
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 from pipeline.modules.shared.base_consumer import BaseKafkaConsumer
+from pipeline.modules.shared.db import DatabasePool
 from pipeline.modules.ip_msisdn.redis_store import IPMappingStore
 
 logger = logging.getLogger(__name__)
@@ -17,8 +18,9 @@ class IPMsisdnConsumer(BaseKafkaConsumer):
         self,
         topic: str = os.getenv("KAFKA_TOPIC_RAW", "radius.accounting.raw"),
         group_id: str = "cg-ip-msisdn",
+        db: Optional[DatabasePool] = None,
     ):
-        super().__init__(topic=topic, group_id=group_id)
+        super().__init__(topic=topic, group_id=group_id, db=db)
         self.store: IPMappingStore = None
 
     async def initialize(self):

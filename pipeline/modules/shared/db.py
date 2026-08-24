@@ -26,11 +26,13 @@ class DatabasePool:
 
     async def connect(self):
         if self.pool is None:
+            # F-09: Reduced pool size — now shared across all consumers in 1 process
             self.pool = await asyncpg.create_pool(
                 dsn=self.dsn,
-                min_size=5,       # Tầng 3: tăng từ 1
-                max_size=20,      # Tầng 3: tăng từ 10
+                min_size=int(os.getenv("DB_POOL_MIN", "4")),
+                max_size=int(os.getenv("DB_POOL_MAX", "12")),
                 command_timeout=30,
+                timeout=10,  # acquire timeout — fail rõ ràng thay vì treo vô hạn khi pool cạn
             )
             logger.info("Database connection pool initialized.")
 
@@ -257,3 +259,108 @@ class DatabasePool:
                 """,
                 records
             )
+
+    # =========================================================================
+    # F-02: ATOMIC BATCH methods — single transaction for consistency
+    # =========================================================================
+
+    async def commit_sim_swap_batch(
+        self,
+        upserts: List[Tuple[str, str]],
+        history: List[tuple],
+        audit: List[Tuple[str, Optional[str], str]],
+        notification_records: Optional[List[tuple]] = None,
+    ) -> None:
+        """
+        F-02: Ghi atomic: state (msisdn_sim) + history (sim_swap_history) + audit_log
+        + notification_log trong CÙNG một transaction. Nếu bất kỳ bước nào lỗi,
+        toàn bộ rollback — không bao giờ để state mới tồn tại mà thiếu history tương ứng.
+        """
+        assert self.pool is not None
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                if upserts:
+                    await conn.executemany(
+                        """
+                        INSERT INTO msisdn_sim (msisdn, imsi_current, updated_at)
+                        VALUES ($1, $2, NOW())
+                        ON CONFLICT (msisdn)
+                        DO UPDATE SET imsi_current = EXCLUDED.imsi_current, updated_at = NOW()
+                        """,
+                        upserts
+                    )
+                if history:
+                    await conn.copy_records_to_table(
+                        "sim_swap_history",
+                        records=history,
+                        columns=["msisdn", "imsi_old", "imsi_new", "changed_at"],
+                    )
+                if audit:
+                    await conn.executemany(
+                        """
+                        INSERT INTO audit_log (event_type, msisdn, details)
+                        VALUES ($1, $2, $3::jsonb)
+                        """,
+                        audit
+                    )
+                # F-03: Ghi notification_log PENDING trong cùng transaction
+                if notification_records:
+                    for sub_id, event_type, payload_json in notification_records:
+                        await conn.execute(
+                            """
+                            INSERT INTO notification_log
+                                (subscription_id, event_type, payload, status, attempts)
+                            VALUES ($1, $2, $3::jsonb, 'PENDING', 0)
+                            """,
+                            sub_id, event_type, payload_json,
+                        )
+
+    async def commit_device_swap_batch(
+        self,
+        upserts: List[Tuple[str, str]],
+        history: List[tuple],
+        audit: List[Tuple[str, Optional[str], str]],
+        notification_records: Optional[List[tuple]] = None,
+    ) -> None:
+        """
+        F-02: Ghi atomic: state (msisdn_device) + history (device_swap_history) + audit_log
+        + notification_log trong CÙNG một transaction.
+        """
+        assert self.pool is not None
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                if upserts:
+                    await conn.executemany(
+                        """
+                        INSERT INTO msisdn_device (msisdn, imei_current, updated_at)
+                        VALUES ($1, $2, NOW())
+                        ON CONFLICT (msisdn)
+                        DO UPDATE SET imei_current = EXCLUDED.imei_current, updated_at = NOW()
+                        """,
+                        upserts
+                    )
+                if history:
+                    await conn.copy_records_to_table(
+                        "device_swap_history",
+                        records=history,
+                        columns=["msisdn", "imei_old", "imei_new", "changed_at"],
+                    )
+                if audit:
+                    await conn.executemany(
+                        """
+                        INSERT INTO audit_log (event_type, msisdn, details)
+                        VALUES ($1, $2, $3::jsonb)
+                        """,
+                        audit
+                    )
+                # F-03: Ghi notification_log PENDING trong cùng transaction
+                if notification_records:
+                    for sub_id, event_type, payload_json in notification_records:
+                        await conn.execute(
+                            """
+                            INSERT INTO notification_log
+                                (subscription_id, event_type, payload, status, attempts)
+                            VALUES ($1, $2, $3::jsonb, 'PENDING', 0)
+                            """,
+                            sub_id, event_type, payload_json,
+                        )

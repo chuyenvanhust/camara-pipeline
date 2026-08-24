@@ -23,7 +23,7 @@ from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 
 from api.routers import health, sim_swap, device_swap, number_verification
-from api.dependencies.database import create_pool, close_pool
+from api.dependencies.database import create_pool, close_pool, _pool
 import asyncpg
 
 
@@ -55,9 +55,46 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
+# F-12: Tách liveness (process sống) và readiness (DB truy vấn được)
 @app.get("/health")
-async def health():
+async def health_legacy():
+    """Legacy health endpoint — redirect về /health/live."""
     return {"status": "ok"}
+
+
+@app.get("/health/live")
+async def liveness():
+    """Liveness: process còn sống — dùng cho container restart policy."""
+    return {"status": "ok"}
+
+
+@app.get("/health/ready")
+async def readiness():
+    """Readiness: DB thực sự truy vấn được — dùng cho load balancer routing."""
+    from api.dependencies.database import _pool as pool_ref
+    try:
+        if pool_ref is None:
+            return JSONResponse(
+                status_code=503,
+                content={"status": "not_ready", "error": "Database pool not initialized"},
+            )
+        async with pool_ref.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+        return {"status": "ready"}
+    except Exception as exc:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "not_ready", "error": str(exc)},
+        )
+
+
+# F-08: Mount Prometheus metrics ASGI app
+try:
+    from prometheus_client import make_asgi_app
+    metrics_app = make_asgi_app()
+    app.mount("/metrics", metrics_app)
+except ImportError:
+    pass  # prometheus_client not installed — metrics endpoint disabled
 
 
 # ── Exception Handlers ────────────────────────────────────────────────────────

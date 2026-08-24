@@ -52,18 +52,20 @@ INGESTION_BATCH_SIZE_BYTES = int(os.getenv("INGESTION_BATCH_SIZE_BYTES", 256 * 1
 
 INGESTION_LINGER_MS = int(os.getenv("INGESTION_LINGER_MS", 50))
 
-
-INGESTION_ACKS = os.getenv("INGESTION_ACKS", "1")
+# F-04: Default acks="all" cho durability, cho phép override qua env cho dev/lab
+INGESTION_ACKS = os.getenv("INGESTION_ACKS", "all")
 if INGESTION_ACKS not in ("0", "1", "all"):
-    INGESTION_ACKS = "1"
+    INGESTION_ACKS = "all"
 elif INGESTION_ACKS in ("0", "1"):
     INGESTION_ACKS = int(INGESTION_ACKS)
 
-
-INGESTION_COMPRESSION_TYPE = os.getenv("INGESTION_COMPRESSION_TYPE", "none")
+# F-04: Default compression=lz4 cho bandwidth efficiency
+INGESTION_COMPRESSION_TYPE = os.getenv("INGESTION_COMPRESSION_TYPE", "lz4")
 if INGESTION_COMPRESSION_TYPE.lower() in ("none", "", "null"):
     INGESTION_COMPRESSION_TYPE = None
 
+# F-04: Enable idempotence by default khi acks=all
+ENABLE_IDEMPOTENCE = os.getenv("INGESTION_ENABLE_IDEMPOTENCE", "true").lower() == "true"
 
 INGESTION_MAX_REQUEST_SIZE = int(
     os.getenv("INGESTION_MAX_REQUEST_SIZE", max(INGESTION_BATCH_SIZE_BYTES * 2, 1024 * 1024))
@@ -81,6 +83,7 @@ class RadiusLogProducer:
         self.bootstrap_servers = bootstrap_servers or KAFKA_BOOTSTRAP_SERVERS
         self.topic             = topic             or KAFKA_TOPIC_RAW
         self._producer         = None
+        self._metrics_failed   = 0  # F-04: Track failed records across flush cycles
 
     async def start(self):
         self._producer = AIOKafkaProducer(
@@ -94,14 +97,16 @@ class RadiusLogProducer:
             compression_type=INGESTION_COMPRESSION_TYPE,
             max_request_size=INGESTION_MAX_REQUEST_SIZE,
             acks=INGESTION_ACKS,
+            enable_idempotence=ENABLE_IDEMPOTENCE,  # F-04: tránh duplicate do retry
             retry_backoff_ms=500,
         )
         await self._producer.start()
         logger.info(
             "Producer started | batch=%dKB linger=%dms compression=%s acks=%s "
-            "flush_every=%d records",
+            "idempotence=%s flush_every=%d records",
             INGESTION_BATCH_SIZE_BYTES // 1024, INGESTION_LINGER_MS,
-            INGESTION_COMPRESSION_TYPE, INGESTION_ACKS, FLUSH_EVERY_N_RECORDS,
+            INGESTION_COMPRESSION_TYPE, INGESTION_ACKS,
+            ENABLE_IDEMPOTENCE, FLUSH_EVERY_N_RECORDS,
         )
 
     async def stop(self):
@@ -112,30 +117,33 @@ class RadiusLogProducer:
         """
         Doc CSV va day toan bo records len radius.raw.
 
-        Chien luoc "fire, collect, flush theo chu ky":
-            - Gui record (await send() chi cho toi khi message duoc dua
-              vao accumulator noi bo -- nhanh, KHONG doi ack tu broker).
-            - Gom Future tra ve vao 1 buffer nho.
-            - Cu moi FLUSH_EVERY_N_RECORDS record: gather() cac Future do
-              (doi ack thuc su), xoa buffer, log tien do + toc do hien tai.
-            - flush() cuoi cung dam bao phan con lai (chua du 1 chu ky)
-              cung duoc gui het truoc khi ham tra ve.
-
-        Neu goi gather() cho TAT CA record chi 1 lan o cuoi (nhu cach lam
-        don gian), buffer futures se phinh to theo kich thuoc file va
-        khong co progress log giua chung -- khong phu hop voi file lon.
+        F-04 changes:
+        - Reject record thiếu msisdn (partition key rỗng phá ordering)
+        - Kiểm tra kết quả gather() thay vì nuốt exception
+        - Báo lỗi rõ ràng nếu có record thất bại
         """
         if not self._producer:
             await self.start()
 
         reader = LocalCSVReader(file_path)
         count = 0
+        skipped_count = 0
+        self._metrics_failed = 0
         pending: List[asyncio.Future] = []
         t_start = time.time()
         t_last_log = t_start
 
         for record in reader.read_records():
-            partition_key = record.get("msisdn", "")
+            # F-14: Reject record thiếu msisdn — không gửi với key rỗng
+            partition_key = record.get("msisdn")
+            if not partition_key:
+                logger.warning(
+                    "[S1] Bỏ qua record thiếu msisdn, không đảm bảo được partition ordering: %s",
+                    {k: record.get(k) for k in ("acct_status_type", "acct_session_id", "timestamp")},
+                )
+                skipped_count += 1
+                continue
+
             fut = await self._producer.send(
                 topic=self.topic,
                 key=partition_key,
@@ -145,7 +153,15 @@ class RadiusLogProducer:
             count += 1
 
             if count % FLUSH_EVERY_N_RECORDS == 0:
-                await asyncio.gather(*pending, return_exceptions=True)
+                # F-04: Kiểm tra thật kết quả gather thay vì nuốt exception
+                results = await asyncio.gather(*pending, return_exceptions=True)
+                failed = [r for r in results if isinstance(r, Exception)]
+                if failed:
+                    self._metrics_failed += len(failed)
+                    logger.error(
+                        "[S1] %d/%d record trong batch gửi thất bại (ví dụ lỗi đầu: %s)",
+                        len(failed), len(results), failed[0],
+                    )
                 pending.clear()
 
                 now = time.time()
@@ -160,18 +176,32 @@ class RadiusLogProducer:
 
         # Gui not phan con lai chua du 1 chu ky flush
         if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+            results = await asyncio.gather(*pending, return_exceptions=True)
+            failed = [r for r in results if isinstance(r, Exception)]
+            if failed:
+                self._metrics_failed += len(failed)
+                logger.error(
+                    "[S1] %d/%d record trong batch cuối gửi thất bại (ví dụ lỗi đầu: %s)",
+                    len(failed), len(results), failed[0],
+                )
             pending.clear()
 
        
         await self._producer.flush()
 
         duration = time.time() - t_start
-        logger.info(
-            
-            "[S1-THROUGHPUT] S1 Finished: %d records in %.2fs (%.0f rec/s overall)",
-            count, duration, count / max(duration, 1e-6),
-        )
+        # F-04: Log rõ ràng nếu có record thất bại
+        if self._metrics_failed > 0:
+            logger.error(
+                "[S1] Ingest hoàn tất NHƯNG có %d record gửi thất bại + %d record bị skip (thiếu msisdn) "
+                "— cần kiểm tra trước khi coi là an toàn.",
+                self._metrics_failed, skipped_count,
+            )
+        else:
+            logger.info(
+                "[S1-THROUGHPUT] S1 Finished: %d records in %.2fs (%.0f rec/s overall), %d skipped",
+                count, duration, count / max(duration, 1e-6), skipped_count,
+            )
         return count
 
 

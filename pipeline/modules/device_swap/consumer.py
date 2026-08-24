@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
 
 from pipeline.modules.shared.base_consumer import BaseKafkaConsumer
-from pipeline.modules.device_swap.notifier import DeviceSwapNotifier
+from pipeline.modules.shared.db import DatabasePool
 
 logger = logging.getLogger(__name__)
 
@@ -16,28 +16,31 @@ class DeviceSwapConsumer(BaseKafkaConsumer):
         self,
         topic: str = os.getenv("KAFKA_TOPIC_RAW", "radius.accounting.raw"),
         group_id: str = "cg-device-swap",
+        db: Optional[DatabasePool] = None,
     ):
-        super().__init__(topic=topic, group_id=group_id)
-        self.notifier: Optional[DeviceSwapNotifier] = None
+        super().__init__(topic=topic, group_id=group_id, db=db)
 
     async def initialize(self):
         await super().initialize()
-        self.notifier = DeviceSwapNotifier(self.db, self.redis)
 
     @staticmethod
     def _device_cache_key(msisdn: str) -> str:
         return f"device:{msisdn}"
 
     @staticmethod
-    def _parse_event_time(message: Dict[str, Any]) -> datetime:
+    def _parse_event_time(message: Dict[str, Any]) -> Optional[datetime]:
+        """
+        F-14: Trả None nếu không parse được — KHÔNG fallback về 'now()',
+        để caller quyết định (skip + log warning thay vì âm thầm tạo swap event
+        với timestamp sai).
+        """
         event_time = message.get("timestamp") or message.get("event_timestamp")
-        dt = datetime.now(timezone.utc)
+        if not event_time:
+            return None
         try:
-            if event_time and "T" in str(event_time):
-                dt = datetime.fromisoformat(str(event_time).replace("Z", "+00:00"))
-        except Exception:
-            pass
-        return dt
+            return datetime.fromisoformat(str(event_time).replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return None
 
     async def process_message(self, message: Dict[str, Any]):
         """Fallback single-message processing (backward compatible)."""
@@ -69,9 +72,17 @@ class DeviceSwapConsumer(BaseKafkaConsumer):
             self.metrics.increment("ignored")
             return
 
+        # F-14: Validate event_time — skip message nếu không parse được
+        dt = self._parse_event_time(message)
+        if dt is None:
+            self.metrics.increment("errors")
+            logger.warning(
+                f"[{self.group_id}] Bỏ qua message có event_time không hợp lệ: msisdn={msisdn}"
+            )
+            return
+
         logger.info(f"[Device Swap Detected] MSISDN: {msisdn} | IMEI Old: {imei_old} -> New: {imei_new}")
         self.metrics.increment("events_detected")
-        dt = self._parse_event_time(message)
         await self.db.upsert_device_state(msisdn, imei_new)
         await self.db.record_device_swap_history(msisdn, imei_old, imei_new, dt)
         await self.redis.set(cache_key, json.dumps({"imei_current": imei_new}))
@@ -82,19 +93,24 @@ class DeviceSwapConsumer(BaseKafkaConsumer):
             details={"imei_old": imei_old, "imei_new": imei_new, "event_time": dt.isoformat()},
         )
 
-        if self.notifier:
-            await self.notifier.notify_subscriptions(
-                msisdn=msisdn, imei_old=imei_old, imei_new=imei_new, event_time=dt.isoformat(),
-            )
+        # F-03: Ghi notification_log PENDING — KHÔNG gọi HTTP trong consumer
+        subs = await self.db.get_active_subscriptions(msisdn, "DEVICE_SWAP")
+        if subs:
+            payload = {"msisdn": msisdn, "imei_old": imei_old, "imei_new": imei_new, "event_time": dt.isoformat()}
+            for sub in subs:
+                await self.db.insert_notification_log(
+                    subscription_id=sub["subscription_id"],
+                    event_type="DEVICE_SWAP",
+                    payload=payload,
+                    status="PENDING",
+                )
 
     async def process_batch(self, messages: List[Dict[str, Any]]):
         """
         Batch processing — Tầng 1 Optimization.
-        1. Redis MGET tất cả MSISDN cùng lúc
-        2. Postgres batch SELECT cho cache miss
-        3. Phân loại: init / unchanged / swap
-        4. Batch UPSERT + COPY INSERT + Redis MSET
-        5. Audit log chỉ cho sự kiện Swap
+        F-02: Atomic transaction cho tất cả DB writes.
+        F-03: Notification chỉ ghi vào notification_log, không gọi HTTP.
+        F-14: Validate event_time, skip message không hợp lệ.
         """
         # ── Step 1: Extract & filter valid messages ──
         valid_msgs = []
@@ -137,8 +153,10 @@ class DeviceSwapConsumer(BaseKafkaConsumer):
         swap_records: List[tuple] = []         # (msisdn, imei_old, imei_new, dt)
         swap_upserts: List[tuple] = []         # (msisdn, imei_new)
         swap_audit: List[tuple] = []           # (event_type, msisdn, details_json)
-        swap_notify: List[tuple] = []          # (msisdn, imei_old, imei_new, event_time)
+        notification_records: List[tuple] = [] # F-03: (sub_id, event_type, payload_json)
         cache_updates: Dict[str, str] = {}     # cache_key -> json_value
+
+        swap_msisdns_for_notify: List[str] = []
 
         for msisdn, imei_new, msg in valid_msgs:
             imei_old = redis_state.get(msisdn)
@@ -155,8 +173,16 @@ class DeviceSwapConsumer(BaseKafkaConsumer):
                 self.metrics.increment("ignored")
                 continue
 
-            # ── Device Swap Detected ──
+            # F-14: Validate event_time
             dt = self._parse_event_time(msg)
+            if dt is None:
+                self.metrics.increment("errors")
+                logger.warning(
+                    f"[{self.group_id}] Bỏ qua message có event_time không hợp lệ: msisdn={msisdn}"
+                )
+                continue
+
+            # ── Device Swap Detected ──
             logger.info(f"[Device Swap Detected] MSISDN: {msisdn} | IMEI Old: {imei_old} -> New: {imei_new}")
             self.metrics.increment("events_detected")
 
@@ -165,37 +191,40 @@ class DeviceSwapConsumer(BaseKafkaConsumer):
             swap_audit.append(("DEVICE_SWAP", msisdn, json.dumps({
                 "imei_old": imei_old, "imei_new": imei_new, "event_time": dt.isoformat(),
             })))
-            swap_notify.append((msisdn, imei_old, imei_new, dt.isoformat()))
+            swap_msisdns_for_notify.append(msisdn)
             cache_updates[self._device_cache_key(msisdn)] = json.dumps({"imei_current": imei_new})
             redis_state[msisdn] = imei_new  # cập nhật state cho msg tiếp theo trong batch
 
-        # ── Step 5: Batch writes — tối thiểu round-trips ──
-        # 5a. Batch UPSERT init + swap vào msisdn_device
+        # ── Step 4b: Fetch subscriptions for notification ──
+        if swap_msisdns_for_notify:
+            for i, msisdn in enumerate(swap_msisdns_for_notify):
+                subs = await self.db.get_active_subscriptions(msisdn, "DEVICE_SWAP")
+                if subs:
+                    rec = swap_records[i]
+                    dt_iso = rec[3].isoformat()
+                    payload_json = json.dumps({
+                        "msisdn": msisdn,
+                        "imei_old": rec[1],
+                        "imei_new": rec[2],
+                        "event_time": dt_iso,
+                    })
+                    for sub in subs:
+                        notification_records.append((sub["subscription_id"], "DEVICE_SWAP", payload_json))
+
+        # ── Step 5: F-02 Atomic batch writes ──
         all_upserts = init_records + swap_upserts
-        if all_upserts:
-            await self.db.batch_upsert_device_state(all_upserts)
+        if all_upserts or swap_records or swap_audit or notification_records:
+            await self.db.commit_device_swap_batch(
+                upserts=all_upserts,
+                history=swap_records,
+                audit=swap_audit,
+                notification_records=notification_records if notification_records else None,
+            )
 
-        # 5b. Batch INSERT swap history (COPY protocol)
-        if swap_records:
-            await self.db.batch_insert_device_swap_history(swap_records)
-
-        # 5c. Batch INSERT audit log — CHỈ cho sự kiện Swap
-        if swap_audit:
-            await self.db.batch_insert_audit_logs(swap_audit)
-
-        # 5d. Redis MSET — 1 round-trip cập nhật tất cả cache
+        # Redis KHÔNG nằm trong transaction Postgres (khác engine).
+        # Coi Redis là projection có thể rebuild: chỉ update SAU KHI Postgres commit.
         if cache_updates:
             await self.redis.mset(cache_updates)
-
-        # 5e. Notifications (chạy tuần tự vì có HTTP callback)
-        if self.notifier and swap_notify:
-            for msisdn, imei_old, imei_new, event_time in swap_notify:
-                try:
-                    await self.notifier.notify_subscriptions(
-                        msisdn=msisdn, imei_old=imei_old, imei_new=imei_new, event_time=event_time,
-                    )
-                except Exception as exc:
-                    logger.error(f"[{self.group_id}] Notification error for {msisdn}: {exc}")
 
         self.metrics.increment("success", len(valid_msgs))
 

@@ -17,5 +17,6 @@ httpx
 sqlalchemy
 pydantic-settings
 redis
-
+prometheus-client
+cramjam>=2.7
 

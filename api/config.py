@@ -17,6 +17,7 @@ Không dùng pydantic-settings để tránh dependency bổ sung.
 """
 
 import os
+import sys
 from pydantic import BaseModel
 
 
@@ -34,6 +35,7 @@ class Settings(BaseModel):
     gsma_tac_api_url: str
     hlr_hss_api_url: str
     itu_e164_api_url: str
+    environment: str  # F-12: dev | staging | production
 
 
 # Singleton — khởi tạo 1 lần, import trực tiếp từ mọi nơi
@@ -49,4 +51,12 @@ settings = Settings(
     gsma_tac_api_url=os.getenv("GSMA_TAC_API_URL", "http://camara-mock-gsma-tac:8100"),
     hlr_hss_api_url=os.getenv("HLR_HSS_API_URL", "http://camara-mock-hlr-hss:8200"),
     itu_e164_api_url=os.getenv("ITU_E164_API_URL", "http://camara-mock-itu-e164:8300"),
+    environment=os.getenv("ENVIRONMENT", "dev"),
 )
+
+# F-12: Fail startup rõ ràng nếu dùng default secret trong production
+if settings.environment == "production" and settings.api_key == "dev-secret":
+    sys.exit(
+        "FATAL: API_KEY vẫn là giá trị mặc định 'dev-secret' trong môi trường production. "
+        "Đặt biến môi trường API_KEY trước khi khởi động."
+    )
