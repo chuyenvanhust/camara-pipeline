@@ -113,7 +113,7 @@ async def run_pipeline_async(input_file: str = None, duration: int = None):
     except Exception as exc:
         _log(f">>> Warning: Could not start metrics server: {exc}")
 
-    await ensure_kafka_topics(bootstrap_servers, [raw_topic], num_partitions=4)
+    await ensure_kafka_topics(bootstrap_servers, [raw_topic], num_partitions=128)
 
     # F-09: Create shared DB pool — 1 pool for all 3 consumers instead of 3 separate pools
     shared_db = DatabasePool()

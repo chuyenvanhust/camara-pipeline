@@ -157,7 +157,7 @@ class DatabasePool:
             return log_id
 
     # =========================================================================
-    # BATCH methods — Tầng 1: Batch Processing (high throughput)
+    # 
     # =========================================================================
 
     async def batch_get_current_imei(self, msisdns: List[str]) -> Dict[str, Optional[str]]:
@@ -261,7 +261,7 @@ class DatabasePool:
             )
 
     # =========================================================================
-    # F-02: ATOMIC BATCH methods — single transaction for consistency
+    #  ATOMIC BATCH methods — single transaction for consistency
     # =========================================================================
 
     async def commit_sim_swap_batch(

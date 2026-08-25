@@ -12,7 +12,7 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 set -a; [ -f "$ROOT_DIR/.env" ] && source "$ROOT_DIR/.env"; set +a
 
 KAFKA_TOPIC_RAW="${KAFKA_TOPIC_RAW:-radius.accounting.raw}"
-KAFKA_PARTITIONS="${KAFKA_PARTITIONS:-4}"
+KAFKA_PARTITIONS="${KAFKA_PARTITIONS:-128}"
 
 echo "=================================================="
 echo ">>> CẢNH BÁO: Sắp reset toàn bộ state pipeline"
