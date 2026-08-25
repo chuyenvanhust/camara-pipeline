@@ -66,8 +66,6 @@ until docker exec camara-redis redis-cli ping 2>/dev/null | grep -q PONG; do
 done
 echo "[OK] Redis sẵn sàng"
 
-docker exec camara-pipeline pkill -f "pipeline.run_pipeline" 2>/dev/null || true
-sleep 1
 
 # 5. Khởi động pipeline
 echo ">>> Khởi động pipeline..."

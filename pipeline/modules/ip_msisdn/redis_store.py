@@ -77,7 +77,14 @@ class IPMappingStore:
             return
 
         ggsn_key = self._ggsn_key(nas_identifier)
-        framed_ips = await self.redis.smembers(ggsn_key)
+        
+        framed_ips = set()
+        cursor = 0
+        while True:
+            cursor, batch = await self.redis.sscan(ggsn_key, cursor=cursor, count=500)
+            framed_ips.update(batch)
+            if cursor == 0:
+                break
 
         if framed_ips:
             async with self.redis.pipeline(transaction=True) as pipe:

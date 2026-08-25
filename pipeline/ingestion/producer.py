@@ -29,6 +29,7 @@ from typing import List
 from dotenv import load_dotenv
 from aiokafka import AIOKafkaProducer
 from pipeline.ingestion.csv_reader import LocalCSVReader
+from pipeline.ingestion.packet_reader import PacketReader
 
 load_dotenv()
 
@@ -52,19 +53,18 @@ INGESTION_BATCH_SIZE_BYTES = int(os.getenv("INGESTION_BATCH_SIZE_BYTES", 256 * 1
 
 INGESTION_LINGER_MS = int(os.getenv("INGESTION_LINGER_MS", 50))
 
-# F-04: Default acks="all" cho durability, cho phép override qua env cho dev/lab
 INGESTION_ACKS = os.getenv("INGESTION_ACKS", "all")
 if INGESTION_ACKS not in ("0", "1", "all"):
     INGESTION_ACKS = "all"
 elif INGESTION_ACKS in ("0", "1"):
     INGESTION_ACKS = int(INGESTION_ACKS)
 
-# F-04: Default compression=lz4 cho bandwidth efficiency
+
 INGESTION_COMPRESSION_TYPE = os.getenv("INGESTION_COMPRESSION_TYPE", "lz4")
 if INGESTION_COMPRESSION_TYPE.lower() in ("none", "", "null"):
     INGESTION_COMPRESSION_TYPE = None
 
-# F-04: Enable idempotence by default khi acks=all
+
 ENABLE_IDEMPOTENCE = os.getenv("INGESTION_ENABLE_IDEMPOTENCE", "true").lower() == "true"
 
 INGESTION_MAX_REQUEST_SIZE = int(
@@ -83,7 +83,7 @@ class RadiusLogProducer:
         self.bootstrap_servers = bootstrap_servers or KAFKA_BOOTSTRAP_SERVERS
         self.topic             = topic             or KAFKA_TOPIC_RAW
         self._producer         = None
-        self._metrics_failed   = 0  # F-04: Track failed records across flush cycles
+        self._metrics_failed   = 0  
 
     async def start(self):
         self._producer = AIOKafkaProducer(
@@ -91,13 +91,13 @@ class RadiusLogProducer:
             value_serializer=lambda v: json.dumps(v).encode("utf-8"),
             key_serializer=lambda k: k.encode("utf-8") if k else None,
 
-            # --- CAU HINH HIEU NANG (xem giai thich o dau file) ---
+            
             max_batch_size=INGESTION_BATCH_SIZE_BYTES,
             linger_ms=INGESTION_LINGER_MS,
             compression_type=INGESTION_COMPRESSION_TYPE,
             max_request_size=INGESTION_MAX_REQUEST_SIZE,
             acks=INGESTION_ACKS,
-            enable_idempotence=ENABLE_IDEMPOTENCE,  # F-04: tránh duplicate do retry
+            enable_idempotence=ENABLE_IDEMPOTENCE,  
             retry_backoff_ms=500,
         )
         await self._producer.start()
@@ -117,7 +117,7 @@ class RadiusLogProducer:
         """
         Doc CSV va day toan bo records len radius.raw.
 
-        F-04 changes:
+        
         - Reject record thiếu msisdn (partition key rỗng phá ordering)
         - Kiểm tra kết quả gather() thay vì nuốt exception
         - Báo lỗi rõ ràng nếu có record thất bại
@@ -134,7 +134,7 @@ class RadiusLogProducer:
         t_last_log = t_start
 
         for record in reader.read_records():
-            # F-14: Reject record thiếu msisdn — không gửi với key rỗng
+           
             partition_key = record.get("msisdn")
             if not partition_key:
                 logger.warning(
@@ -153,7 +153,7 @@ class RadiusLogProducer:
             count += 1
 
             if count % FLUSH_EVERY_N_RECORDS == 0:
-                # F-04: Kiểm tra thật kết quả gather thay vì nuốt exception
+                
                 results = await asyncio.gather(*pending, return_exceptions=True)
                 failed = [r for r in results if isinstance(r, Exception)]
                 if failed:
@@ -174,7 +174,6 @@ class RadiusLogProducer:
                 )
                 t_last_log = now
 
-        # Gui not phan con lai chua du 1 chu ky flush
         if pending:
             results = await asyncio.gather(*pending, return_exceptions=True)
             failed = [r for r in results if isinstance(r, Exception)]
@@ -190,7 +189,7 @@ class RadiusLogProducer:
         await self._producer.flush()
 
         duration = time.time() - t_start
-        # F-04: Log rõ ràng nếu có record thất bại
+        
         if self._metrics_failed > 0:
             logger.error(
                 "[S1] Ingest hoàn tất NHƯNG có %d record gửi thất bại + %d record bị skip (thiếu msisdn) "
@@ -204,6 +203,54 @@ class RadiusLogProducer:
             )
         return count
 
+    async def publish_packets(self, port: int = 1813):
+        """
+        Lắng nghe UDP packets và stream lên Kafka theo thời gian thực.
+        """
+        if not self._producer:
+            await self.start()
+
+        reader = PacketReader()
+        count = 0
+        t_start = time.time()
+        
+        logger.info("[S1] Starting UDP Packet Ingestion on port %d...", port)
+
+        # Vì reader.listen_radius_packets là một generator đồng bộ (blocking IO)
+        # Trong môi trường production, ta nên chạy nó trong thread hoặc dùng non-blocking socket.
+        # Ở đây ta sử dụng loop.run_in_executor để không làm nghẽn event loop của asyncio.
+        
+        loop = asyncio.get_event_loop()
+        
+        # Hàm wrapper để chạy generator trong background
+        def get_packets():
+            return reader.listen_radius_packets(port=port)
+
+        # Chạy generator
+        for record in await loop.run_in_executor(None, get_packets):
+            partition_key = record.get("msisdn") or record.get("Calling_Station_Id")
+            
+            if not partition_key:
+                # Đối với gói tin RADIUS thật, nếu không có MSISDN ta có thể dùng Acct-Session-Id làm key tạm
+                partition_key = record.get("acct_session_id", "unknown")
+
+            try:
+                # Gửi lên Kafka
+                await self._producer.send(
+                    topic=self.topic,
+                    key=str(partition_key),
+                    value=record
+                )
+                count += 1
+                
+                # In log định kỳ mỗi 1000 gói tin
+                if count % 1000 == 0:
+                    elapsed = time.time() - t_start
+                    logger.info("[S1-LIVE] Streamed %d packets | Rate: %.0f pkts/s", count, count/elapsed)
+            
+            except Exception as e:
+                logger.error("[S1] Failed to send packet to Kafka: %s", e)
+
 
 # ---------------------------------------------------------------------------
 # Entry-point CLI
@@ -211,15 +258,29 @@ class RadiusLogProducer:
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Stage 1: CSV → radius.raw")
-    parser.add_argument("--file", required=True, help="Đường dẫn tới file CSV đầu vào")
+    parser = argparse.ArgumentParser(description="Stage 1: Ingestion (CSV or UDP) → Kafka")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--file", help="Đường dẫn tới file CSV đầu vào")
+    group.add_argument("--udp", action="store_true", help="Chế độ lắng nghe UDP (Packet Reader)")
+    
+    parser.add_argument("--port", type=int, default=1813, help="Cổng UDP (mặc định 1813)")
+    
     args = parser.parse_args()
 
     producer = RadiusLogProducer()
     loop = asyncio.get_event_loop()
+    
     try:
-        n = loop.run_until_complete(producer.publish_csv(args.file))
-        print(f"[S1] Đã đẩy {n} records lên topic '{producer.topic}'.")
+        if args.file:
+            # Chế độ đọc file CSV
+            n = loop.run_until_complete(producer.publish_csv(args.file))
+            print(f"[S1] Hoàn tất CSV: Đã đẩy {n} records.")
+        else:
+            # Chế độ lắng nghe UDP
+            loop.run_until_complete(producer.publish_packets(port=args.port))
+            
+    except KeyboardInterrupt:
+        print("\n[!] Stopped by user.")
     finally:
         if producer._producer is not None:
             loop.run_until_complete(producer.stop())
