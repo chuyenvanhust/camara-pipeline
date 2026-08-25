@@ -35,8 +35,15 @@ case "$1" in
     sim)
         run_script scripts/run_simulator.sh
         ;;
+    reset-db)
+        run_script scripts/reset_db.sh
+        ;;
     pipeline)
         run_script scripts/run_pipeline.sh data/radius_log.csv
+        ;;
+    dispatcher)
+        
+        run_script scripts/run_dispatcher.sh "${2:-start}"
         ;;
     report)
         run_script scripts/generate_report.sh
