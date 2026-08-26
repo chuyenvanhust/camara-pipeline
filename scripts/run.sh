@@ -4,7 +4,13 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 case "${1:-}" in
-  up) docker compose up -d --build ;;
+  up)
+    # F-PARALLEL: đọc PIPELINE_REPLICAS/RADIUS_INGESTION_REPLICAS từ .env để scale
+    # thật số container — Docker Compose không tự đọc biến này, phải qua --scale.
+    docker compose up -d --build \
+      --scale "pipeline=${PIPELINE_REPLICAS:-1}" \
+      --scale "radius-ingestion=${RADIUS_INGESTION_REPLICAS:-1}"
+    ;;
   down) docker compose down ;;
   status) docker compose ps ;;
   logs) docker compose logs -f "${2:-pipeline}" ;;

@@ -99,36 +99,58 @@ class ModuleMetrics:
         return self.counters.get(metric, 0)
 
     def log_summary(self):
-        logger.info(f"[{self.name} Metrics Summary] {self.counters}")
+        event_name = self._event_name()
+        logger.info(
+            "[PROCESSING][%s][FINAL] received=%d success=%d ignored=%d %s=%d "
+            "postgres=%d redis=%d errors=%d dlq=%d batches=%d",
+            self.name, self.get("processed"), self.get("success"), self.get("ignored"),
+            event_name, self.get("events_detected"), self.get("postgres_records"),
+            self.get("redis_records"), self.get("errors"), self.get("dlq"), self.get("batches"),
+        )
+
+    def _event_name(self) -> str:
+        if self.name == "cg-device-swap":
+            return "device_swaps_total"
+        if self.name == "cg-sim-swap":
+            return "sim_swaps_total"
+        return "mapping_events_total"
 
     async def log_periodically(self, interval: float) -> None:
         previous = dict(self.counters)
         previous_seconds = self.processing_seconds
+        loop = asyncio.get_running_loop()
+        previous_log_at = loop.time()
         while True:
             await asyncio.sleep(interval)
+            now = loop.time()
+            elapsed = max(now - previous_log_at, 1e-9)
             current = dict(self.counters)
             batch_delta = current["batches"] - previous["batches"]
             seconds_delta = self.processing_seconds - previous_seconds
-            logger.info(
-                "stage=processing group=%s window=%.1fs "
-                "kafka_received_total=%d kafka_rate=%.1f_rec_s "
-                "success_total=%d success_rate=%.1f_rec_s ignored_total=%d "
-                "dlq_total=%d errors_total=%d events_total=%d batches_total=%d avg_batch_ms=%.1f",
-                self.name, interval,
-                current["processed"], (current["processed"] - previous["processed"]) / interval,
-                current["success"], (current["success"] - previous["success"]) / interval,
-                current["ignored"], current["dlq"], current["errors"], current["events_detected"],
-                current["batches"], (seconds_delta * 1000 / batch_delta) if batch_delta else 0.0,
-            )
-            logger.info(
-                "stage=postgresql group=%s window=%.1fs records_total=%d write_rate=%.1f_rec_s",
-                self.name, interval, current["postgres_records"],
-                (current["postgres_records"] - previous["postgres_records"]) / interval,
-            )
-            logger.info(
-                "stage=redis group=%s window=%.1fs mutations_total=%d write_rate=%.1f_rec_s",
-                self.name, interval, current["redis_records"],
-                (current["redis_records"] - previous["redis_records"]) / interval,
+            received_delta = current["processed"] - previous["processed"]
+            success_delta = current["success"] - previous["success"]
+            events_delta = current["events_detected"] - previous["events_detected"]
+            errors_delta = current["errors"] - previous["errors"]
+            dlq_delta = current["dlq"] - previous["dlq"]
+            status = "ERROR" if errors_delta or dlq_delta else "OK"
+            level = logging.ERROR if status == "ERROR" else logging.INFO
+            event_name = self._event_name()
+            logger.log(
+                level,
+                "[PROCESSING][%s][%s] window=%.1fs kafka=%.1f/s success=%.1f/s "
+                "postgres=%.1f/s redis=%.1f/s batch_avg=%.1fms "
+                "%s=%d(+%d) ignored=%d errors=%d(+%d) dlq=%d(+%d) "
+                "totals(received=%d,success=%d,postgres=%d,redis=%d,batches=%d)",
+                self.name, status, elapsed,
+                received_delta / elapsed, success_delta / elapsed,
+                (current["postgres_records"] - previous["postgres_records"]) / elapsed,
+                (current["redis_records"] - previous["redis_records"]) / elapsed,
+                (seconds_delta * 1000 / batch_delta) if batch_delta else 0.0,
+                event_name, current["events_detected"], events_delta,
+                current["ignored"], current["errors"], errors_delta,
+                current["dlq"], dlq_delta, current["processed"], current["success"],
+                current["postgres_records"], current["redis_records"], current["batches"],
             )
             previous = current
             previous_seconds = self.processing_seconds
+            previous_log_at = now

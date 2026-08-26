@@ -38,8 +38,11 @@ import hashlib
 import logging
 import time
 import argparse
+import heapq
 import queue
+import random
 import threading
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Dict, Any, List, Tuple, Optional
 
@@ -86,6 +89,15 @@ ACCT_STATUS_TYPE_MAP = {
 
 RADIUS_CODE_ACCOUNTING_REQUEST = 0x04
 DEFAULT_SHARED_SECRET = os.getenv("RADIUS_SHARED_SECRET", "camara-radius-dev-secret")
+
+
+@dataclass
+class PendingPacket:
+    packet: bytes
+    identifier: int
+    authenticator: bytes
+    deadline: float
+    retries: int = 0
 
 
 def _pick(record: Dict[str, Any], *keys: str) -> Optional[str]:
@@ -267,6 +279,11 @@ def send_csv_as_radius(
     pacing_window_ms: float = 2.0,
     max_packets: int = 0,
     max_catchup_ms: float = 100.0,
+    require_ack: bool = False,
+    ack_timeout_ms: float = 1000.0,
+    max_retries: int = 5,
+    max_pending: int = 50_000,
+    ack_drain_seconds: float = 15.0,
 ) -> None:
     """Đọc CSV, đóng gói từng dòng thành gói tin RADIUS, bắn UDP tới host:port.
 
@@ -276,6 +293,8 @@ def send_csv_as_radius(
 
     if queue_size < 1 or pacing_window_ms <= 0 or max_catchup_ms < pacing_window_ms:
         raise ValueError("queue_size > 0 và max_catchup_ms >= pacing_window_ms > 0")
+    if ack_timeout_ms <= 0 or max_retries < 0 or max_pending < 1 or ack_drain_seconds < 0:
+        raise ValueError("Cấu hình RADIUS ACK/retry không hợp lệ")
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
@@ -284,7 +303,99 @@ def send_csv_as_radius(
     packet_queue: queue.Queue[object] = queue.Queue(maxsize=queue_size)
     sentinel = object()
     stop_event = threading.Event()
-    counters = {"encoded": 0, "failed": 0, "queue_high_watermark": 0}
+    counters = {
+        "encoded": 0, "failed": 0, "queue_high_watermark": 0,
+        "acked": 0, "responses_invalid": 0, "retries": 0, "retry_exhausted": 0,
+    }
+    pending: Dict[bytes, PendingPacket] = {}
+    pending_by_identifier: Dict[int, Dict[bytes, PendingPacket]] = {}
+    retry_heap: List[Tuple[float, bytes]] = []
+    pending_lock = threading.Lock()
+    ack_receiver_stop = threading.Event()
+
+    def pending_count() -> int:
+        with pending_lock:
+            return len(pending)
+
+    def receive_responses() -> None:
+        sock.settimeout(0.1)
+        secret_bytes = _secret_bytes(secret)
+        while not ack_receiver_stop.is_set():
+            try:
+                response = sock.recv(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            if len(response) < 20 or response[0] != 5 or int.from_bytes(response[2:4], "big") != len(response):
+                counters["responses_invalid"] += 1
+                continue
+            identifier = response[1]
+            matched_auth: bytes | None = None
+            with pending_lock:
+                candidates = list(pending_by_identifier.get(identifier, {}).items())
+            for request_auth, _candidate in candidates:
+                expected = hashlib.md5(response[:4] + request_auth + response[20:] + secret_bytes).digest()
+                if hmac.compare_digest(response[4:20], expected):
+                    matched_auth = request_auth
+                    break
+            if matched_auth is None:
+                counters["responses_invalid"] += 1
+                continue
+            with pending_lock:
+                item = pending.pop(matched_auth, None)
+                identifier_items = pending_by_identifier.get(identifier)
+                if identifier_items is not None:
+                    identifier_items.pop(matched_auth, None)
+                    if not identifier_items:
+                        pending_by_identifier.pop(identifier, None)
+            if item is not None:
+                counters["acked"] += 1
+
+    ack_receiver: threading.Thread | None = None
+    if require_ack:
+        ack_receiver = threading.Thread(
+            target=receive_responses, name="radius-response-receiver", daemon=True
+        )
+        ack_receiver.start()
+
+    def track_packet(packet: bytes) -> None:
+        now = time.perf_counter()
+        authenticator = packet[4:20]
+        item = PendingPacket(
+            packet=packet,
+            identifier=packet[1],
+            authenticator=authenticator,
+            deadline=now + ack_timeout_ms / 1000.0,
+        )
+        with pending_lock:
+            pending[authenticator] = item
+            pending_by_identifier.setdefault(item.identifier, {})[authenticator] = item
+        heapq.heappush(retry_heap, (item.deadline, authenticator))
+
+    def service_retries() -> None:
+        now = time.perf_counter()
+        while retry_heap and retry_heap[0][0] <= now:
+            scheduled_deadline, authenticator = heapq.heappop(retry_heap)
+            with pending_lock:
+                item = pending.get(authenticator)
+                if item is None or item.deadline != scheduled_deadline:
+                    continue
+                if item.retries >= max_retries:
+                    pending.pop(authenticator, None)
+                    identifier_items = pending_by_identifier.get(item.identifier)
+                    if identifier_items is not None:
+                        identifier_items.pop(authenticator, None)
+                        if not identifier_items:
+                            pending_by_identifier.pop(item.identifier, None)
+                    counters["retry_exhausted"] += 1
+                    continue
+            sock.send(item.packet)
+            counters["retries"] += 1
+            item.retries += 1
+            backoff = (ack_timeout_ms / 1000.0) * (2 ** min(item.retries, 4))
+            item.deadline = time.perf_counter() + backoff + random.uniform(0, backoff * 0.1)
+            heapq.heappush(retry_heap, (item.deadline, authenticator))
 
     def put_interruptibly(item: object) -> bool:
         while not stop_event.is_set():
@@ -347,11 +458,13 @@ def send_csv_as_radius(
     logger.info(
         "[RADIUS-UDP] Bắt đầu gửi từ %s tới %s:%d | rate=%s | loop=%s | "
         "prefetch_queue=%d | prefilled=%d | prefill_ms=%.1f | pacing_window_ms=%.1f | "
-        "burst=%d | max_catchup_ms=%.1f | max_packets=%d | secret=%s",
+        "burst=%d | max_catchup_ms=%.1f | max_packets=%d | require_ack=%s | "
+        "ack_timeout_ms=%.0f | max_retries=%d | max_pending=%d | secret=%s",
         csv_path, host, port,
         f"{rate} pkt/s" if rate > 0 else "không giới hạn",
         loop, queue_size, packet_queue.qsize(), prefill_duration * 1000,
-        pacing_window_ms, burst_size, max_catchup_ms, max_packets,
+        pacing_window_ms, burst_size, max_catchup_ms, max_packets, require_ack,
+        ack_timeout_ms, max_retries, max_pending,
         "(mặc định)" if secret == DEFAULT_SHARED_SECRET else "(tuỳ biến)",
     )
 
@@ -367,8 +480,16 @@ def send_csv_as_radius(
                 batch.append(item)  # type: ignore[arg-type]
 
             for packet in batch:
+                while require_ack and pending_count() >= max_pending:
+                    service_retries()
+                    time.sleep(0.001)
                 sock.send(packet)
+                if require_ack:
+                    track_packet(packet)
             total_sent += len(batch)
+
+            if require_ack:
+                service_retries()
 
             if rate > 0 and batch:
                 next_deadline += len(batch) / rate
@@ -385,13 +506,17 @@ def send_csv_as_radius(
             now = time.perf_counter()
             log_elapsed = now - last_log_at
             if log_elapsed >= 1.0 or finished:
+                pending_now = pending_count()
+                status = "PRESSURE" if require_ack and pending_now >= max_pending * 0.7 else "OK"
                 logger.info(
-                    "[RADIUS-UDP] stage=sender sent_total=%d send_rate=%.1f_pkt_s "
-                    "target_rate=%.1f queue_depth=%d queue_capacity=%d queue_high_watermark=%d "
-                    "encoded_total=%d encode_failed_total=%d",
-                    total_sent, (total_sent - last_log_sent) / max(log_elapsed, 1e-9), rate,
-                    packet_queue.qsize(), queue_size, counters["queue_high_watermark"],
-                    counters["encoded"], counters["failed"],
+                    "[SENDER][%s] target=%.0f/s actual=%.1f/s sent=%d encoded_queue=%d/%d "
+                    "pending_ack=%d/%d acked=%d retries=%d retry_exhausted=%d "
+                    "invalid_responses=%d encode_failed=%d",
+                    status, rate,
+                    (total_sent - last_log_sent) / max(log_elapsed, 1e-9), total_sent,
+                    packet_queue.qsize(), queue_size, pending_now, max_pending,
+                    counters["acked"], counters["retries"], counters["retry_exhausted"],
+                    counters["responses_invalid"], counters["failed"],
                 )
                 last_log_at = now
                 last_log_sent = total_sent
@@ -402,13 +527,31 @@ def send_csv_as_radius(
         logger.info("[RADIUS-UDP] Dừng theo yêu cầu người dùng.")
     finally:
         stop_event.set()
-        sock.close()
         encoder.join(timeout=2.0)
 
-    duration = time.perf_counter() - t_start
+    send_duration = time.perf_counter() - t_start
+    if require_ack and pending_count() and ack_drain_seconds > 0:
+        drain_deadline = time.perf_counter() + ack_drain_seconds
+        logger.info(
+            "[SENDER][DRAIN] đã gửi hết nguồn, chờ ACK pending=%d tối đa %.1fs",
+            pending_count(), ack_drain_seconds,
+        )
+        while pending_count() and time.perf_counter() < drain_deadline:
+            service_retries()
+            time.sleep(0.01)
+
+    unacked = pending_count() + counters["retry_exhausted"]
+    ack_receiver_stop.set()
+    sock.close()
+    if ack_receiver is not None:
+        ack_receiver.join(timeout=1.0)
+
     logger.info(
-        "[RADIUS-UDP] Hoàn tất: %d gói gửi thành công, %d record bị bỏ qua, %.2fs (%.1f pkt/s)",
-        total_sent, counters["failed"], duration, total_sent / max(duration, 1e-6),
+        "[SENDER][FINAL] sent=%d acked=%d unacked=%d retries=%d invalid_responses=%d "
+        "encode_failed=%d send_duration=%.2fs send_rate=%.1f/s",
+        total_sent, counters["acked"], unacked, counters["retries"],
+        counters["responses_invalid"], counters["failed"], send_duration,
+        total_sent / max(send_duration, 1e-6),
     )
 
 
@@ -430,6 +573,12 @@ if __name__ == "__main__":
                         help="Dừng sau N packet; 0 nghĩa là gửi hết file hoặc chạy theo --loop")
     parser.add_argument("--max-catchup-ms", type=float, default=100.0,
                         help="Giới hạn nợ pacing được bù để tránh burst lớn (mặc định 100ms)")
+    parser.add_argument("--require-ack", action="store_true",
+                        help="Chờ RADIUS Accounting-Response và retry packet chưa được ACK")
+    parser.add_argument("--ack-timeout-ms", type=float, default=1000.0)
+    parser.add_argument("--max-retries", type=int, default=5)
+    parser.add_argument("--max-pending", type=int, default=50_000)
+    parser.add_argument("--ack-drain-seconds", type=float, default=15.0)
     args = parser.parse_args()
 
     send_csv_as_radius(
@@ -443,4 +592,9 @@ if __name__ == "__main__":
         pacing_window_ms=args.pacing_window_ms,
         max_packets=args.max_packets,
         max_catchup_ms=args.max_catchup_ms,
+        require_ack=args.require_ack,
+        ack_timeout_ms=args.ack_timeout_ms,
+        max_retries=args.max_retries,
+        max_pending=args.max_pending,
+        ack_drain_seconds=args.ack_drain_seconds,
     )

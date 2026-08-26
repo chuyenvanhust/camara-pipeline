@@ -7,12 +7,14 @@ import logging
 import os
 import signal
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from collections import OrderedDict
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 
 from aiokafka import AIOKafkaProducer
 
 from pipeline.ingestion.csv_reader import LocalCSVReader
-from pipeline.ingestion.packet_reader import PacketReader
+from pipeline.ingestion.packet_reader import PacketReader, RadiusEnvelope
 from pipeline.modules.shared.events import InvalidMessageError, canonical_msisdn, parse_event_time
 
 logger = logging.getLogger(__name__)
@@ -20,12 +22,21 @@ KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "camara-kafka:909
 KAFKA_TOPIC_RAW = os.getenv("KAFKA_TOPIC_RAW", "radius.accounting.raw")
 FLUSH_EVERY_N_RECORDS = int(os.getenv("INGESTION_FLUSH_EVERY_N_RECORDS", "1000"))
 THROUGHPUT_LOG_INTERVAL_SECONDS = float(os.getenv("THROUGHPUT_LOG_INTERVAL_SECONDS", "10"))
-UDP_QUEUE_MAX_RECORDS = int(os.getenv("RADIUS_UDP_QUEUE_MAX_RECORDS", "20000"))
+UDP_QUEUE_MAX_RECORDS = int(os.getenv("RADIUS_UDP_QUEUE_MAX_RECORDS", "100000"))
 UDP_KAFKA_BATCH_RECORDS = int(os.getenv("RADIUS_UDP_KAFKA_BATCH_RECORDS", "500"))
 UDP_KAFKA_BATCH_WAIT_MS = int(os.getenv("RADIUS_UDP_KAFKA_BATCH_WAIT_MS", "10"))
 UDP_KAFKA_MAX_INFLIGHT_BATCHES = int(os.getenv("RADIUS_UDP_KAFKA_MAX_INFLIGHT_BATCHES", "8"))
+RADIUS_ACK_CACHE_MAX_RECORDS = int(os.getenv("RADIUS_ACK_CACHE_MAX_RECORDS", "500000"))
+RADIUS_ACK_CACHE_TTL_SECONDS = float(os.getenv("RADIUS_ACK_CACHE_TTL_SECONDS", "120"))
 
-QueueItem = Tuple[str, Optional[str], Dict[str, Any], str]
+
+@dataclass(frozen=True)
+class QueueItem:
+    topic: str
+    key: Optional[str]
+    value: Dict[str, Any]
+    kind: str
+    envelope: RadiusEnvelope | None = None
 
 
 class RadiusLogProducer:
@@ -45,7 +56,12 @@ class RadiusLogProducer:
             "kafka_batches": 0, "queue_high_watermark": 0,
             "last_batch_records": 0, "last_batch_ms": 0.0,
             "last_batch_rate": 0.0,
+            "responses_sent": 0, "responses_failed": 0,
+            "duplicates_acked": 0, "duplicates_inflight": 0,
+            "responses_withheld": 0,
         }
+        self._radius_inflight: set[str] = set()
+        self._radius_ack_cache: OrderedDict[str, float] = OrderedDict()
 
     async def start(self) -> None:
         compression = os.getenv("INGESTION_COMPRESSION_TYPE", "lz4").strip().lower()
@@ -72,12 +88,12 @@ class RadiusLogProducer:
             await self._producer.stop()
             self._producer = None
         logger.info(
-            "stage=producer source=%s final=true received_total=%d queued_total=%d "
-            "kafka_ack_total=%d rejected_total=%d dlq_total=%d queue_dropped_total=%d "
-            "publish_failed_total=%d",
-            self._source, self._counts["received"], self._counts["queued"],
-            self._counts["acknowledged"], self._counts["rejected"], self._counts["dlq"],
-            self._counts["queue_dropped"], self._counts["publish_failed"],
+            "[INGESTION][FINAL] source=%s received=%d kafka_acked=%d dropped=%d "
+            "radius_responses=%d duplicate_responses=%d response_failed=%d rejected=%d dlq=%d publish_failed=%d",
+            self._source, self._counts["received"], self._counts["acknowledged"],
+            self._counts["queue_dropped"], self._counts["responses_sent"],
+            self._counts["duplicates_acked"], self._counts["responses_failed"],
+            self._counts["rejected"], self._counts["dlq"], self._counts["publish_failed"],
         )
 
     async def _log_throughput(self) -> None:
@@ -88,22 +104,26 @@ class RadiusLogProducer:
             current = dict(self._counts)
             queue_depth = self._queue.qsize() if self._queue is not None else 0
             reader_stats = self._packet_reader.stats if self._packet_reader is not None else {}
-            logger.info(
-                "stage=producer source=%s window=%.1fs udp_datagrams_total=%d "
-                "received_total=%d receive_rate=%.1f_rec_s queued_total=%d queue_depth=%d "
-                "queue_capacity=%d queue_high_watermark=%d queue_dropped_total=%d "
-                "kafka_ack_total=%d kafka_ack_rate=%.1f_rec_s kafka_batches_total=%d "
-                "last_batch_records=%d last_batch_ms=%.1f last_batch_rate=%.1f_rec_s "
-                "rejected_total=%d radius_rejected_total=%d dlq_total=%d publish_failed_total=%d",
-                self._source, interval, reader_stats.get("datagrams", current["received"]),
-                current["received"], (current["received"] - previous["received"]) / interval,
-                current["queued"], queue_depth, UDP_QUEUE_MAX_RECORDS,
-                current["queue_high_watermark"], current["queue_dropped"],
+            input_rate = (current["received"] - previous["received"]) / interval
+            kafka_rate = (current["acknowledged"] - previous["acknowledged"]) / interval
+            dropped_window = current["queue_dropped"] - previous["queue_dropped"]
+            queue_percent = queue_depth * 100 / UDP_QUEUE_MAX_RECORDS
+            loss_percent = current["queue_dropped"] * 100 / max(current["received"], 1)
+            status = "OVERLOAD" if dropped_window else "PRESSURE" if queue_percent >= 70 else "OK"
+            level = logging.WARNING if status != "OK" else logging.INFO
+            logger.log(
+                level,
+                "[INGESTION][%s] window=%.0fs input=%.1f/s kafka_ack=%.1f/s "
+                "queue=%d/%d(%.1f%%) inflight_radius=%d dropped_window=%d dropped_total=%d(%.4f%%) "
+                "radius_response_total=%d duplicate_acked=%d duplicate_waiting=%d response_failed=%d "
+                "rejected=%d dlq=%d publish_failed=%d totals(received=%d,kafka_acked=%d)",
+                status, interval, input_rate, kafka_rate,
+                queue_depth, UDP_QUEUE_MAX_RECORDS, queue_percent, len(self._radius_inflight),
+                dropped_window, current["queue_dropped"], loss_percent,
+                current["responses_sent"], current["duplicates_acked"], current["duplicates_inflight"],
+                current["responses_failed"], reader_stats.get("rejected", 0), current["dlq"],
+                current["publish_failed"], reader_stats.get("datagrams", current["received"]),
                 current["acknowledged"],
-                (current["acknowledged"] - previous["acknowledged"]) / interval,
-                current["kafka_batches"], current["last_batch_records"],
-                current["last_batch_ms"], current["last_batch_rate"], current["rejected"],
-                reader_stats.get("rejected", 0), current["dlq"], current["publish_failed"],
             )
             previous = current
 
@@ -163,7 +183,7 @@ class RadiusLogProducer:
                     acknowledged, rejected, time.monotonic() - started)
         return acknowledged
 
-    def _put_udp_item(self, item: QueueItem) -> None:
+    def _put_udp_item(self, item: QueueItem) -> bool:
         assert self._queue is not None
         try:
             self._queue.put_nowait(item)
@@ -171,20 +191,62 @@ class RadiusLogProducer:
             self._counts["queue_high_watermark"] = max(
                 self._counts["queue_high_watermark"], self._queue.qsize()
             )
+            return True
         except asyncio.QueueFull:
             self._counts["queue_dropped"] += 1
+            self._counts["responses_withheld"] += 1
+            return False
+
+    def _cache_radius_ack(self, event_id: str) -> None:
+        now = time.monotonic()
+        self._radius_ack_cache[event_id] = now
+        self._radius_ack_cache.move_to_end(event_id)
+        while len(self._radius_ack_cache) > RADIUS_ACK_CACHE_MAX_RECORDS:
+            self._radius_ack_cache.popitem(last=False)
+
+    def _is_radius_duplicate(self, event_id: str) -> bool:
+        now = time.monotonic()
+        while self._radius_ack_cache:
+            oldest_id, created_at = next(iter(self._radius_ack_cache.items()))
+            if now - created_at <= RADIUS_ACK_CACHE_TTL_SECONDS:
+                break
+            self._radius_ack_cache.pop(oldest_id, None)
+        return event_id in self._radius_ack_cache
+
+    async def _send_radius_response(self, envelope: RadiusEnvelope, duplicate: bool = False) -> None:
+        assert self._packet_reader is not None
+        try:
+            await self._packet_reader.send_accounting_response(envelope)
+            self._counts["responses_sent"] += 1
+            if duplicate:
+                self._counts["duplicates_acked"] += 1
+        except Exception:
+            self._counts["responses_failed"] += 1
+            logger.exception("Không gửi được RADIUS Accounting-Response tới %s", envelope.address)
 
     async def _receive_udp(self, reader: PacketReader, port: int) -> None:
         source = f"udp:{port}"
-        async for record in reader.listen_radius_packets(port):
+        async for envelope in reader.listen_radius_packets(port):
             self._counts["received"] += 1
+            record = envelope.record
+            if self._is_radius_duplicate(envelope.event_id):
+                await self._send_radius_response(envelope, duplicate=True)
+                continue
+            if envelope.event_id in self._radius_inflight:
+                self._counts["duplicates_inflight"] += 1
+                continue
+            self._radius_inflight.add(envelope.event_id)
             try:
                 key, normalized = self._normalize(record)
-                self._put_udp_item((self.topic, key, normalized, "raw"))
+                queued = self._put_udp_item(QueueItem(self.topic, key, normalized, "raw", envelope))
             except InvalidMessageError as exc:
                 self._counts["rejected"] += 1
-                envelope = self._dlq_envelope(record, exc, source)
-                self._put_udp_item((f"{self.topic}.dlq", None, envelope, "dlq"))
+                dlq_payload = self._dlq_envelope(record, exc, source)
+                queued = self._put_udp_item(
+                    QueueItem(f"{self.topic}.dlq", None, dlq_payload, "dlq", envelope)
+                )
+            if not queued:
+                self._radius_inflight.discard(record.get("radius_event_id", ""))
 
     async def _next_kafka_batch(self) -> List[QueueItem]:
         assert self._queue is not None
@@ -211,7 +273,7 @@ class RadiusLogProducer:
         async def acknowledge(batch: List[QueueItem], futures: List[asyncio.Future], started: float) -> None:
             try:
                 await asyncio.gather(*futures)
-                raw_count = sum(item[3] == "raw" for item in batch)
+                raw_count = sum(item.kind == "raw" for item in batch)
                 self._counts["acknowledged"] += raw_count
                 self._counts["dlq"] += len(batch) - raw_count
                 self._counts["kafka_batches"] += 1
@@ -219,6 +281,16 @@ class RadiusLogProducer:
                 self._counts["last_batch_records"] = len(batch)
                 self._counts["last_batch_ms"] = elapsed * 1000
                 self._counts["last_batch_rate"] = len(batch) / elapsed
+                response_items = [item for item in batch if item.envelope is not None]
+                for item in response_items:
+                    assert item.envelope is not None
+                    self._radius_inflight.discard(item.envelope.event_id)
+                    self._cache_radius_ack(item.envelope.event_id)
+                if response_items:
+                    await asyncio.gather(*(
+                        self._send_radius_response(item.envelope)  # type: ignore[arg-type]
+                        for item in response_items
+                    ))
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -239,8 +311,8 @@ class RadiusLogProducer:
                 batch = await self._next_kafka_batch()
                 started = time.monotonic()
                 futures = [
-                    await self._producer.send(topic, key=key, value=value)
-                    for topic, key, value, _kind in batch
+                    await self._producer.send(item.topic, key=item.key, value=item.value)
+                    for item in batch
                 ]
                 task = asyncio.create_task(
                     acknowledge(batch, futures, started),

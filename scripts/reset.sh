@@ -11,8 +11,10 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
 set -a; [ -f "$ROOT_DIR/.env" ] && source "$ROOT_DIR/.env"; set +a
 
+# F-PARALLEL: đồng bộ đúng tên biến với docker-compose.yml/.env.example
 KAFKA_TOPIC_RAW="${KAFKA_TOPIC_RAW:-radius.accounting.raw}"
-KAFKA_PARTITIONS="${KAFKA_PARTITIONS:-8}"
+KAFKA_PARTITIONS="${KAFKA_TOPIC_PARTITIONS:-12}"
+KAFKA_REPL="${KAFKA_REPLICATION_FACTOR:-3}"
 
 echo "=================================================="
 echo ">>> CẢNH BÁO: Sắp reset toàn bộ state pipeline"
@@ -54,7 +56,7 @@ CREATED=0
 for i in $(seq 1 45); do
     if docker exec camara-kafka kafka-topics --bootstrap-server localhost:9092 \
         --create --topic "$KAFKA_TOPIC_RAW" --partitions "$KAFKA_PARTITIONS" \
-        --replication-factor 1 2>/tmp/reset_kafka_create.log; then
+        --replication-factor "$KAFKA_REPL" 2>/tmp/reset_kafka_create.log; then
         CREATED=1
         break
     fi

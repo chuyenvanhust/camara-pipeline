@@ -10,7 +10,7 @@ volumes:
   grafana_data:
 
 x-pipeline-environment: &pipeline-environment
-  KAFKA_BOOTSTRAP_SERVERS: camara-kafka:9092
+  KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-camara-kafka:9092,camara-kafka-2:9092,camara-kafka-3:9092}
   KAFKA_TOPIC_RAW: radius.accounting.raw
   REDIS_HOST: camara-redis
   REDIS_PORT: "6379"
@@ -33,9 +33,9 @@ services:
       timeout: 5s
       retries: 10
       start_period: 10s
-    mem_limit: 256m
+    mem_limit: ${ZOOKEEPER_MEM_LIMIT:-256m}
 
-  kafka:
+  kafka-1: &kafka-broker
     image: confluentinc/cp-kafka:7.5.0
     container_name: camara-kafka
     restart: unless-stopped
@@ -45,25 +45,54 @@ services:
     networks: [camara-network]
     ports:
       - "127.0.0.1:29092:29092"
-    environment:
+    environment: &kafka-broker-env
       KAFKA_BROKER_ID: "1"
       KAFKA_ZOOKEEPER_CONNECT: camara-zookeeper:2181
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://camara-kafka:9092,PLAINTEXT_HOST://localhost:29092
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
-      KAFKA_HEAP_OPTS: -Xmx1536m -Xms1536m
+      # F-KAFKA-HA: 3 broker -> replication factor 3 mặc định cho mọi topic hệ thống
+      # tự tạo (offsets/transaction), và min.insync.replicas=2 để chịu được 1 broker
+      # chết mà vẫn ghi được (acks=all chỉ cần 2/3 ISR ack).
+      KAFKA_DEFAULT_REPLICATION_FACTOR: ${KAFKA_REPLICATION_FACTOR:-3}
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: ${KAFKA_REPLICATION_FACTOR:-3}
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: ${KAFKA_MIN_INSYNC_REPLICAS:-2}
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: ${KAFKA_REPLICATION_FACTOR:-3}
+      KAFKA_MIN_INSYNC_REPLICAS: ${KAFKA_MIN_INSYNC_REPLICAS:-2}
+      KAFKA_HEAP_OPTS: -Xmx${KAFKA_HEAP_MB:-1536}m -Xms${KAFKA_HEAP_MB:-1536}m
+      KAFKA_NUM_NETWORK_THREADS: ${KAFKA_NUM_NETWORK_THREADS:-4}
+      KAFKA_NUM_IO_THREADS: ${KAFKA_NUM_IO_THREADS:-8}
     healthcheck:
       test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list"]
       interval: 5s
       timeout: 5s
       retries: 15
       start_period: 15s
-    mem_limit: 3g
-    cpus: 2
+    mem_limit: ${KAFKA_MEM_LIMIT:-3g}
+    cpus: ${KAFKA_CPUS:-2}
+
+  kafka-2:
+    <<: *kafka-broker
+    environment:
+      <<: *kafka-broker-env
+      KAFKA_BROKER_ID: "2"
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://camara-kafka-2:9092,PLAINTEXT_HOST://localhost:29093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29093
+    ports:
+      - "127.0.0.1:29093:29093"
+    container_name: camara-kafka-2
+
+  kafka-3:
+    <<: *kafka-broker
+    environment:
+      <<: *kafka-broker-env
+      KAFKA_BROKER_ID: "3"
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://camara-kafka-3:9092,PLAINTEXT_HOST://localhost:29094
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29094
+    ports:
+      - "127.0.0.1:29094:29094"
+    container_name: camara-kafka-3
 
   postgres:
     image: postgres:15-alpine
@@ -82,8 +111,8 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
-    mem_limit: 2g
-    cpus: 2
+    mem_limit: ${POSTGRES_MEM_LIMIT:-2g}
+    cpus: ${POSTGRES_CPUS:-2}
 
   redis:
     image: redis:7-alpine
@@ -98,7 +127,7 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
-    mem_limit: 640m
+    mem_limit: ${REDIS_MEM_LIMIT:-640m}
 
   migrate:
     build:
@@ -135,16 +164,19 @@ services:
       timeout: 5s
       retries: 10
       start_period: 15s
-    mem_limit: 512m
+    mem_limit: ${FASTAPI_MEM_LIMIT:-512m}
 
   pipeline:
     build:
       context: .
       dockerfile: pipeline/Dockerfile
-    container_name: camara-pipeline
     restart: unless-stopped
     depends_on:
-      kafka:
+      kafka-1:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+      kafka-3:
         condition: service_healthy
       redis:
         condition: service_healthy
@@ -154,11 +186,18 @@ services:
     environment:
       <<: *pipeline-environment
       METRICS_PORT: "9200"
-      KAFKA_TOPIC_PARTITIONS: "8"
+      KAFKA_TOPIC_PARTITIONS: ${KAFKA_TOPIC_PARTITIONS:-12}
+      KAFKA_REPLICATION_FACTOR: ${KAFKA_REPLICATION_FACTOR:-3}
+      # F-PARALLEL: số instance CHẠY SONG SONG THẬT (asyncio task riêng, mỗi task
+      # là 1 member Kafka riêng trong group -> partition được rebalance chia thật
+      # ra nhiều task, không còn 1 task ôm hết partition). Xem run_pipeline.py.
+      CONSUMERS_PER_GROUP: ${CONSUMERS_PER_GROUP:-1}
       BATCH_MAX_RECORDS: ${BATCH_MAX_RECORDS:-4000}
       BATCH_TIMEOUT_MS: ${BATCH_TIMEOUT_MS:-20}
       PROCESSING_PARTITION_CONCURRENCY: ${PROCESSING_PARTITION_CONCURRENCY:-2}
       THROUGHPUT_LOG_INTERVAL_SECONDS: ${THROUGHPUT_LOG_INTERVAL_SECONDS:-10}
+      DB_POOL_MIN: ${PIPELINE_DB_POOL_MIN:-4}
+      DB_POOL_MAX: ${PIPELINE_DB_POOL_MAX:-24}
     command: ["python", "-m", "pipeline.run_pipeline"]
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:9200/metrics >/dev/null"]
@@ -166,17 +205,20 @@ services:
       timeout: 5s
       retries: 10
       start_period: 15s
-    mem_limit: 2g
-    cpus: 2
+    mem_limit: ${PIPELINE_MEM_LIMIT:-2g}
+    cpus: ${PIPELINE_CPUS:-2}
 
   radius-ingestion:
     build:
       context: .
       dockerfile: pipeline/Dockerfile
-    container_name: camara-radius-ingestion
     restart: unless-stopped
     depends_on:
-      kafka:
+      kafka-1:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+      kafka-3:
         condition: service_healthy
     networks: [camara-network]
     ports:
@@ -192,7 +234,8 @@ services:
       RADIUS_UDP_KAFKA_MAX_INFLIGHT_BATCHES: ${RADIUS_UDP_KAFKA_MAX_INFLIGHT_BATCHES:-8}
     command: ["python", "-m", "pipeline.ingestion.producer", "--udp", "--port", "1813"]
     stop_grace_period: 30s
-    mem_limit: 512m
+    mem_limit: ${RADIUS_INGESTION_MEM_LIMIT:-512m}
+    cpus: ${RADIUS_INGESTION_CPUS:-1}
 
   notification-dispatcher:
     build:
@@ -210,7 +253,7 @@ services:
       DISPATCHER_POLL_INTERVAL: "2"
       DISPATCHER_MAX_ATTEMPTS: "5"
     command: ["python", "-m", "pipeline.dispatcher.notification_dispatcher"]
-    mem_limit: 256m
+    mem_limit: ${DISPATCHER_MEM_LIMIT:-256m}
 
   prometheus:
     image: prom/prometheus:v2.45.0
@@ -222,7 +265,7 @@ services:
       - "127.0.0.1:9090:9090"
     volumes:
       - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-    mem_limit: 256m
+    mem_limit: ${PROMETHEUS_MEM_LIMIT:-256m}
 
   grafana:
     image: grafana/grafana:10.0.0
@@ -240,4 +283,4 @@ services:
       - grafana_data:/var/lib/grafana
       - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
       - ./infra/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
-    mem_limit: 256m
+    mem_limit: ${GRAFANA_MEM_LIMIT:-256m}

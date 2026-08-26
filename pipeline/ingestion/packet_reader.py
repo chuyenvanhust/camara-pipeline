@@ -6,14 +6,25 @@ import hmac
 import logging
 import os
 import socket
+import struct
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Dict
+from typing import Any, AsyncIterator, Dict, Tuple
 
 logger = logging.getLogger(__name__)
 
 
 class PacketDecodeError(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class RadiusEnvelope:
+    record: Dict[str, Any]
+    address: Tuple[str, int]
+    identifier: int
+    request_authenticator: bytes
+    event_id: str
 
 
 class PacketReader:
@@ -30,6 +41,24 @@ class PacketReader:
             raise ValueError("RADIUS_SHARED_SECRET is required")
         self.secret = secret.encode("utf-8")
         self.stats = {"datagrams": 0, "decoded": 0, "rejected": 0}
+        self._socket: socket.socket | None = None
+
+    def build_accounting_response(self, envelope: RadiusEnvelope) -> bytes:
+        header = bytes([5, envelope.identifier]) + struct.pack("!H", 20)
+        authenticator = hashlib.md5(
+            header + envelope.request_authenticator + self.secret
+        ).digest()
+        return header + authenticator
+
+    async def send_accounting_response(self, envelope: RadiusEnvelope) -> None:
+        if self._socket is None:
+            raise RuntimeError("RADIUS listener socket is not available")
+        loop = asyncio.get_running_loop()
+        await loop.sock_sendto(
+            self._socket,
+            self.build_accounting_response(envelope),
+            envelope.address,
+        )
 
     @staticmethod
     def _text(value: bytes) -> str:
@@ -100,18 +129,34 @@ class PacketReader:
                 result[self.VENDOR[vendor_type]] = self._text(value[offset + 2:offset + vendor_len])
             offset += vendor_len
 
-    async def listen_radius_packets(self, port: int = DEFAULT_RADIUS_PORT) -> AsyncIterator[Dict[str, Any]]:
+    async def listen_radius_packets(self, port: int = DEFAULT_RADIUS_PORT) -> AsyncIterator[RadiusEnvelope]:
         loop = asyncio.get_running_loop()
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # F-PARALLEL: SO_REUSEPORT cho phép NHIỀU tiến trình/container cùng bind
+        # đúng 1 port UDP — kernel Linux tự chia datagram đến giữa chúng (round-
+        # robin theo hash), cho phép chạy N instance radius-ingestion song song
+        # THẬT (mỗi instance 1 process riêng, không bị GIL chia sẻ) khi chuyển
+        # sang host Linux nhiều core (`docker compose up --scale radius-ingestion=N`
+        # + `network_mode: host`, xem docker-compose.prod.yml). Trên Windows/macOS
+        # Docker Desktop không hỗ trợ SO_REUSEPORT -> tự động bỏ qua, không lỗi.
+        so_reuseport_enabled = os.getenv("RADIUS_UDP_SO_REUSEPORT", "true").strip().lower() not in ("0", "false", "")
+        if so_reuseport_enabled and hasattr(socket, "SO_REUSEPORT"):
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            except OSError:
+                logger.warning("SO_REUSEPORT không khả dụng trên nền tảng này, bỏ qua")
         requested_buffer = int(os.getenv("RADIUS_UDP_RECEIVE_BUFFER_BYTES", str(16 * 1024 * 1024)))
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, requested_buffer)
         actual_buffer = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
         sock.setblocking(False)
         sock.bind(("0.0.0.0", port))
+        self._socket = sock
         logger.info(
-            "RADIUS listener ready on UDP/%d receive_buffer_requested=%d receive_buffer_actual=%d",
+            "RADIUS listener ready on UDP/%d receive_buffer_requested=%d receive_buffer_actual=%d "
+            "so_reuseport=%s",
             port, requested_buffer, actual_buffer,
+            so_reuseport_enabled and hasattr(socket, "SO_REUSEPORT"),
         )
         try:
             while True:
@@ -120,7 +165,16 @@ class PacketReader:
                 try:
                     decoded = self.decode_radius(packet)
                     self.stats["decoded"] += 1
-                    yield decoded
+                    request_authenticator = packet[4:20]
+                    event_id = f"radius:{request_authenticator.hex()}"
+                    decoded["radius_event_id"] = event_id
+                    yield RadiusEnvelope(
+                        record=decoded,
+                        address=(address[0], address[1]),
+                        identifier=packet[1],
+                        request_authenticator=request_authenticator,
+                        event_id=event_id,
+                    )
                 except PacketDecodeError as exc:
                     self.stats["rejected"] += 1
                     rejected = self.stats["rejected"]
@@ -130,11 +184,12 @@ class PacketReader:
                             address, exc, rejected,
                         )
         finally:
+            self._socket = None
             sock.close()
 
 
 if __name__ == "__main__":
     async def _main() -> None:
-        async for decoded in PacketReader().listen_radius_packets():
-            print(decoded)
+        async for envelope in PacketReader().listen_radius_packets():
+            print(envelope.record)
     asyncio.run(_main())
