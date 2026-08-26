@@ -198,4 +198,8 @@ giống production và đo lại benchmark batch-write — repo hiện **chưa c
 | `DISPATCHER_BATCH_SIZE` / `DISPATCHER_POLL_INTERVAL` / `DISPATCHER_MAX_ATTEMPTS` | `50` / `2.0` / `5` | Cấu hình notification dispatcher |
 
 Danh sách đầy đủ và biến riêng của từng thành phần: xem README con tương ứng
+<<<<<<< ours
 (`pipeline/README.md`, `pipeline/modules/*/README.md`, `api/README.md`).
+=======
+(`pipeline/README.md`, `pipeline/modules/*/README.md`, `api/README.md`).
+>>>>>>> theirs

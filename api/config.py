@@ -17,7 +17,6 @@ Không dùng pydantic-settings để tránh dependency bổ sung.
 """
 
 import os
-import sys
 from pydantic import BaseModel
 
 
@@ -55,8 +54,7 @@ settings = Settings(
 )
 
 # F-12: Fail startup rõ ràng nếu dùng default secret trong production
-if settings.environment == "production" and settings.api_key == "dev-secret":
-    sys.exit(
-        "FATAL: API_KEY vẫn là giá trị mặc định 'dev-secret' trong môi trường production. "
-        "Đặt biến môi trường API_KEY trước khi khởi động."
-    )
+if settings.environment.lower() == "production" and (
+    settings.api_key == "dev-secret" or len(settings.api_key) < 32
+):
+    raise RuntimeError("production API_KEY must be non-default and at least 32 characters")

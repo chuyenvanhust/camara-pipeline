@@ -24,4 +24,4 @@ ENV PYTHONPATH=/workspace
 EXPOSE 8000
 
 # Chạy bằng đường dẫn tuyệt đối
-CMD ["/usr/local/bin/python", "-m", "uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["/usr/local/bin/python", "-m", "uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2", "--proxy-headers", "--forwarded-allow-ips", "*"]

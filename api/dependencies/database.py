@@ -40,6 +40,7 @@ async def create_pool() -> None:
         min_size=2,
         max_size=settings.db_pool_size,
         command_timeout=30,
+        timeout=10,
     )
 
 
@@ -79,5 +80,11 @@ async def get_db() -> AsyncGenerator[asyncpg.Connection, None]:
             },
         )
 
-    async with _pool.acquire() as connection:
-        yield connection
+    try:
+        async with _pool.acquire(timeout=3) as connection:
+            yield connection
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error": "SERVICE_UNAVAILABLE", "message": "Database pool is busy."},
+        ) from exc

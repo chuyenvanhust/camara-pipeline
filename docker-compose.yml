@@ -2,26 +2,33 @@ name: camara-pipeline
 
 networks:
   camara-network:
-    name: camara-network
     driver: bridge
-    external: true
 
 volumes:
   postgres_data:
-  grafana_data:
   redis_data:
+  grafana_data:
+
+x-pipeline-environment: &pipeline-environment
+  KAFKA_BOOTSTRAP_SERVERS: camara-kafka:9092
+  KAFKA_TOPIC_RAW: radius.accounting.raw
+  REDIS_HOST: camara-redis
+  REDIS_PORT: "6379"
+  DATABASE_URL: postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-camara}@camara-postgres:5432/${DB_NAME:-camara_db}
+  DB_POOL_MIN: "2"
+  DB_POOL_MAX: "12"
 
 services:
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
     container_name: camara-zookeeper
-    networks:
-      - camara-network
+    restart: unless-stopped
+    networks: [camara-network]
     environment:
-      ZOOKEEPER_CLIENT_PORT: 2181
-      ZOOKEEPER_TICK_TIME: 2000
+      ZOOKEEPER_CLIENT_PORT: "2181"
+      ZOOKEEPER_TICK_TIME: "2000"
     healthcheck:
-      test: ["CMD-SHELL", "nc -z localhost 2181 || exit 1"]
+      test: ["CMD-SHELL", "nc -z localhost 2181"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -31,81 +38,59 @@ services:
   kafka:
     image: confluentinc/cp-kafka:7.5.0
     container_name: camara-kafka
+    restart: unless-stopped
     depends_on:
       zookeeper:
         condition: service_healthy
-    networks:
-      - camara-network
+    networks: [camara-network]
     ports:
-      # WARNING (F-12): Trong production, hạn chế hoặc xoá port expose ra host.
-      # Giữ lại cho dev/lab. Production nên dùng SSH tunnel/bastion.
-      - "9092:9092"
-      - "29092:29092"
+      - "127.0.0.1:29092:29092"
     environment:
-      KAFKA_BROKER_ID: 1
+      KAFKA_BROKER_ID: "1"
       KAFKA_ZOOKEEPER_CONNECT: camara-zookeeper:2181
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://camara-kafka:9092,PLAINTEXT_HOST://localhost:29092
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      KAFKA_HEAP_OPTS: "-Xmx768m -Xms768m"
-    mem_limit: 1g
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_HEAP_OPTS: -Xmx1536m -Xms1536m
     healthcheck:
-      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list || exit 1"]
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list"]
       interval: 5s
       timeout: 5s
       retries: 15
       start_period: 15s
+    mem_limit: 3g
+    cpus: 2
 
   postgres:
     image: postgres:15-alpine
     container_name: camara-postgres
-    # F-09: Giảm shared_buffers và max_connections cho phù hợp mem_limit 768m
-    command: [
-      "postgres",
-      "-c", "synchronous_commit=off",
-      "-c", "max_connections=100",
-      "-c", "shared_buffers=256MB",
-      "-c", "work_mem=8MB",
-      "-c", "max_wal_size=2GB",
-      "-c", "wal_buffers=16MB",
-      "-c", "checkpoint_timeout=15min"
-    ]
-    mem_limit: 768m
-    networks:
-      - camara-network
-    ports:
-      # WARNING (F-12): Trong production, xoá mục ports này.
-      # Service khác trong cùng network vẫn kết nối qua container_name:5432.
-      - "5432:5432"
+    restart: unless-stopped
+    command: ["postgres", "-c", "synchronous_commit=on", "-c", "max_connections=120", "-c", "shared_buffers=512MB", "-c", "effective_cache_size=1536MB", "-c", "work_mem=8MB", "-c", "max_wal_size=2GB", "-c", "checkpoint_timeout=15min"]
+    networks: [camara-network]
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: camara
-      POSTGRES_DB: camara_db
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-camara}
+      POSTGRES_DB: ${DB_NAME:-camara_db}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./storage/migrations:/docker-entrypoint-initdb.d
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d camara_db"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-camara_db}"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
+    mem_limit: 2g
+    cpus: 2
 
-  # F-07: Redis — đổi maxmemory-policy sang noeviction
-  # Khi đầy, ghi mới sẽ lỗi rõ ràng (OOM command not allowed)
-  # thay vì âm thầm evict state quan trọng (sim:*, device:*, ip-ggsn:*)
   redis:
     image: redis:7-alpine
     container_name: camara-redis
+    restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes", "--maxmemory", "512mb", "--maxmemory-policy", "noeviction"]
-    networks:
-      - camara-network
-    ports:
-      # WARNING (F-12): Trong production, xoá mục ports này.
-      - "6379:6379"
+    networks: [camara-network]
     volumes:
       - redis_data:/data
     healthcheck:
@@ -113,117 +98,135 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
-      start_period: 5s
     mem_limit: 640m
+
+  migrate:
+    build:
+      context: .
+      dockerfile: pipeline/Dockerfile
+    networks: [camara-network]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment: *pipeline-environment
+    command: ["python", "-m", "storage.migrate"]
+    restart: "no"
 
   fastapi:
     build:
       context: .
       dockerfile: api/Dockerfile
     container_name: fastapi-app
+    restart: unless-stopped
     depends_on:
-      postgres:
-        condition: service_healthy
-    networks:
-      - camara-network
-    mem_limit: 256m
+      migrate:
+        condition: service_completed_successfully
+    networks: [camara-network]
     ports:
       - "8000:8000"
     environment:
-      - DATABASE_URL=postgresql://postgres:camara@camara-postgres:5432/camara_db
-      - DB_HOST=camara-postgres
-      - DB_PORT=5432
-      - DB_USER=postgres
-      - DB_PASSWORD=camara
-      - DB_NAME=camara_db
-      - ENVIRONMENT=${ENVIRONMENT:-dev}
-      - API_KEY=${API_KEY:-dev-secret}
+      DATABASE_URL: postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-camara}@camara-postgres:5432/${DB_NAME:-camara_db}
+      DB_POOL_SIZE: "10"
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      API_KEY: ${API_KEY:-dev-secret}
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8000/health/live || exit 1"]
-      interval: 5s
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health/ready"]
+      interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 15s
+    mem_limit: 512m
 
   pipeline:
     build:
       context: .
       dockerfile: pipeline/Dockerfile
     container_name: camara-pipeline
+    restart: unless-stopped
     depends_on:
       kafka:
         condition: service_healthy
       redis:
         condition: service_healthy
-      postgres:
-        condition: service_healthy
-    networks:
-      - camara-network
+      migrate:
+        condition: service_completed_successfully
+    networks: [camara-network]
     environment:
-      - KAFKA_BOOTSTRAP_SERVERS=camara-kafka:9092
-      - KAFKA_TOPIC_RAW=radius.accounting.raw
-      - REDIS_HOST=camara-redis
-      - REDIS_PORT=6379
-      - DB_HOST=camara-postgres
-      - DB_PORT=5432
-      - DB_USER=postgres
-      - DB_PASSWORD=camara
-      - DB_NAME=camara_db
-    volumes:
-      - .:/workspace
-    command: ["sleep", "infinity"]
+      <<: *pipeline-environment
+      METRICS_PORT: "9200"
+      KAFKA_TOPIC_PARTITIONS: "8"
+    command: ["python", "-m", "pipeline.run_pipeline"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/metrics >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    mem_limit: 2g
+    cpus: 2
 
-  # F-03: Notification Dispatcher — outbox pattern, chạy như service riêng
+  radius-ingestion:
+    build:
+      context: .
+      dockerfile: pipeline/Dockerfile
+    container_name: camara-radius-ingestion
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks: [camara-network]
+    ports:
+      - "1813:1813/udp"
+    environment:
+      <<: *pipeline-environment
+      RADIUS_SHARED_SECRET: ${RADIUS_SHARED_SECRET:-camara-radius-dev-secret}
+    command: ["python", "-m", "pipeline.ingestion.producer", "--udp", "--port", "1813"]
+    mem_limit: 512m
+
   notification-dispatcher:
     build:
       context: .
       dockerfile: pipeline/Dockerfile
     container_name: camara-notification-dispatcher
+    restart: unless-stopped
     depends_on:
-      postgres:
-        condition: service_healthy
-    networks:
-      - camara-network
+      migrate:
+        condition: service_completed_successfully
+    networks: [camara-network]
     environment:
-      - DB_HOST=camara-postgres
-      - DB_PORT=5432
-      - DB_USER=postgres
-      - DB_PASSWORD=camara
-      - DB_NAME=camara_db
-      - DISPATCHER_BATCH_SIZE=50
-      - DISPATCHER_POLL_INTERVAL=2.0
-      - DISPATCHER_MAX_ATTEMPTS=5
+      <<: *pipeline-environment
+      DISPATCHER_BATCH_SIZE: "50"
+      DISPATCHER_POLL_INTERVAL: "2"
+      DISPATCHER_MAX_ATTEMPTS: "5"
     command: ["python", "-m", "pipeline.dispatcher.notification_dispatcher"]
     mem_limit: 256m
 
   prometheus:
     image: prom/prometheus:v2.45.0
     container_name: camara-prometheus
-    depends_on:
-      - fastapi
-    networks:
-      - camara-network
+    restart: unless-stopped
+    depends_on: [fastapi, pipeline]
+    networks: [camara-network]
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
     volumes:
-      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     mem_limit: 256m
 
   grafana:
     image: grafana/grafana:10.0.0
     container_name: camara-grafana
-    depends_on:
-      - prometheus
-    networks:
-      - camara-network
+    restart: unless-stopped
+    depends_on: [prometheus]
+    networks: [camara-network]
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     environment:
-      # F-12: Không hardcode credentials — bắt buộc set qua .env
-      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
-      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
-      - GF_AUTH_ANONYMOUS_ENABLED=false
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
     volumes:
       - grafana_data:/var/lib/grafana
-      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards
-      - ./infra/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ./infra/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
     mem_limit: 256m

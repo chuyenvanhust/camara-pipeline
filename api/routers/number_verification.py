@@ -69,8 +69,10 @@ router = APIRouter(
 _QUERY_ACTIVE_SESSION = """
     SELECT EXISTS (
         SELECT 1
-        FROM msisdn_sim
+        FROM radius_session_state
         WHERE msisdn = $1
+          AND active
+          AND last_event_at >= NOW() - INTERVAL '24 hours'
     ) AS has_active_session
 """
 

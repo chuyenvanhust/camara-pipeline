@@ -1,0 +1,136 @@
+4.4.1 Module IP-MSISDN Processing
+Chức năng: Lắng nghe bản tin mới từ Kafka, trích xuất thông tin ánh xạ IP–
+MSISDN–GGSN và duy trì bảng mapping trong cơ sở dữ liệu phục vụ truy vấn realtime.
+Consumer group: cg-ip-msisdn
+Luồng xử lý:
+1. Đọc bản tin từ topic radius.accounting.raw.
+2. Trích xuất các trường: Framed_IP_Address (IPv4 của thiết bị), Calling-StationId (msisdn), NAS-Identifier (ggsn_name), acct_status_type (loại bản tin
+accounting), timestamp.
+3. Phân loại theo Acct-Status-Type:
+o Start / Interim-Update:
+• Upsert bản ghi (Key: Framed_IP_Address; Value: Calling-StationId, timestamp) vào Redis.
+• Bổ sung key phụ là NAS-Identifier phục vụ xóa bản tin hàng loạt
+theo key phụ.
+o Stop: Xóa hoặc đánh dấu hết hiệu lực bản ghi tương ứng trong Redis (xóa
+theo key và value MSISDN)
+o Accounting-Off: Xóa hoặc đánh dấu hết hiệu lực bản ghi có key phụ là
+NAS-Identifier tương ứng.
+Lưu ý: nghiệp vụ hiện tại chỉ xử lý được trường hợp IP Private của thuê bao bị NAT
+sang dải IP Public, chưa xử lý được trường hợp tái sử dụng IP Pool giữa các node
+GGSN. Khi giải pháp tái sử dụng IP Pool được triển khai, sẽ thực hiện nâng cấp giải
+pháp theo phương án tái sử dụng IP được áp dụng.
+4.4.2 Module Device Swap Processing
+Chức năng: Phát hiện sự kiện đổi thiết bị (thay đổi liên kết IMEI–MSISDN), cập
+nhật cơ sở dữ liệu và gửi notification đến các subscription đã đăng ký qua Open
+Gateway.
+Consumer group: cg-device-swap
+Luồng xử lý:
+1. Đọc bản tin từ topic radius.accounting.raw.
+2. Trích xuất: msisdn, imei, timestamp.
+3. Truy vấn Redis/PostgreSQL để lấy imei hiện tại đang lưu ứng với msisdn.
+4. So sánh imei mới với imei đang lưu:
+o Không thay đổi: Bỏ qua.
+o Có thay đổi: Thực hiện các bước sau:
+a. Cập nhật bản ghi (msisdn → imei_new, changed_at) vào PostgreSQL,
+lưu lại imei_old vào bảng lịch sử.
+b. Cập nhật cache Redis nếu có lưu thông tin này.
+c. Truy vấn bảng subscription để tìm các subscription đang hoạt động đăng
+ký nhận sự kiện Device Swap cho msisdn này.
+d. Gửi HTTP callback đến endpoint của Open Gateway, kèm payload:
+msisdn, imei_old, imei_new, event_time.
+5. Ghi log sự kiện Device Swap vào bảng audit.
+Xử lý lỗi callback: Tương tự SIM Swap, áp dụng retry với exponential backoff và
+retry queue cho notification thất bại.
+4.4.3 Module SIM Swap Processing
+Chức năng: Phát hiện sự kiện đổi SIM (IMSI_Changeover/SUPI_Changeover),
+cập nhật cơ sở dữ liệu và gửi notification đến các subscription đã đăng ký qua Open
+Gateway.
+Consumer group: cg-sim-swap
+Luồng xử lý:
+1. Đọc bản tin từ topic proclog.phase1/prolog.phase2.
+2. Trích xuất: msisdn, timestamp.
+3. Thực hiện lưu vào cơ sở dữ liệu, cache và tạo notification:
+o Lưu vào cơ sở dữ liệu SIM Swap: cập nhật bản ghi (msisdn;
+lastTimeSIMChange; SIMChangeList)
+o Cập nhật cache Redis phục vụ truy vấn nhanh (MSISDN –
+LastTimeSIMChange)
+o Tạo Notification: Truy vấn bản Subscription để tìm subscription đăng ký
+nhận sự kiện SIM Swap đối với MSISDN này, đang còn hiệu lực.
+Với mỗi subscription tìm được: gửi bản tin callback tới Subscriber đã đăng
+ký (Open Gateway), kèm theo payload gồm: MSISDN,
+LastTimeSIMChange.
+4. Ghi log xử lý và thay đổi thông số Counter, Gauge
+Xử lý lỗi callback: Trường hợp gửi notification thất bại, module cần có cơ chế retry
+với exponential backoff.
+4.5 Database
+4.5.1 Redis
+Mục đích: Cung cấp khả năng tra cứu IP → MSISDN với độ trễ dưới mili-giây,
+phục vụ cho API truy vấn IP-MSISDN từ Open Gateway.
+Cấu trúc dữ liệu:
+Key: ip-ggsn:<framed_i>
+Value: { "msisdn": "...", "timestamp": "..." }
+TTL: Theo session timeout (24h), làm mới mỗi lần có Interim-Update
+Lưu ý triển khai:
+• Sử dụng Redis Sentinel để đảm bảo high availability.
+• Bật persistence (AOF/RDB) tránh mất toàn bộ mapping khi restart.
+• Ngoài mapping IP→MSISDN, thực hiện cache thêm thông tin subscription theo
+msisdn để SIM Swap/Device Swap tra cứu nhanh.
+4.5.2 PostgreSQL
+Mục đích: Lưu trữ lâu dài trạng thái IMSI/IMEI hiện tại theo MSISDN, lịch sử
+thay đổi, và thông tin subscription của Open Gateway.
+Thiết kế schema chính:
+- Bảng msisdn_device – Trạng thái IMEI hiện tại:
+msisdn VARCHAR PRIMARY KEY
+imei_current VARCHAR
+updated_at TIMESTAMP
+- Bảng msisdn_sim – Trạng thái IMSI hiện tại:
+msisdn VARCHAR PRIMARY KEY
+imsi_current VARCHAR
+updated_at TIMESTAMP
+- Bảng device_swap_history – Lịch sử đổi thiết bị:
+id BIGSERIAL PRIMARY KEY
+msisdn VARCHAR
+imei_old VARCHAR
+imei_new VARCHAR
+changed_at TIMESTAMP
+- Bảng sim_swap_history – Lịch sử đổi SIM:
+id BIGSERIAL PRIMARY KEY
+msisdn VARCHAR
+imsi_old VARCHAR
+imsi_new VARCHAR
+changed_at TIMESTAMP
+- Bảng subscription – Subscription từ Open Gateway:
+subscription_id UUID PRIMARY KEY
+msisdn VARCHAR
+event_type VARCHAR -- 'SIM_SWAP' | 'DEVICE_SWAP'
+callback_url VARCHAR
+status VARCHAR -- 'ACTIVE' | 'EXPIRED' | 'CANCELLED'
+created_at TIMESTAMP
+expires_at TIMESTAMP
+Lưu ý triển khai:
+- Index trên (msisdn, event_type, status) của bảng subscription để tra cứu nhanh
+khi phát hiện sự kiện.
+- Các bảng dữ liệu có thể thay đổi trong quá trình phát triển để tối ưu và nâng cấp
+giải pháp.
+4.6 Module Query Service
+Chức năng: Cung cấp API phục vụ các truy vấn real-time từ Open Gateway và
+quản lý vòng đời subscription lắng nghe sự kiện SIM Swap, Device Swap.
+Các nhóm chức năng:
+Truy vấn (Query API):
+- GET /ip-msisdn?ip=<framed_ip>: Tra cứu MSISDN từ IP, đọc từ Redis. Trả về
+MSISDN, GGSN, thời điểm ghi nhận gần nhất.
+- GET /sim-swap?msisdn=<msisdn>: Truy vấn thời điểm SIM Swap gần nhất của
+thuê bao, đọc từ PostgreSQL.
+- GET /device-swap?msisdn=<msisdn>: Truy vấn thời điểm Device Swap gần
+nhất của thuê bao.
+Quản lý Subscription:
+- POST /subscriptions: Tạo subscription mới cho một msisdn và event_type
+(SIM_SWAP hoặc DEVICE_SWAP), lưu callback_url và expires_at vào
+PostgreSQL.
+- DELETE /subscriptions/{id}: Huỷ subscription, cập nhật status =
+CANCELLED.
+- GET /subscriptions/{id}: Truy vấn trạng thái subscription.
+Lưu ý khi triển khai:
+- Hỗ trợ subscription toàn mạng với tham số anyUE (phục vụ đáp ứng nghiệp vụ
+phát hiện sự thay đổi thiết bị theo Thông tư 08/2026/BKHCN).
+- Triển khai xác thực và phân quyền, hạn chế hệ thống có thể truy vấn đế

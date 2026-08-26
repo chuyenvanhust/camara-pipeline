@@ -87,4 +87,8 @@ instance dispatcher song song), gửi HTTP POST tới `callback_url` của subsc
 nhật lại status (`SENT` / `FAILED` với backoff / `DEAD` sau `DISPATCHER_MAX_ATTEMPTS` lần).
 
 Phải chạy dispatcher như 1 process riêng song song với `run_pipeline.py` nếu muốn subscriber
+<<<<<<< ours
 Open Gateway thực sự nhận được callback — pipeline chính **không** tự gửi HTTP.
+=======
+Open Gateway thực sự nhận được callback — pipeline chính **không** tự gửi HTTP.
+>>>>>>> theirs

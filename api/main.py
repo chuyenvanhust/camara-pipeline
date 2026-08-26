@@ -78,13 +78,13 @@ async def readiness():
                 status_code=503,
                 content={"status": "not_ready", "error": "Database pool not initialized"},
             )
-        async with pool_ref.acquire() as conn:
+        async with pool_ref.acquire(timeout=3) as conn:
             await conn.fetchval("SELECT 1")
         return {"status": "ready"}
-    except Exception as exc:
+    except Exception:
         return JSONResponse(
             status_code=503,
-            content={"status": "not_ready", "error": str(exc)},
+            content={"status": "not_ready"},
         )
 
 
@@ -156,7 +156,7 @@ async def db_interface_error_handler(request: Request, exc: asyncpg.InterfaceErr
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         content={
             "error": "SERVICE_UNAVAILABLE",
-            "message": str(exc) or "Database connection timeout",
+            "message": "Database connection error.",
             "request_id": request.headers.get("x-request-id", "unknown"),
         },
     )

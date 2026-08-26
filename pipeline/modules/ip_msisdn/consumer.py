@@ -1,164 +1,84 @@
-# pipeline/modules/ip_msisdn/consumer.py
-import json
+from __future__ import annotations
+
+import ipaddress
 import logging
 import os
-from typing import Dict, Any, List, Optional
+from typing import Any, List, Optional
 
+from pipeline.modules.ip_msisdn.redis_store import IPMappingStore
 from pipeline.modules.shared.base_consumer import BaseKafkaConsumer
 from pipeline.modules.shared.db import DatabasePool
-from pipeline.modules.ip_msisdn.redis_store import IPMappingStore
-
-logger = logging.getLogger(__name__)
-
-SESSION_TTL_SECONDS = 86400  # 24h
+from pipeline.modules.shared.events import InvalidMessageError, canonical_msisdn, event_id, normalize_status, parse_event_time, required_text
 
 
 class IPMsisdnConsumer(BaseKafkaConsumer):
-    def __init__(
-        self,
-        topic: str = os.getenv("KAFKA_TOPIC_RAW", "radius.accounting.raw"),
-        group_id: str = "cg-ip-msisdn",
-        db: Optional[DatabasePool] = None,
-    ):
+    def __init__(self, topic: str = os.getenv("KAFKA_TOPIC_RAW", "radius.accounting.raw"), group_id: str = "cg-ip-msisdn", db: Optional[DatabasePool] = None):
         super().__init__(topic=topic, group_id=group_id, db=db)
-        self.store: IPMappingStore = None
+        self.store: Optional[IPMappingStore] = None
 
-    async def initialize(self):
+    async def initialize(self) -> None:
         await super().initialize()
+        assert self.redis is not None
         self.store = IPMappingStore(self.redis)
 
-    async def process_message(self, message: Dict[str, Any]):
-        """Fallback single-message processing (backward compatible)."""
-        framed_ip = message.get("Framed_IP_Address") or message.get("framed_ip")
-        msisdn = message.get("Calling-StationId") or message.get("Calling_Station_Id") or message.get("msisdn")
-        nas_id = message.get("NAS-Identifier") or message.get("NAS_Identifier") or message.get("nas_identifier")
-        status_type = message.get("acct_status_type", "")
-        timestamp = message.get("timestamp") or message.get("event_timestamp", "")
+    @staticmethod
+    def _optional_text(message, *keys):
+        for key in keys:
+            value = message.get(key)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+        return None
 
-        if not status_type:
-            self.metrics.increment("ignored")
-            return
-
-        status_norm = status_type.strip().lower()
-
-        if status_norm in ("start", "interim-update", "interim_update"):
-            if not framed_ip or not msisdn:
-                self.metrics.increment("ignored")
-                return
-            await self.store.upsert_mapping(
-                framed_ip=framed_ip, msisdn=msisdn, timestamp=timestamp, nas_identifier=nas_id,
-            )
-            self.metrics.increment("events_detected")
-
-        elif status_norm == "stop":
-            if not framed_ip or not msisdn:
-                self.metrics.increment("ignored")
-                return
-            await self.store.delete_mapping(
-                framed_ip=framed_ip, msisdn=msisdn, nas_identifier=nas_id,
-            )
-            self.metrics.increment("events_detected")
-
-        elif status_norm in ("accounting-off", "accounting_off"):
-            if not nas_id:
-                self.metrics.increment("ignored")
-                return
-            await self.store.accounting_off(nas_identifier=nas_id)
-            self.metrics.increment("events_detected")
-
-        else:
-            self.metrics.increment("ignored")
-
-    async def process_batch(self, messages: List[Dict[str, Any]]):
-        """
-        Batch processing — Tầng 1 Optimization.
-        Gom tất cả Start/Interim/Stop thành batch Redis pipeline operations.
-        """
-        upsert_ops = []   # (framed_ip, msisdn, timestamp, nas_id)
-        delete_ops = []   # (framed_ip, msisdn, nas_id)
-        acct_off_ops = [] # (nas_id,)
-
-        for msg in messages:
-            framed_ip = msg.get("Framed_IP_Address") or msg.get("framed_ip")
-            msisdn = msg.get("Calling-StationId") or msg.get("Calling_Station_Id") or msg.get("msisdn")
-            nas_id = msg.get("NAS-Identifier") or msg.get("NAS_Identifier") or msg.get("nas_identifier")
-            status_type = msg.get("acct_status_type", "")
-            timestamp = msg.get("timestamp") or msg.get("event_timestamp", "")
-
-            if not status_type:
-                self.metrics.increment("ignored")
-                continue
-
-            status_norm = status_type.strip().lower()
-
-            if status_norm in ("start", "interim-update", "interim_update"):
-                if not framed_ip or not msisdn:
-                    self.metrics.increment("ignored")
+    async def process_batch(self, records: List[Any]) -> None:
+        assert self.store is not None
+        operations = []
+        session_records = []
+        for record in records:
+            try:
+                message = record.value
+                if message.get("_decode_error"):
+                    raise InvalidMessageError(message["_decode_error"])
+                status = normalize_status(message.get("acct_status_type"))
+                occurred_at = parse_event_time(message)
+                nas = self._optional_text(message, "nas_identifier", "NAS_Identifier", "NAS-Identifier")
+                if status == "accounting-off":
+                    if not nas:
+                        raise InvalidMessageError("accounting-off requires nas_identifier")
+                    operations.append((record, status, occurred_at, nas, None, None))
                     continue
-                upsert_ops.append((framed_ip, msisdn, timestamp, nas_id))
-                self.metrics.increment("events_detected")
-
-            elif status_norm == "stop":
-                if not framed_ip or not msisdn:
-                    self.metrics.increment("ignored")
+                if status == "accounting-on":
                     continue
-                delete_ops.append((framed_ip, msisdn, nas_id))
-                self.metrics.increment("events_detected")
+                msisdn = canonical_msisdn(message)
+                framed_ip = required_text(message, "framed_ip", "Framed_IP_Address", "Framed-IP-Address")
+                try:
+                    ipaddress.ip_address(framed_ip)
+                except ValueError as exc:
+                    raise InvalidMessageError("invalid framed_ip") from exc
+                raw_session_id = required_text(message, "acct_session_id", "Acct_Session_Id", "Acct-Session-Id")
+                session_id = f"{nas or '-'}:{raw_session_id}"
+                eid = event_id(record)
+                session_records.append((session_id, msisdn, nas, status != "stop", occurred_at,
+                                        eid, record.partition, record.offset))
+                operations.append((record, status, occurred_at, nas, framed_ip, msisdn))
+            except InvalidMessageError as exc:
+                await self.send_to_dlq(record, exc)
 
-            elif status_norm in ("accounting-off", "accounting_off"):
-                if not nas_id:
-                    self.metrics.increment("ignored")
-                    continue
-                acct_off_ops.append(nas_id)
-                self.metrics.increment("events_detected")
-
-            else:
-                self.metrics.increment("ignored")
-
-        # ── Batch Redis operations ──
-
-        # 1. Batch UPSERT (Start / Interim-Update) — 1 Redis pipeline
-        if upsert_ops:
-            async with self.redis.pipeline(transaction=False) as pipe:
-                for framed_ip, msisdn, timestamp, nas_id in upsert_ops:
-                    ip_key = IPMappingStore._ip_key(framed_ip)
-                    payload = json.dumps({"msisdn": msisdn, "timestamp": timestamp})
-                    pipe.set(ip_key, payload, ex=SESSION_TTL_SECONDS)
-                    if nas_id:
-                        ggsn_key = IPMappingStore._ggsn_key(nas_id)
-                        pipe.sadd(ggsn_key, framed_ip)
-                        pipe.expire(ggsn_key, SESSION_TTL_SECONDS)
-                await pipe.execute()
-
-        # 2. Batch DELETE (Stop) — need to check ownership first
-        if delete_ops:
-            # 2a. Batch MGET to check ownership
-            ip_keys_to_check = [IPMappingStore._ip_key(framed_ip) for framed_ip, _, _ in delete_ops]
-            existing_values = await self.redis.mget(ip_keys_to_check)
-
-            # 2b. Filter: only delete if MSISDN matches
-            async with self.redis.pipeline(transaction=False) as pipe:
-                for (framed_ip, msisdn, nas_id), existing_val in zip(delete_ops, existing_values):
-                    if existing_val:
-                        try:
-                            data = json.loads(existing_val)
-                            if data.get("msisdn") == msisdn:
-                                pipe.delete(IPMappingStore._ip_key(framed_ip))
-                                if nas_id:
-                                    pipe.srem(IPMappingStore._ggsn_key(nas_id), framed_ip)
-                        except Exception:
-                            pass
-                await pipe.execute()
-
-        # 3. Accounting-Off — process sequentially (rare event, bulk delete)
-        for nas_id in acct_off_ops:
-            await self.store.accounting_off(nas_identifier=nas_id)
-
-        self.metrics.increment("success", len(messages))
+        await self.db.persist_session_batch(session_records)
+        for record, status, occurred_at, nas, framed_ip, msisdn in operations:
+            if status in {"start", "interim-update"}:
+                await self.store.upsert_mapping(framed_ip, msisdn, occurred_at, event_id(record),
+                                                record.partition, record.offset, nas)
+            elif status == "stop":
+                await self.store.delete_mapping(framed_ip, msisdn, occurred_at,
+                                                record.partition, record.offset)
+            elif status == "accounting-off":
+                await self.db.mark_nas_sessions_inactive(nas, occurred_at)
+                await self.store.accounting_off(nas, occurred_at)
+            self.metrics.increment("events_detected")
+        self.metrics.increment("success", len(operations))
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    consumer = IPMsisdnConsumer()
     import asyncio
-    asyncio.run(consumer.run())
+    logging.basicConfig(level=logging.INFO)
+    asyncio.run(IPMsisdnConsumer().run())

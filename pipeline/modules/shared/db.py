@@ -1,22 +1,24 @@
-# pipeline/modules/shared/db.py
-import os
-import json
+from __future__ import annotations
+
 import logging
-from typing import Optional, List, Dict, Any, Tuple
+import os
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
 import asyncpg
 
+
 logger = logging.getLogger(__name__)
-
-DB_HOST = os.getenv("DB_HOST", "camara-postgres")
-DB_PORT = int(os.getenv("DB_PORT", "5432"))
-DB_USER = os.getenv("DB_USER", "postgres")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "camara")
-DB_NAME = os.getenv("DB_NAME", "camara_db")
-
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
-    f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+    "postgresql://postgres:camara@camara-postgres:5432/camara_db",
 )
+
+StateRecord = Tuple[str, str, datetime, str, int, int]
+HistoryRecord = Tuple[str, str, int, int, str, Optional[str], str, datetime]
+AuditRecord = Tuple[str, str, str, str, datetime]
+OutboxEvent = Tuple[str, str, str, str, datetime]
+SessionRecord = Tuple[str, str, Optional[str], bool, datetime, str, int, int]
 
 
 class DatabasePool:
@@ -24,343 +26,286 @@ class DatabasePool:
         self.dsn = dsn
         self.pool: Optional[asyncpg.Pool] = None
 
-    async def connect(self):
+    async def connect(self) -> None:
         if self.pool is None:
-            # F-09: Reduced pool size — now shared across all consumers in 1 process
+            minimum = int(os.getenv("DB_POOL_MIN", "2"))
+            maximum = int(os.getenv("DB_POOL_MAX", "12"))
+            if minimum < 1 or maximum < minimum:
+                raise ValueError("invalid DB_POOL_MIN/DB_POOL_MAX")
             self.pool = await asyncpg.create_pool(
                 dsn=self.dsn,
-                min_size=int(os.getenv("DB_POOL_MIN", "4")),
-                max_size=int(os.getenv("DB_POOL_MAX", "12")),
+                min_size=minimum,
+                max_size=maximum,
                 command_timeout=30,
-                timeout=10,  # acquire timeout — fail rõ ràng thay vì treo vô hạn khi pool cạn
+                timeout=10,
             )
-            logger.info("Database connection pool initialized.")
+            logger.info("Database pool initialized min=%d max=%d", minimum, maximum)
 
-    async def close(self):
+    async def close(self) -> None:
         if self.pool is not None:
             await self.pool.close()
             self.pool = None
-            logger.info("Database connection pool closed.")
 
-    # =========================================================================
-    # Single-record methods (giữ lại cho backward compatibility)
-    # =========================================================================
-
-    async def get_current_imei(self, msisdn: str) -> Optional[str]:
-        assert self.pool is not None
-        async with self.pool.acquire() as conn:
-            val = await conn.fetchval(
-                "SELECT imei_current FROM msisdn_device WHERE msisdn = $1",
-                msisdn
-            )
-            return val
-
-    async def upsert_device_state(self, msisdn: str, imei_new: str) -> None:
-        assert self.pool is not None
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO msisdn_device (msisdn, imei_current, updated_at)
-                VALUES ($1, $2, NOW())
-                ON CONFLICT (msisdn)
-                DO UPDATE SET imei_current = EXCLUDED.imei_current, updated_at = NOW()
-                """,
-                msisdn, imei_new
-            )
-
-    async def record_device_swap_history(
-        self, msisdn: str, imei_old: Optional[str], imei_new: str, changed_at
-    ) -> None:
-        assert self.pool is not None
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO device_swap_history (msisdn, imei_old, imei_new, changed_at)
-                VALUES ($1, $2, $3, $4)
-                """,
-                msisdn, imei_old, imei_new, changed_at
-            )
-
-    async def get_current_imsi(self, msisdn: str) -> Optional[str]:
-        assert self.pool is not None
-        async with self.pool.acquire() as conn:
-            val = await conn.fetchval(
-                "SELECT imsi_current FROM msisdn_sim WHERE msisdn = $1",
-                msisdn
-            )
-            return val
-
-    async def upsert_sim_state(self, msisdn: str, imsi_new: str) -> None:
-        assert self.pool is not None
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO msisdn_sim (msisdn, imsi_current, updated_at)
-                VALUES ($1, $2, NOW())
-                ON CONFLICT (msisdn)
-                DO UPDATE SET imsi_current = EXCLUDED.imsi_current, updated_at = NOW()
-                """,
-                msisdn, imsi_new
-            )
-
-    async def record_sim_swap_history(
-        self, msisdn: str, imsi_old: Optional[str], imsi_new: str, changed_at
-    ) -> None:
-        assert self.pool is not None
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO sim_swap_history (msisdn, imsi_old, imsi_new, changed_at)
-                VALUES ($1, $2, $3, $4)
-                """,
-                msisdn, imsi_old, imsi_new, changed_at
-            )
-
-    async def get_active_subscriptions(self, msisdn: str, event_type: str) -> List[Dict[str, Any]]:
-        assert self.pool is not None
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT subscription_id, msisdn, event_type, callback_url, expires_at
-                FROM subscription
-                WHERE msisdn = $1 AND event_type = $2 AND status = 'ACTIVE'
-                  AND (expires_at IS NULL OR expires_at > NOW())
-                """,
-                msisdn, event_type
-            )
-            return [dict(r) for r in rows]
-
-    async def insert_audit_log(self, event_type: str, msisdn: Optional[str], details: Dict[str, Any]) -> None:
-        assert self.pool is not None
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO audit_log (event_type, msisdn, details)
-                VALUES ($1, $2, $3::jsonb)
-                """,
-                event_type, msisdn, json.dumps(details)
-            )
-
-    async def insert_notification_log(
-        self, subscription_id: Any, event_type: str, payload: Dict[str, Any], status: str = "PENDING"
-    ) -> int:
-        assert self.pool is not None
-        async with self.pool.acquire() as conn:
-            log_id = await conn.fetchval(
-                """
-                INSERT INTO notification_log (subscription_id, event_type, payload, status, attempts, last_attempt_at)
-                VALUES ($1, $2, $3::jsonb, $4, 1, NOW())
-                RETURNING id
-                """,
-                subscription_id, event_type, json.dumps(payload), status
-            )
-            return log_id
-
-    # =========================================================================
-    # 
-    # =========================================================================
-
-    async def batch_get_current_imei(self, msisdns: List[str]) -> Dict[str, Optional[str]]:
-        """Batch lookup IMEI hiện tại cho danh sách MSISDN. Returns {msisdn: imei_or_None}."""
-        assert self.pool is not None
-        result: Dict[str, Optional[str]] = {m: None for m in msisdns}
+    async def _fetch_state(
+        self, table: str, value_column: str, msisdns: Sequence[str]
+    ) -> Dict[str, Dict[str, Any]]:
         if not msisdns:
-            return result
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT msisdn, imei_current FROM msisdn_device WHERE msisdn = ANY($1::text[])",
-                msisdns
-            )
-            for r in rows:
-                result[r["msisdn"]] = r["imei_current"]
-        return result
-
-    async def batch_upsert_device_state(self, records: List[Tuple[str, str]]) -> None:
-        """Batch UPSERT (msisdn, imei_new) vào msisdn_device."""
-        if not records:
-            return
+            return {}
         assert self.pool is not None
-        async with self.pool.acquire() as conn:
-            await conn.executemany(
-                """
-                INSERT INTO msisdn_device (msisdn, imei_current, updated_at)
-                VALUES ($1, $2, NOW())
-                ON CONFLICT (msisdn)
-                DO UPDATE SET imei_current = EXCLUDED.imei_current, updated_at = NOW()
-                """,
-                records
-            )
+        query = f"""
+            SELECT msisdn, {value_column} AS value, last_event_at, last_event_id,
+                   last_source_partition, last_source_offset
+            FROM {table}
+            WHERE msisdn = ANY($1::text[])
+        """
+        async with self.pool.acquire(timeout=3) as connection:
+            rows = await connection.fetch(query, list(msisdns))
+        return {row["msisdn"]: dict(row) for row in rows}
 
-    async def batch_insert_device_swap_history(self, records: List[tuple]) -> None:
-        """Batch INSERT vào device_swap_history. records: [(msisdn, imei_old, imei_new, changed_at), ...]"""
-        if not records:
-            return
-        assert self.pool is not None
-        async with self.pool.acquire() as conn:
-            await conn.copy_records_to_table(
-                "device_swap_history",
-                records=records,
-                columns=["msisdn", "imei_old", "imei_new", "changed_at"],
-            )
+    async def batch_get_device_state(self, msisdns: Sequence[str]):
+        return await self._fetch_state("msisdn_device", "imei_current", msisdns)
 
-    async def batch_get_current_imsi(self, msisdns: List[str]) -> Dict[str, Optional[str]]:
-        """Batch lookup IMSI hiện tại cho danh sách MSISDN. Returns {msisdn: imsi_or_None}."""
-        assert self.pool is not None
-        result: Dict[str, Optional[str]] = {m: None for m in msisdns}
-        if not msisdns:
-            return result
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT msisdn, imsi_current FROM msisdn_sim WHERE msisdn = ANY($1::text[])",
-                msisdns
-            )
-            for r in rows:
-                result[r["msisdn"]] = r["imsi_current"]
-        return result
+    async def batch_get_sim_state(self, msisdns: Sequence[str]):
+        return await self._fetch_state("msisdn_sim", "imsi_current", msisdns)
 
-    async def batch_upsert_sim_state(self, records: List[Tuple[str, str]]) -> None:
-        """Batch UPSERT (msisdn, imsi_new) vào msisdn_sim."""
-        if not records:
-            return
-        assert self.pool is not None
-        async with self.pool.acquire() as conn:
-            await conn.executemany(
-                """
-                INSERT INTO msisdn_sim (msisdn, imsi_current, updated_at)
-                VALUES ($1, $2, NOW())
-                ON CONFLICT (msisdn)
-                DO UPDATE SET imsi_current = EXCLUDED.imsi_current, updated_at = NOW()
-                """,
-                records
-            )
-
-    async def batch_insert_sim_swap_history(self, records: List[tuple]) -> None:
-        """Batch INSERT vào sim_swap_history. records: [(msisdn, imsi_old, imsi_new, changed_at), ...]"""
-        if not records:
-            return
-        assert self.pool is not None
-        async with self.pool.acquire() as conn:
-            await conn.copy_records_to_table(
-                "sim_swap_history",
-                records=records,
-                columns=["msisdn", "imsi_old", "imsi_new", "changed_at"],
-            )
-
-    async def batch_insert_audit_logs(self, records: List[Tuple[str, Optional[str], str]]) -> None:
-        """Batch INSERT vào audit_log. records: [(event_type, msisdn, details_json_str), ...]"""
-        if not records:
-            return
-        assert self.pool is not None
-        async with self.pool.acquire() as conn:
-            await conn.executemany(
-                """
-                INSERT INTO audit_log (event_type, msisdn, details)
-                VALUES ($1, $2, $3::jsonb)
-                """,
-                records
-            )
-
-    # =========================================================================
-    #  ATOMIC BATCH methods — single transaction for consistency
-    # =========================================================================
-
-    async def commit_sim_swap_batch(
+    async def _upsert_state(
         self,
-        upserts: List[Tuple[str, str]],
-        history: List[tuple],
-        audit: List[Tuple[str, Optional[str], str]],
-        notification_records: Optional[List[tuple]] = None,
+        connection: asyncpg.Connection,
+        table: str,
+        value_column: str,
+        records: Sequence[StateRecord],
     ) -> None:
+        if not records:
+            return
+        query = f"""
+            INSERT INTO {table}(
+                msisdn, {value_column}, updated_at, last_event_at, last_event_id,
+                last_source_partition, last_source_offset
+            )
+            SELECT msisdn, value, NOW(), event_time, event_id, partition, offset_value
+            FROM UNNEST(
+                $1::text[], $2::text[], $3::timestamptz[], $4::text[],
+                $5::int[], $6::bigint[]
+            ) incoming(msisdn, value, event_time, event_id, partition, offset_value)
+            ON CONFLICT(msisdn) DO UPDATE SET
+                {value_column}=EXCLUDED.{value_column}, updated_at=NOW(),
+                last_event_at=EXCLUDED.last_event_at,
+                last_event_id=EXCLUDED.last_event_id,
+                last_source_partition=EXCLUDED.last_source_partition,
+                last_source_offset=EXCLUDED.last_source_offset
+            WHERE (EXCLUDED.last_event_at, EXCLUDED.last_source_partition,
+                   EXCLUDED.last_source_offset)
+                > ({table}.last_event_at, {table}.last_source_partition,
+                   {table}.last_source_offset)
         """
-        F-02: Ghi atomic: state (msisdn_sim) + history (sim_swap_history) + audit_log
-        + notification_log trong CÙNG một transaction. Nếu bất kỳ bước nào lỗi,
-        toàn bộ rollback — không bao giờ để state mới tồn tại mà thiếu history tương ứng.
-        """
-        assert self.pool is not None
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                if upserts:
-                    await conn.executemany(
-                        """
-                        INSERT INTO msisdn_sim (msisdn, imsi_current, updated_at)
-                        VALUES ($1, $2, NOW())
-                        ON CONFLICT (msisdn)
-                        DO UPDATE SET imsi_current = EXCLUDED.imsi_current, updated_at = NOW()
-                        """,
-                        upserts
-                    )
-                if history:
-                    await conn.copy_records_to_table(
-                        "sim_swap_history",
-                        records=history,
-                        columns=["msisdn", "imsi_old", "imsi_new", "changed_at"],
-                    )
-                if audit:
-                    await conn.executemany(
-                        """
-                        INSERT INTO audit_log (event_type, msisdn, details)
-                        VALUES ($1, $2, $3::jsonb)
-                        """,
-                        audit
-                    )
-                # F-03: Ghi notification_log PENDING trong cùng transaction
-                if notification_records:
-                    for sub_id, event_type, payload_json in notification_records:
-                        await conn.execute(
-                            """
-                            INSERT INTO notification_log
-                                (subscription_id, event_type, payload, status, attempts)
-                            VALUES ($1, $2, $3::jsonb, 'PENDING', 0)
-                            """,
-                            sub_id, event_type, payload_json,
-                        )
+        columns = list(zip(*records))
+        await connection.execute(query, *(list(column) for column in columns))
 
-    async def commit_device_swap_batch(
-        self,
-        upserts: List[Tuple[str, str]],
-        history: List[tuple],
-        audit: List[Tuple[str, Optional[str], str]],
-        notification_records: Optional[List[tuple]] = None,
+    @staticmethod
+    async def _insert_history(
+        connection: asyncpg.Connection,
+        table: str,
+        old_column: str,
+        new_column: str,
+        records: Sequence[HistoryRecord],
     ) -> None:
-        """
-        F-02: Ghi atomic: state (msisdn_device) + history (device_swap_history) + audit_log
-        + notification_log trong CÙNG một transaction.
-        """
+        if records:
+            await connection.executemany(
+                f"""
+                INSERT INTO {table}(
+                    event_id, source_topic, source_partition, source_offset,
+                    msisdn, {old_column}, {new_column}, changed_at
+                ) VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+                ON CONFLICT(event_id) DO NOTHING
+                """,
+                records,
+            )
+
+    @staticmethod
+    async def _insert_audit(
+        connection: asyncpg.Connection, records: Sequence[AuditRecord]
+    ) -> None:
+        if records:
+            await connection.executemany(
+                """
+                INSERT INTO audit_log(event_id,event_type,msisdn,details,event_time)
+                VALUES($1,$2,$3,$4::jsonb,$5)
+                ON CONFLICT(event_id,event_type) DO NOTHING
+                """,
+                records,
+            )
+
+    @staticmethod
+    async def _insert_outbox(
+        connection: asyncpg.Connection, events: Sequence[OutboxEvent]
+    ) -> None:
+        if not events:
+            return
+        await connection.executemany(
+            """
+            INSERT INTO notification_log(
+                event_id, subscription_id, event_type, payload, status,
+                attempts, next_retry_at
+            )
+            SELECT $1, subscription_id, $2, $4::jsonb, 'PENDING', 0, NOW()
+            FROM subscription
+            WHERE msisdn=$3 AND event_type=$2 AND status='ACTIVE'
+              AND (expires_at IS NULL OR expires_at > NOW())
+            ON CONFLICT(event_id, subscription_id) DO NOTHING
+            """,
+            events,
+        )
+
+    async def _persist_swap_batch(
+        self,
+        table: str,
+        value_column: str,
+        history_table: str,
+        old_column: str,
+        new_column: str,
+        states: Sequence[StateRecord],
+        history: Sequence[HistoryRecord],
+        audit: Sequence[AuditRecord],
+        outbox: Sequence[OutboxEvent],
+    ) -> None:
         assert self.pool is not None
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                if upserts:
-                    await conn.executemany(
-                        """
-                        INSERT INTO msisdn_device (msisdn, imei_current, updated_at)
-                        VALUES ($1, $2, NOW())
-                        ON CONFLICT (msisdn)
-                        DO UPDATE SET imei_current = EXCLUDED.imei_current, updated_at = NOW()
-                        """,
-                        upserts
+        async with self.pool.acquire(timeout=3) as connection:
+            async with connection.transaction():
+                await self._upsert_state(connection, table, value_column, states)
+                await self._insert_history(
+                    connection, history_table, old_column, new_column, history
+                )
+                await self._insert_audit(connection, audit)
+                await self._insert_outbox(connection, outbox)
+
+    async def persist_sim_batch(self, states, history, audit, outbox) -> None:
+        await self._persist_swap_batch(
+            "msisdn_sim", "imsi_current", "sim_swap_history", "imsi_old",
+            "imsi_new", states, history, audit, outbox
+        )
+
+    async def persist_device_batch(self, states, history, audit, outbox) -> None:
+        await self._persist_swap_batch(
+            "msisdn_device", "imei_current", "device_swap_history", "imei_old",
+            "imei_new", states, history, audit, outbox
+        )
+
+    async def persist_session_batch(self, records: Sequence[SessionRecord]) -> None:
+        if not records:
+            return
+        assert self.pool is not None
+        columns = list(zip(*records))
+        async with self.pool.acquire(timeout=3) as connection:
+            await connection.execute(
+                """
+                INSERT INTO radius_session_state(
+                    acct_session_id,msisdn,nas_identifier,active,last_event_at,
+                    last_event_id,source_partition,source_offset,updated_at
+                )
+                SELECT session_id,msisdn,nas,active,event_time,event_id,
+                       partition,offset_value,NOW()
+                FROM UNNEST(
+                    $1::text[],$2::text[],$3::text[],$4::boolean[],
+                    $5::timestamptz[],$6::text[],$7::int[],$8::bigint[]
+                ) incoming(session_id,msisdn,nas,active,event_time,event_id,
+                           partition,offset_value)
+                ON CONFLICT(acct_session_id) DO UPDATE SET
+                    msisdn=EXCLUDED.msisdn,nas_identifier=EXCLUDED.nas_identifier,
+                    active=EXCLUDED.active,last_event_at=EXCLUDED.last_event_at,
+                    last_event_id=EXCLUDED.last_event_id,
+                    source_partition=EXCLUDED.source_partition,
+                    source_offset=EXCLUDED.source_offset,updated_at=NOW()
+                WHERE (EXCLUDED.last_event_at,EXCLUDED.source_partition,
+                       EXCLUDED.source_offset)
+                    > (radius_session_state.last_event_at,
+                       radius_session_state.source_partition,
+                       radius_session_state.source_offset)
+                """,
+                *(list(column) for column in columns),
+            )
+
+    async def mark_nas_sessions_inactive(
+        self, nas_identifier: str, event_time: datetime
+    ) -> None:
+        assert self.pool is not None
+        async with self.pool.acquire(timeout=3) as connection:
+            await connection.execute(
+                """
+                UPDATE radius_session_state
+                SET active=FALSE,last_event_at=$2,updated_at=NOW()
+                WHERE nas_identifier=$1 AND active AND last_event_at <= $2
+                """,
+                nas_identifier,
+                event_time,
+            )
+
+    async def recover_stale_notifications(self) -> None:
+        assert self.pool is not None
+        async with self.pool.acquire(timeout=3) as connection:
+            await connection.execute(
+                """
+                UPDATE notification_log
+                SET status='FAILED',locked_at=NULL,next_retry_at=NOW(),
+                    error_detail='recovered stale claim'
+                WHERE status='IN_PROGRESS'
+                  AND locked_at < NOW() - INTERVAL '5 minutes'
+                """
+            )
+
+    async def claim_notifications(self, limit: int) -> List[Dict[str, Any]]:
+        assert self.pool is not None
+        async with self.pool.acquire(timeout=3) as connection:
+            async with connection.transaction():
+                rows = await connection.fetch(
+                    """
+                    WITH picked AS (
+                        SELECT nl.id
+                        FROM notification_log nl
+                        WHERE nl.status IN ('PENDING','FAILED')
+                          AND (nl.next_retry_at IS NULL OR nl.next_retry_at <= NOW())
+                        ORDER BY nl.created_at
+                        FOR UPDATE SKIP LOCKED LIMIT $1
                     )
-                if history:
-                    await conn.copy_records_to_table(
-                        "device_swap_history",
-                        records=history,
-                        columns=["msisdn", "imei_old", "imei_new", "changed_at"],
-                    )
-                if audit:
-                    await conn.executemany(
-                        """
-                        INSERT INTO audit_log (event_type, msisdn, details)
-                        VALUES ($1, $2, $3::jsonb)
-                        """,
-                        audit
-                    )
-                # F-03: Ghi notification_log PENDING trong cùng transaction
-                if notification_records:
-                    for sub_id, event_type, payload_json in notification_records:
-                        await conn.execute(
-                            """
-                            INSERT INTO notification_log
-                                (subscription_id, event_type, payload, status, attempts)
-                            VALUES ($1, $2, $3::jsonb, 'PENDING', 0)
-                            """,
-                            sub_id, event_type, payload_json,
-                        )
+                    UPDATE notification_log nl
+                    SET status='IN_PROGRESS',locked_at=NOW(),attempts=attempts+1
+                    FROM picked, subscription s
+                    WHERE nl.id=picked.id AND s.subscription_id=nl.subscription_id
+                    RETURNING nl.id,nl.event_id,nl.payload,nl.attempts,s.callback_url
+                    """,
+                    limit,
+                )
+        return [dict(row) for row in rows]
+
+    async def mark_notification_sent(self, notification_id: int) -> None:
+        await self._update_notification(
+            notification_id,
+            "status='SENT',last_attempt_at=NOW(),locked_at=NULL,error_detail=NULL",
+        )
+
+    async def mark_notification_failed(
+        self, notification_id: int, attempts: int, max_attempts: int, error: str
+    ) -> None:
+        assert self.pool is not None
+        status = "DEAD" if attempts >= max_attempts else "FAILED"
+        delay = min(2 ** max(attempts, 1), 300)
+        async with self.pool.acquire(timeout=3) as connection:
+            await connection.execute(
+                """
+                UPDATE notification_log
+                SET status=$2,last_attempt_at=NOW(),locked_at=NULL,
+                    next_retry_at=NOW()+($3*INTERVAL '1 second'),error_detail=$4
+                WHERE id=$1
+                """,
+                notification_id,
+                status,
+                delay,
+                error[:2000],
+            )
+
+    async def _update_notification(self, notification_id: int, assignment: str) -> None:
+        assert self.pool is not None
+        async with self.pool.acquire(timeout=3) as connection:
+            await connection.execute(
+                f"UPDATE notification_log SET {assignment} WHERE id=$1",
+                notification_id,
+            )

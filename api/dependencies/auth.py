@@ -16,13 +16,16 @@ Lưu ý (Quyết định Lab #10):
     theo CAMARA OIDC profile.
 """
 
+import secrets
+from typing import Optional
+
 from fastapi import Header, HTTPException, status
 from api.config import settings
 
 
 async def verify_api_key(
-    x_api_key: str = Header(
-        ...,
+    x_api_key: Optional[str] = Header(
+        None,
         alias="X-API-Key",
         description="API Key xác thực. Lấy từ env var API_KEY.",
     )
@@ -42,7 +45,7 @@ async def verify_api_key(
               bằng HTTPException 401 để khớp CAMARA error convention.
             - Key sai: raise 401 với WWW-Authenticate header.
     """
-    if x_api_key != settings.api_key:
+    if x_api_key is None or not secrets.compare_digest(x_api_key, settings.api_key):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={
