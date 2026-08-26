@@ -67,11 +67,32 @@ def fetch_metrics():
             except Exception:
                 pass
 
-        # 3. Đo lường Thông lượng Performance (rec/s)
-        producer_throughput = 19150     # Producer Ingestion (CSV -> Kafka)
-        processing_throughput = 15400   # Consumer Parsing & Stream Evaluation
-        db_write_throughput = 9800      # PostgreSQL & Redis State Write Rate
-        overall_throughput = 12625      # End-to-End Average Pipeline Throughput
+        # F-QR-FIX: throughput trước đây là literal cứng (19150/15400/9800/12625),
+        # không phản ánh lần chạy thực tế nào. Tính từ khoảng thời gian thật giữa
+        # bản ghi audit_log đầu tiên và cuối cùng (proxy cho thời gian pipeline
+        # thực sự chạy) chia cho tổng số event đã xử lý.
+        cur.execute(
+            "SELECT MIN(created_at) AS first_ts, MAX(created_at) AS last_ts, COUNT(*) AS n "
+            "FROM audit_log;"
+        )
+        window = cur.fetchone()
+        total_events = sim_swap_count + device_swap_count
+        duration_seconds = None
+        if window and window["first_ts"] and window["last_ts"]:
+            duration_seconds = (window["last_ts"] - window["first_ts"]).total_seconds()
+
+        if duration_seconds and duration_seconds > 0 and total_events > 0:
+            overall_throughput = round(total_events / duration_seconds, 1)
+        else:
+            # Không đủ dữ liệu để tính (0-1 event, hoặc audit_log rỗng) — báo rõ
+            # là "không xác định", KHÔNG bịa số để tránh đánh lừa báo cáo go-live.
+            overall_throughput = None
+        # Không có điểm đo riêng cho từng giai đoạn (producer/consumer/db) trong
+        # schema hiện tại -> không hiển thị số giả cho 3 mục này, chỉ hiển thị
+        # overall_throughput (thực đo) hoặc None nếu chưa đủ dữ liệu.
+        producer_throughput = None
+        processing_throughput = None
+        db_write_throughput = None
 
         sim_rate = round((sim_swap_count / max(total_input_records, 1)) * 100, 3)
         device_rate = round((device_swap_count / max(total_input_records, 1)) * 100, 3)
@@ -137,9 +158,16 @@ def fetch_metrics():
             "counts": [0]
         }
 
+        metrics['_data_source'] = "live"
+
     except Exception as e:
         print(f"Error gathering metrics from Postgres: {e}")
         metrics = get_mock_metrics()
+        # F-QR-FIX: trước đây fallback này hoàn toàn im lặng — báo cáo hiển thị
+        # số liệu giả (1250 IMEI, 3120 duplicate...) không khác gì số thật, có thể
+        # bị hiểu nhầm là kết quả go-live thật. Đánh dấu rõ ràng để template cảnh báo.
+        metrics['_data_source'] = "mock_fallback"
+        metrics['_data_source_error'] = str(e)
     finally:
         cur.close()
         conn.close()
@@ -149,7 +177,12 @@ def fetch_metrics():
 def get_mock_metrics():
     """Fallback mock dữ liệu mẫu chuẩn cấu trúc để test report không bị crash."""
     return {
-        "overview": {"total_records": 125000, "execution_time": "45 seconds", "throughput": 2777.78, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
+        "overview": {
+            "total_records": 125000, "execution_time": "45 seconds", "overall_throughput": None,
+            "subscribers_count": 0, "sim_swap_count": 0, "device_swap_count": 0,
+            "audit_count": 0, "notification_count": 0,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        },
         "imei": {"total": 1250, "rate": 1.0, "luhn_fail": 850, "tac_unknown": 400},
         "duplicate": {"total": 3120, "rate": 2.5, "hourly_labels": ["08h", "09h", "10h", "11h"], "hourly_data": [500, 1200, 920, 500]},
         "conflict": {"total": 450, "rate": 0.36, "type_a": 200, "type_b": 150, "type_c": 100},

@@ -14,7 +14,7 @@ x-pipeline-environment: &pipeline-environment
   KAFKA_TOPIC_RAW: radius.accounting.raw
   REDIS_HOST: camara-redis
   REDIS_PORT: "6379"
-  DATABASE_URL: postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-camara}@camara-postgres:5432/${DB_NAME:-camara_db}
+  DATABASE_URL: postgresql://${POSTGRES_LOCAL_USER:-postgres}:${POSTGRES_LOCAL_PASSWORD:-camara}@camara-postgres:5432/${POSTGRES_LOCAL_DB:-camara_db}
   DB_POOL_MIN: "2"
   DB_POOL_MAX: "12"
 
@@ -72,13 +72,13 @@ services:
     command: ["postgres", "-c", "synchronous_commit=on", "-c", "max_connections=120", "-c", "shared_buffers=512MB", "-c", "effective_cache_size=1536MB", "-c", "work_mem=8MB", "-c", "max_wal_size=2GB", "-c", "checkpoint_timeout=15min"]
     networks: [camara-network]
     environment:
-      POSTGRES_USER: ${DB_USER:-postgres}
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-camara}
-      POSTGRES_DB: ${DB_NAME:-camara_db}
+      POSTGRES_USER: ${POSTGRES_LOCAL_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_LOCAL_PASSWORD:-camara}
+      POSTGRES_DB: ${POSTGRES_LOCAL_DB:-camara_db}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-camara_db}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_LOCAL_USER:-postgres} -d ${POSTGRES_LOCAL_DB:-camara_db}"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -125,7 +125,7 @@ services:
     ports:
       - "8000:8000"
     environment:
-      DATABASE_URL: postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-camara}@camara-postgres:5432/${DB_NAME:-camara_db}
+      DATABASE_URL: postgresql://${POSTGRES_LOCAL_USER:-postgres}:${POSTGRES_LOCAL_PASSWORD:-camara}@camara-postgres:5432/${POSTGRES_LOCAL_DB:-camara_db}
       DB_POOL_SIZE: "10"
       ENVIRONMENT: ${ENVIRONMENT:-development}
       API_KEY: ${API_KEY:-dev-secret}
@@ -155,6 +155,10 @@ services:
       <<: *pipeline-environment
       METRICS_PORT: "9200"
       KAFKA_TOPIC_PARTITIONS: "8"
+      BATCH_MAX_RECORDS: ${BATCH_MAX_RECORDS:-4000}
+      BATCH_TIMEOUT_MS: ${BATCH_TIMEOUT_MS:-20}
+      PROCESSING_PARTITION_CONCURRENCY: ${PROCESSING_PARTITION_CONCURRENCY:-2}
+      THROUGHPUT_LOG_INTERVAL_SECONDS: ${THROUGHPUT_LOG_INTERVAL_SECONDS:-10}
     command: ["python", "-m", "pipeline.run_pipeline"]
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:9200/metrics >/dev/null"]
@@ -180,7 +184,14 @@ services:
     environment:
       <<: *pipeline-environment
       RADIUS_SHARED_SECRET: ${RADIUS_SHARED_SECRET:-camara-radius-dev-secret}
+      THROUGHPUT_LOG_INTERVAL_SECONDS: ${THROUGHPUT_LOG_INTERVAL_SECONDS:-10}
+      RADIUS_UDP_RECEIVE_BUFFER_BYTES: ${RADIUS_UDP_RECEIVE_BUFFER_BYTES:-16777216}
+      RADIUS_UDP_QUEUE_MAX_RECORDS: ${RADIUS_UDP_QUEUE_MAX_RECORDS:-20000}
+      RADIUS_UDP_KAFKA_BATCH_RECORDS: ${RADIUS_UDP_KAFKA_BATCH_RECORDS:-500}
+      RADIUS_UDP_KAFKA_BATCH_WAIT_MS: ${RADIUS_UDP_KAFKA_BATCH_WAIT_MS:-2}
+      RADIUS_UDP_KAFKA_MAX_INFLIGHT_BATCHES: ${RADIUS_UDP_KAFKA_MAX_INFLIGHT_BATCHES:-8}
     command: ["python", "-m", "pipeline.ingestion.producer", "--udp", "--port", "1813"]
+    stop_grace_period: 30s
     mem_limit: 512m
 
   notification-dispatcher:

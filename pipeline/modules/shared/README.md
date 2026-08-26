@@ -94,8 +94,4 @@ sự gọi `send_callback`-tương-đương. Xem chi tiết dispatcher ở
 
 File `sim_swap/notifier.py` và `device_swap/notifier.py` chỉ còn là stub log cảnh báo
 deprecated — giữ lại cho tương thích ngược, an toàn để xoá sau khi xác nhận dispatcher chạy
-<<<<<<< ours
 ổn định.
-=======
-ổn định.
->>>>>>> theirs

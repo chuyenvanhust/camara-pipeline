@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 import redis.asyncio as aioredis
 
@@ -94,6 +94,42 @@ class IPMappingStore:
         result = await self.redis.eval(DELETE_LUA, 1, self._ip_key(framed_ip),
                                        framed_ip, msisdn, event_time.timestamp(), partition, offset)
         return bool(result)
+
+    async def apply_batch(self, operations: List[Dict[str, Any]],
+                          ttl: int = SESSION_TTL_SECONDS) -> int:
+        """Apply ordered Start/Interim/Stop operations in one Redis round trip.
+
+        Each Lua invocation remains atomic. A non-transactional pipeline only batches
+        network I/O; Redis still executes commands in the original Kafka offset order.
+        """
+        if not operations:
+            return 0
+        async with self.redis.pipeline(transaction=False) as pipe:
+            for operation in operations:
+                framed_ip = operation["framed_ip"]
+                event_time = operation["event_time"]
+                if operation["kind"] == "upsert":
+                    nas = operation.get("nas_identifier") or ""
+                    epoch = event_time.timestamp()
+                    payload = json.dumps({
+                        "msisdn": operation["msisdn"], "nas_identifier": nas,
+                        "event_timestamp": event_time.isoformat(), "event_epoch": epoch,
+                        "event_id": operation["event_id"],
+                        "source_partition": operation["partition"],
+                        "source_offset": operation["offset"],
+                    })
+                    pipe.eval(
+                        UPSERT_LUA, 1, self._ip_key(framed_ip), framed_ip, nas, epoch,
+                        operation["partition"], operation["offset"], payload, ttl,
+                    )
+                else:
+                    pipe.eval(
+                        DELETE_LUA, 1, self._ip_key(framed_ip), framed_ip,
+                        operation["msisdn"], event_time.timestamp(),
+                        operation["partition"], operation["offset"],
+                    )
+            results = await pipe.execute()
+        return sum(bool(result) for result in results)
 
     async def accounting_off(self, nas_identifier: str, event_time: datetime,
                              chunk_size: int = 500) -> int:

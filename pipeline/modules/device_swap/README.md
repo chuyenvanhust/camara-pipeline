@@ -62,8 +62,4 @@ batch được xử lý theo từng giai đoạn thay vì lặp tuần tự gọ
   cho hiệu năng cao khi batch lớn.
 - `audit_log` — audit chung toàn hệ thống, chỉ ghi khi thực sự có swap (không ghi cho lần đầu
   gặp MSISDN).
-<<<<<<< ours
 - `notification_log` — outbox, xem `../shared/README.md`.
-=======
-- `notification_log` — outbox, xem `../shared/README.md`.
->>>>>>> theirs

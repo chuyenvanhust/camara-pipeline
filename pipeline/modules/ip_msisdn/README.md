@@ -53,8 +53,4 @@ Redis là single-threaded, latency network dồn lại nhanh nếu gọi tuần 
   `NAS-Identifier`/`NAS_Identifier`/`nas_identifier` — do dữ liệu simulator và dữ liệu CSV
   thật có thể khác convention đặt tên.
 - Không có audit log hay history table cho module này — nếu sau này cần truy vết lịch sử IP
-<<<<<<< ours
   (ví dụ phục vụ điều tra), cần bổ sung bảng Postgres tương tự `device_swap_history`.
-=======
-  (ví dụ phục vụ điều tra), cần bổ sung bảng Postgres tương tự `device_swap_history`.
->>>>>>> theirs

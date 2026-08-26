@@ -52,7 +52,9 @@ class SimSwapConsumer(BaseKafkaConsumer):
             return
 
         state = await self._load_state(list({item[1] for item in parsed}))
-        states, history, audit, outbox = [], [], [], []
+        # F-BATCH-DUP-FIX: xem giải thích trong device_swap/consumer.py
+        states_by_msisdn: Dict[str, tuple] = {}
+        history, audit, outbox = [], [], []
         cache_updates: Dict[str, str] = {}
         for record, msisdn, imsi_new, occurred_at in parsed:
             eid = event_id(record)
@@ -62,7 +64,7 @@ class SimSwapConsumer(BaseKafkaConsumer):
                 self.metrics.increment("ignored")
                 continue
             imsi_old = previous.get("value", previous.get("imsi_current")) if previous else None
-            states.append((msisdn, imsi_new, occurred_at, eid, record.partition, record.offset))
+            states_by_msisdn[msisdn] = (msisdn, imsi_new, occurred_at, eid, record.partition, record.offset)
             current = {"imsi_current": imsi_new, "last_event_at": occurred_at, "last_event_id": eid,
                        "last_source_partition": record.partition, "last_source_offset": record.offset}
             state[msisdn] = current
@@ -73,13 +75,15 @@ class SimSwapConsumer(BaseKafkaConsumer):
             details = json.dumps({"imsi_old": imsi_old, "imsi_new": imsi_new, "last_time_sim_change": occurred_at.isoformat()})
             history.append((eid, record.topic, record.partition, record.offset, msisdn, imsi_old, imsi_new, occurred_at))
             audit.append((eid, "SIM_SWAP", msisdn, details, occurred_at))
-            outbox.append((eid, "SIM_SWAP", msisdn, details, occurred_at))
+            outbox.append((eid, "SIM_SWAP", msisdn, details))
             self.metrics.increment("events_detected")
 
-        await self.db.persist_sim_batch(states, history, audit, outbox)
+        await self.db.persist_sim_batch(list(states_by_msisdn.values()), history, audit, outbox)
+        self.metrics.increment("postgres_records", len(states_by_msisdn))
         if cache_updates:
             assert self.redis is not None
             await self.redis.mset(cache_updates)
+            self.metrics.increment("redis_records", len(cache_updates))
         self.metrics.increment("success", len(parsed))
 
 

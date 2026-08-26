@@ -1,26 +1,20 @@
 # api/
 
-Ba CAMARA Network API endpoint được xây dựng bằng FastAPI,
-query trực tiếp từ PostgreSQL storage layer.
+Ba CAMARA Network API endpoint được xây dựng bằng FastAPI, query trực tiếp từ PostgreSQL storage layer.
 
 ## Files
 
 ```
 api/
-├── main.py                      # App factory, mount routers, exception handlers
-├── config.py                    # Settings từ env vars
+├── main.py                      # App factory, health, metrics mount
 ├── routers/
 │   ├── sim_swap.py              # POST /sim-swap/v0/check & retrieve-date
 │   ├── device_swap.py           # POST /device-swap/v0/check & retrieve-date
 │   ├── number_verification.py   # POST /number-verification/v0/verify
-│   └── health.py                # GET /health
+│   └── health.py                # GET /health (legacy)
 ├── schemas/
-│   ├── sim_swap.py              # Pydantic request/response cho SIM Swap
-│   ├── device_swap.py           # Pydantic request/response cho Device Swap
-│   ├── number_verification.py   # Pydantic request/response cho Number Verification
-│   └── common.py                # PhoneNumber (E.164), ErrorResponse, shared types
 └── dependencies/
-    ├── auth.py                  # API Key validation: header X-API-Key
+    ├── auth.py                  # X-API-Key validation
     └── database.py              # asyncpg connection pool
 ```
 
@@ -30,59 +24,55 @@ api/
 |--------|------|---------|------------|
 | POST | `/sim-swap/v0/check` | ≤ 200ms | Chính thức |
 | POST | `/sim-swap/v0/retrieve-date` | ≤ 200ms | Chính thức |
-| POST | `/device-swap/v0/check` | ≤ 200ms | Custom (xem ADR-005) |
-| POST | `/device-swap/v0/retrieve-date` | ≤ 200ms | Custom (xem ADR-005) |
+| POST | `/device-swap/v0/check` | ≤ 200ms | Custom (ADR-005) |
+| POST | `/device-swap/v0/retrieve-date` | ≤ 200ms | Custom (ADR-005) |
 | POST | `/number-verification/v0/verify` | ≤ 100ms | Chính thức |
-| GET | `/health` | — | — |
+| GET | `/health/live` | — | Liveness |
+| GET | `/health/ready` | — | Readiness (DB ping) |
+| GET | `/metrics` | — | Prometheus |
 
-Swagger UI: http://localhost:8000/docs  
-ReDoc: http://localhost:8000/redoc
+Swagger UI: http://localhost:8000/docs
 
 ## Authentication
 
-Tất cả endpoint (trừ `/health`) yêu cầu:
-```
-X-API-Key: <value của API_KEY trong .env>
-```
-
-Thiếu hoặc sai key → `401 Unauthorized`.
+Tất cả endpoint nghiệp vụ yêu cầu header `X-API-Key` khớp biến môi trường `API_KEY`.
 
 ## Query logic
 
 ### SIM Swap
+
 ```sql
-SELECT detected_at FROM swap_event
+SELECT changed_at AS confirmed_at
+FROM sim_swap_history
 WHERE msisdn = $1
-  AND swap_type = 'SIM_SWAP'
-  AND detected_at >= NOW() - INTERVAL '$2 days'
-ORDER BY detected_at DESC
+  AND changed_at >= NOW() - ($2 * INTERVAL '1 day')
+ORDER BY changed_at DESC
 LIMIT 1
 ```
-`check` trả `swapped: true` nếu có row. `retrieve-date` trả `latestSimChange`.
 
 ### Device Swap
-Cùng logic, `swap_type = 'DEVICE_SWAP'`, trả `latestDeviceChange`.
+
+Cùng pattern trên `device_swap_history`.
 
 ### Number Verification
+
 ```sql
 SELECT EXISTS (
-  SELECT 1 FROM radius_sessions
-  WHERE msisdn = $1
-    AND acct_status_type = 'Start'
-    AND event_timestamp >= NOW() - INTERVAL '24 hours'
-    AND NOT EXISTS (
-      SELECT 1 FROM radius_sessions s2
-      WHERE s2.acct_session_id = radius_sessions.acct_session_id
-        AND s2.acct_status_type = 'Stop'
-    )
-)
+    SELECT 1
+    FROM radius_session_state
+    WHERE msisdn = $1
+      AND active
+      AND last_event_at >= NOW() - INTERVAL '24 hours'
+) AS has_active_session
 ```
+
+Session state được cập nhật bởi consumer `cg-ip-msisdn` từ RADIUS Start/Stop/Accounting-Off.
 
 ## Chạy API server
 
 ```bash
-# Trong Docker (khuyến nghị)
-docker compose up api
+# Trong Docker (khuyến nghị — có --build)
+bash scripts/run.sh up
 
 # Local development
 uvicorn api.main:app --reload --port 8000

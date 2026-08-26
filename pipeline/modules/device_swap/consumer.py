@@ -52,7 +52,14 @@ class DeviceSwapConsumer(BaseKafkaConsumer):
             return
 
         state = await self._load_state(list({item[1] for item in parsed}))
-        states, history, audit, outbox = [], [], [], []
+        # F-BATCH-DUP-FIX: dict thay vì list — nếu CÙNG msisdn xuất hiện nhiều lần
+        # trong 1 batch (nhiều bản ghi RADIUS liên tiếp của cùng thuê bao), UPSERT
+        # nhiều dòng CÙNG msisdn trong 1 lệnh SQL sẽ bị Postgres từ chối
+        # ("ON CONFLICT DO UPDATE command cannot affect row a second time").
+        # records của process_batch luôn thuộc 1 partition, đã sắp theo offset,
+        # nên ghi đè theo thứ tự lặp = giữ lại đúng bản ghi MỚI NHẤT.
+        states_by_msisdn: Dict[str, tuple] = {}
+        history, audit, outbox = [], [], []
         cache_updates: Dict[str, str] = {}
         for record, msisdn, imei_new, occurred_at in parsed:
             eid = event_id(record)
@@ -62,7 +69,7 @@ class DeviceSwapConsumer(BaseKafkaConsumer):
                 self.metrics.increment("ignored")
                 continue
             imei_old = previous.get("value", previous.get("imei_current")) if previous else None
-            states.append((msisdn, imei_new, occurred_at, eid, record.partition, record.offset))
+            states_by_msisdn[msisdn] = (msisdn, imei_new, occurred_at, eid, record.partition, record.offset)
             current = {"imei_current": imei_new, "last_event_at": occurred_at, "last_event_id": eid,
                        "last_source_partition": record.partition, "last_source_offset": record.offset}
             state[msisdn] = current
@@ -73,13 +80,15 @@ class DeviceSwapConsumer(BaseKafkaConsumer):
             details = json.dumps({"imei_old": imei_old, "imei_new": imei_new, "event_time": occurred_at.isoformat()})
             history.append((eid, record.topic, record.partition, record.offset, msisdn, imei_old, imei_new, occurred_at))
             audit.append((eid, "DEVICE_SWAP", msisdn, details, occurred_at))
-            outbox.append((eid, "DEVICE_SWAP", msisdn, details, occurred_at))
+            outbox.append((eid, "DEVICE_SWAP", msisdn, details))
             self.metrics.increment("events_detected")
 
-        await self.db.persist_device_batch(states, history, audit, outbox)
+        await self.db.persist_device_batch(list(states_by_msisdn.values()), history, audit, outbox)
+        self.metrics.increment("postgres_records", len(states_by_msisdn))
         if cache_updates:
             assert self.redis is not None
             await self.redis.mset(cache_updates)
+            self.metrics.increment("redis_records", len(cache_updates))
         self.metrics.increment("success", len(parsed))
 
 

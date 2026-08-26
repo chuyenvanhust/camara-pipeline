@@ -29,6 +29,7 @@ class PacketReader:
         if not secret:
             raise ValueError("RADIUS_SHARED_SECRET is required")
         self.secret = secret.encode("utf-8")
+        self.stats = {"datagrams": 0, "decoded": 0, "rejected": 0}
 
     @staticmethod
     def _text(value: bytes) -> str:
@@ -103,16 +104,31 @@ class PacketReader:
         loop = asyncio.get_running_loop()
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        requested_buffer = int(os.getenv("RADIUS_UDP_RECEIVE_BUFFER_BYTES", str(16 * 1024 * 1024)))
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, requested_buffer)
+        actual_buffer = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
         sock.setblocking(False)
         sock.bind(("0.0.0.0", port))
-        logger.info("RADIUS listener ready on UDP/%d", port)
+        logger.info(
+            "RADIUS listener ready on UDP/%d receive_buffer_requested=%d receive_buffer_actual=%d",
+            port, requested_buffer, actual_buffer,
+        )
         try:
             while True:
                 packet, address = await loop.sock_recvfrom(sock, 4096)
+                self.stats["datagrams"] += 1
                 try:
-                    yield self.decode_radius(packet)
+                    decoded = self.decode_radius(packet)
+                    self.stats["decoded"] += 1
+                    yield decoded
                 except PacketDecodeError as exc:
-                    logger.warning("Rejected RADIUS packet from %s: %s", address, exc)
+                    self.stats["rejected"] += 1
+                    rejected = self.stats["rejected"]
+                    if rejected <= 5 or rejected % 1000 == 0:
+                        logger.warning(
+                            "Rejected RADIUS packet from %s: %s rejected_total=%d",
+                            address, exc, rejected,
+                        )
         finally:
             sock.close()
 

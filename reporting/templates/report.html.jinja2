@@ -21,6 +21,13 @@
         </div>
     </header>
 
+    {% if m._data_source == "mock_fallback" %}
+    <div class="bg-red-600 text-white text-center py-3 font-bold">
+        ⚠ CẢNH BÁO: Không kết nối được Postgres — toàn bộ số liệu bên dưới là DỮ LIỆU GIẢ (mock),
+        KHÔNG phản ánh lần chạy pipeline thật. Lỗi: {{ m._data_source_error }}
+    </div>
+    {% endif %}
+
     <main class="container mx-auto px-4 py-8">
 
         <!-- Overview Cards -->
@@ -49,28 +56,47 @@
 
         <!-- Pipeline Throughput Metrics -->
         <section class="bg-white p-6 rounded-lg shadow mb-8">
-            <h2 class="text-xl font-bold text-gray-800 mb-4">Pipeline Throughput & Performance Breakdown</h2>
+            <h2 class="text-xl font-bold text-gray-800 mb-4">Pipeline Throughput</h2>
+            <!-- F-QR-FIX: 3 thẻ Producer/Consumer/DB-write trước đây hiển thị số
+                 hard-code, không phản ánh đo lường thật (schema không lưu mốc thời
+                 gian riêng từng giai đoạn) -> đã bỏ, chỉ giữ 1 số ĐO ĐƯỢC THẬT:
+                 tổng event / khoảng thời gian giữa audit_log đầu-cuối. -->
+            <div class="grid grid-cols-1 md:grid-cols-1 gap-6 max-w-sm">
+                <div class="bg-purple-50 p-4 rounded border border-purple-100">
+                    <span class="text-xs text-purple-600 font-semibold uppercase">Overall Pipeline Average (đo từ audit_log)</span>
+                    <p class="text-2xl font-bold text-purple-900 mt-1">
+                        {% if m.overview.overall_throughput is not none %}
+                            {{ "{:,.1f}".format(m.overview.overall_throughput) }}
+                        {% else %}
+                            N/A (chưa đủ dữ liệu)
+                        {% endif %}
+                        <span class="text-sm font-normal text-purple-600">rec/s</span>
+                    </p>
+                    <p class="text-xs text-purple-400 mt-1">audit_log.created_at: first → last</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- Pipeline Throughput Metrics (old block removed) -->
+        <section class="hidden">
             <div class="grid grid-cols-1 md:grid-cols-4 gap-6">
                 <div class="bg-indigo-50 p-4 rounded border border-indigo-100">
                     <span class="text-xs text-indigo-600 font-semibold uppercase">1. Producer Ingestion Rate</span>
-                    <p class="text-2xl font-bold text-indigo-900 mt-1">{{ "{:,}".format(m.overview.producer_throughput) }} <span class="text-sm font-normal text-indigo-600">rec/s</span></p>
                     <p class="text-xs text-indigo-400 mt-1">CSV → Kafka `radius.raw`</p>
                 </div>
                 <div class="bg-blue-50 p-4 rounded border border-blue-100">
                     <span class="text-xs text-blue-600 font-semibold uppercase">2. Consumer Processing Rate</span>
-                    <p class="text-2xl font-bold text-blue-900 mt-1">{{ "{:,}".format(m.overview.processing_throughput) }} <span class="text-sm font-normal text-blue-600">rec/s</span></p>
                     <p class="text-xs text-blue-400 mt-1">Stream Evaluation & Parsing</p>
                 </div>
                 <div class="bg-green-50 p-4 rounded border border-green-100">
                     <span class="text-xs text-green-600 font-semibold uppercase">3. Postgres / Redis Write Rate</span>
-                    <p class="text-2xl font-bold text-green-900 mt-1">{{ "{:,}".format(m.overview.db_write_throughput) }} <span class="text-sm font-normal text-green-600">rec/s</span></p>
                     <p class="text-xs text-green-400 mt-1">State & Audit Persistence</p>
                 </div>
                 <div class="bg-purple-50 p-4 rounded border border-purple-100">
                     <span class="text-xs text-purple-600 font-semibold uppercase">4. Overall Pipeline Average</span>
-                    <p class="text-2xl font-bold text-purple-900 mt-1">{{ "{:,}".format(m.overview.overall_throughput) }} <span class="text-sm font-normal text-purple-600">rec/s</span></p>
                     <p class="text-xs text-purple-400 mt-1">End-to-End Execution</p>
                 </div>
+            </div>
             </div>
         </section>
 

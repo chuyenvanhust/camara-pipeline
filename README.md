@@ -46,7 +46,7 @@ nằm ở [`docs/adr/0001-drop-spark-use-kafka-consumer.md`](docs/adr/0001-drop-
 CSV RADIUS log
       │
       ▼  (pipeline/ingestion — Stage 1, tuỳ chọn, chỉ chạy khi có --input)
-Kafka topic: radius.accounting.raw (4 partitions, key=msisdn)
+Kafka topic: radius.accounting.raw (8 partitions, key=msisdn)
       │
       ├──────────────┬──────────────┬──────────────┐
       ▼              ▼              ▼
@@ -73,9 +73,8 @@ cg-ip-msisdn    cg-device-swap   cg-sim-swap      (3 Kafka consumer group,
 
 **Nguyên tắc thiết kế cốt lõi:**
 
-- **1 process, 3 consumer task song song** — không phải 3 process riêng biệt, để dùng
-  chung 1 connection pool Postgres (`shared_db` trong `run_pipeline.py`) thay vì mỗi
-  consumer tự mở pool.
+- **1 process, 3 consumer task song song** dùng chung một pool Postgres. Mỗi poll gom
+  partition thành các shard batch lớn; shard chạy song song và vẫn giữ thứ tự theo key.
 - **Kafka offset chỉ commit sau khi batch xử lý xong** (manual commit, `enable_auto_commit=False`)
   — tắt lỗi mất dữ liệu khi consumer crash giữa chừng.
 - **Ghi DB theo transaction đơn** cho mỗi batch: state hiện tại + lịch sử + audit log +
@@ -190,16 +189,13 @@ giống production và đo lại benchmark batch-write — repo hiện **chưa c
 | `KAFKA_TOPIC_RAW` | `radius.accounting.raw` | Topic chứa RADIUS accounting record thô |
 | `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME` | xem `docker-compose.yml` | Kết nối Postgres |
 | `REDIS_HOST`, `REDIS_PORT`, `REDIS_DB` | `camara-redis`, `6379`, `0` | Kết nối Redis |
-| `BATCH_MAX_RECORDS` | `500` | Số record tối đa gom trong 1 batch trước khi flush |
-| `BATCH_TIMEOUT_MS` | `100` | Thời gian chờ tối đa trước khi flush batch dở |
+| `BATCH_MAX_RECORDS` | `4000` (Compose) | Số record tối đa lấy trong một poll Kafka |
+| `BATCH_TIMEOUT_MS` | `20` (Compose) | Thời gian chờ tối đa của một poll |
+| `PROCESSING_PARTITION_CONCURRENCY` | `2` (Compose) | Số partition-shard xử lý song song mỗi consumer |
 | `MAX_BATCH_RETRIES` | `3` | Số lần retry 1 batch lỗi trước khi đẩy vào topic `.dlq` |
 | `DB_POOL_MIN` / `DB_POOL_MAX` | `4` / `12` | Kích thước pool Postgres dùng chung cho cả 3 consumer |
 | `METRICS_PORT` | `9200` | Cổng expose `/metrics` Prometheus của pipeline |
 | `DISPATCHER_BATCH_SIZE` / `DISPATCHER_POLL_INTERVAL` / `DISPATCHER_MAX_ATTEMPTS` | `50` / `2.0` / `5` | Cấu hình notification dispatcher |
 
 Danh sách đầy đủ và biến riêng của từng thành phần: xem README con tương ứng
-<<<<<<< ours
 (`pipeline/README.md`, `pipeline/modules/*/README.md`, `api/README.md`).
-=======
-(`pipeline/README.md`, `pipeline/modules/*/README.md`, `api/README.md`).
->>>>>>> theirs

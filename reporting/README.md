@@ -1,40 +1,40 @@
 # reporting/
 
 Sinh Data Quality Report dạng HTML sau mỗi lần chạy pipeline.
-Báo cáo tỷ lệ phát hiện và xử lý theo từng loại vấn đề dữ liệu.
 
 ## Files
 
 | File | Vai trò |
 |------|---------|
-| `quality_report.py` | Query 5 log tables → tính tỷ lệ → render HTML qua Jinja2 |
-| `metrics_collector.py` | Thu thập Spark metrics (throughput, lag) và Kafka consumer lag |
-| `templates/report.html.jinja2` | HTML template với biểu đồ Chart.js, không cần build step |
+| `quality_report.py` | Query PostgreSQL → tính tỷ lệ swap → render HTML qua Jinja2 |
+| `templates/report.html.jinja2` | HTML template với biểu đồ Chart.js |
 
 ## Chạy
 
 ```bash
+# Cần PostgreSQL đang chạy (docker compose up postgres migrate)
 python reporting/quality_report.py --output reports/quality_report.html
-# Hoặc:
-make report
+
+# Offline template test (không cần DB)
+python reporting/quality_report.py --allow-mock --output reports/sample.html
 ```
 
-## Nội dung báo cáo (6 section)
+## Nội dung báo cáo
 
-| Section | Nguồn dữ liệu | Metrics |
-|---------|--------------|---------|
-| Tổng quan | pipeline run log | Tổng records, thời gian, throughput rec/s |
-| Invalid IMEI | `invalid_log` WHERE error_code LIKE 'ERR_IMEI%' | Rate, phân tách Luhn fail vs TAC unknown |
-| Duplicate | `duplicate_log` | Rate, phân bổ theo giờ |
-| Conflict | `conflict_log` | Rate tổng, phân tách loại A/B/C |
-| Late Arrival | `invalid_log` + `radius_sessions.late_arrival` | Rate, histogram độ trễ |
-| Missing Field | `invalid_log` WHERE error_code='ERR_MISSING_FIELD' | Rate, field nào thiếu nhiều nhất |
+| Section | Nguồn dữ liệu |
+|---------|--------------|
+| Tổng quan | `msisdn_device`, CSV input (nếu có) |
+| Swap events | `sim_swap_history`, `device_swap_history` |
+| Throughput | Ước lượng từ `audit_log` event_time span (không hard-code) |
+| Sessions | `radius_session_state` row count |
 
-## Output mẫu
+Throughput producer/consumer đầy đủ cần scrape Prometheus tại `pipeline:9200/metrics`.
+
+## Output
 
 ```
 reports/
-└── quality_report_20250601_143022.html   ← timestamp trong tên file
+└── quality_report_20250601_143022.html
 ```
 
-File HTML self-contained (Chart.js CDN), mở được trực tiếp bằng browser.
+File HTML self-contained (Chart.js CDN), mở trực tiếp bằng browser.

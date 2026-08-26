@@ -83,8 +83,8 @@ _QUERY_ACTIVE_SESSION = """
     response_model=NumberVerifyResponse,
     summary="Xác minh số điện thoại đang active trên mạng",
     description=(
-        "Kiểm tra MSISDN có session đang active (Start chưa có Stop) "
-        "trong 24h gần nhất trong bảng radius_sessions. "
+        "Kiểm tra MSISDN có session đang active (Start chưa Stop) "
+        "trong 24h gần nhất trong bảng radius_session_state. "
         "**Lab simplification** (Quyết định #9): thay thế cho "
         "network-based authentication của CAMARA spec đầy đủ."
     ),

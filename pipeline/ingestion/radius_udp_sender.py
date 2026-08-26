@@ -38,6 +38,9 @@ import hashlib
 import logging
 import time
 import argparse
+import queue
+import threading
+from functools import lru_cache
 from typing import Dict, Any, List, Tuple, Optional
 
 from pipeline.ingestion.csv_reader import LocalCSVReader
@@ -123,6 +126,21 @@ def _encode_ip_avp(attr_type: int, ip_str: str) -> bytes:
     return _encode_avp(attr_type, ip_bytes)
 
 
+@lru_cache(maxsize=131_072)
+def _cached_str_avp(attr_type: int, value: str) -> bytes:
+    """Cache AVP có giá trị lặp lại giữa các accounting record.
+
+    Session id và session time không dùng cache vì thường có cardinality cao.
+    Giới hạn LRU ngăn sender giữ toàn bộ file lớn trong RAM.
+    """
+    return _encode_str_avp(attr_type, value)
+
+
+@lru_cache(maxsize=65_536)
+def _cached_ip_avp(attr_type: int, value: str) -> bytes:
+    return _encode_ip_avp(attr_type, value)
+
+
 def _encode_vendor_specific(vendor_id: int, sub_attrs: List[Tuple[int, str]]) -> bytes:
     """Đóng gói AVP Vendor-Specific (0x1a): Vendor-Id (4 byte) + chuỗi sub-AVP,
     mỗi sub-AVP là Subtype(1) + Sublen(1) + giá trị — đúng layout mà
@@ -135,6 +153,16 @@ def _encode_vendor_specific(vendor_id: int, sub_attrs: List[Tuple[int, str]]) ->
             raise ValueError(f"Vendor sub-AVP subtype=0x{sub_type:02x} quá dài ({sub_len} byte)")
         body += bytes([sub_type, sub_len]) + value_bytes
     return _encode_avp(ATTR_VENDOR_SPECIFIC, body)
+
+
+@lru_cache(maxsize=131_072)
+def _cached_vendor_specific(vendor_id: int, sub_attrs: Tuple[Tuple[int, str], ...]) -> bytes:
+    return _encode_vendor_specific(vendor_id, list(sub_attrs))
+
+
+@lru_cache(maxsize=32)
+def _secret_bytes(secret: str) -> bytes:
+    return secret.encode("utf-8")
 
 
 def build_radius_packet(record: Dict[str, Any], identifier: int, secret: str) -> bytes:
@@ -172,13 +200,13 @@ def build_radius_packet(record: Dict[str, Any], identifier: int, secret: str) ->
     # --- Calling-Station-Id (msisdn) ---
     msisdn = _pick(record, "msisdn", "Calling_Station_Id")
     if msisdn:
-        avps += _encode_str_avp(ATTR_CALLING_STATION, msisdn)
+        avps += _cached_str_avp(ATTR_CALLING_STATION, msisdn)
 
     # --- Framed-IP-Address ---
     framed_ip = _pick(record, "framed_ip", "Framed_IP_Address")
     if framed_ip:
         try:
-            avps += _encode_ip_avp(ATTR_FRAMED_IP, framed_ip)
+            avps += _cached_ip_avp(ATTR_FRAMED_IP, framed_ip)
         except ValueError as e:
             logger.warning("%s — bỏ qua Framed-IP-Address", e)
 
@@ -186,14 +214,14 @@ def build_radius_packet(record: Dict[str, Any], identifier: int, secret: str) ->
     nas_ip = _pick(record, "nas_ip")
     if nas_ip:
         try:
-            avps += _encode_ip_avp(ATTR_NAS_IP, nas_ip)
+            avps += _cached_ip_avp(ATTR_NAS_IP, nas_ip)
         except ValueError as e:
             logger.warning("%s — bỏ qua NAS-IP-Address", e)
 
     # --- NAS-Identifier ---
     nas_identifier = _pick(record, "nas_identifier", "NAS_Identifier")
     if nas_identifier:
-        avps += _encode_str_avp(ATTR_NAS_IDENTIFIER, nas_identifier)
+        avps += _cached_str_avp(ATTR_NAS_IDENTIFIER, nas_identifier)
 
     # --- Vendor-Specific 3GPP (imsi, imei, rat_type, mcc_mnc) ---
     sub_attrs: List[Tuple[int, str]] = []
@@ -210,7 +238,7 @@ def build_radius_packet(record: Dict[str, Any], identifier: int, secret: str) ->
     if mcc_mnc:
         sub_attrs.append((VENDOR_SUBTYPE_MCC_MNC, mcc_mnc))
     if sub_attrs:
-        avps += _encode_vendor_specific(VENDOR_ID_3GPP, sub_attrs)
+        avps += _cached_vendor_specific(VENDOR_ID_3GPP, tuple(sub_attrs))
 
     # --- Header: Code(1) + Identifier(1) + Length(2) + Authenticator(16) ---
     total_length = 20 + len(avps)
@@ -223,7 +251,7 @@ def build_radius_packet(record: Dict[str, Any], identifier: int, secret: str) ->
     # Request Authenticator cho Accounting-Request (RFC 2866 §4.1):
     # MD5(Code + Identifier + Length + 16 byte 0x00 + Attributes + Shared-Secret)
     zero_auth = b"\x00" * 16
-    authenticator = hashlib.md5(header_wo_auth + zero_auth + bytes(avps) + secret.encode()).digest()
+    authenticator = hashlib.md5(header_wo_auth + zero_auth + bytes(avps) + _secret_bytes(secret)).digest()
 
     return header_wo_auth + authenticator + bytes(avps)
 
@@ -235,6 +263,10 @@ def send_csv_as_radius(
     rate: float = 50.0,
     secret: str = DEFAULT_SHARED_SECRET,
     loop: bool = False,
+    queue_size: int = 50_000,
+    pacing_window_ms: float = 2.0,
+    max_packets: int = 0,
+    max_catchup_ms: float = 100.0,
 ) -> None:
     """Đọc CSV, đóng gói từng dòng thành gói tin RADIUS, bắn UDP tới host:port.
 
@@ -242,62 +274,141 @@ def send_csv_as_radius(
     accounting request — KHÔNG phải chế độ bulk-load throughput cao như
     producer.publish_csv()). rate <= 0 nghĩa là gửi nhanh nhất có thể."""
 
+    if queue_size < 1 or pacing_window_ms <= 0 or max_catchup_ms < pacing_window_ms:
+        raise ValueError("queue_size > 0 và max_catchup_ms >= pacing_window_ms > 0")
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    identifier = 0
-    interval = 1.0 / rate if rate > 0 else 0.0
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+    sock.connect((host, port))
+
+    packet_queue: queue.Queue[object] = queue.Queue(maxsize=queue_size)
+    sentinel = object()
+    stop_event = threading.Event()
+    counters = {"encoded": 0, "failed": 0, "queue_high_watermark": 0}
+
+    def put_interruptibly(item: object) -> bool:
+        while not stop_event.is_set():
+            try:
+                packet_queue.put(item, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def encode_records() -> None:
+        identifier = 0
+        try:
+            while not stop_event.is_set():
+                for record in LocalCSVReader(csv_path).read_records():
+                    if stop_event.is_set():
+                        return
+                    if max_packets > 0 and counters["encoded"] >= max_packets:
+                        return
+                    try:
+                        packet = build_radius_packet(record, identifier, secret)
+                    except ValueError as exc:
+                        counters["failed"] += 1
+                        logger.warning("Bỏ qua record không đóng gói được: %s", exc)
+                        identifier = (identifier + 1) & 0xFF
+                        continue
+                    if not put_interruptibly(packet):
+                        return
+                    counters["encoded"] += 1
+                    counters["queue_high_watermark"] = max(
+                        counters["queue_high_watermark"], packet_queue.qsize()
+                    )
+                    identifier = (identifier + 1) & 0xFF
+                if not loop:
+                    return
+        finally:
+            put_interruptibly(sentinel)
+
+    burst_size = max(1, round(rate * pacing_window_ms / 1000.0)) if rate > 0 else 512
+    encoder = threading.Thread(target=encode_records, name="radius-packet-encoder", daemon=True)
+    encoder.start()
+
+    # Prefill tách chi phí đọc CSV/mã hóa khỏi nhịp gửi. Nếu bắt đầu đồng hồ ngay
+    # khi encoder còn giành GIL, scheduler sẽ tích lũy "nợ" rồi bắn burst quá trần.
+    prefill_target = min(
+        queue_size,
+        max_packets if max_packets > 0 else max(5_000, burst_size * 20),
+    )
+    prefill_started = time.perf_counter()
+    while encoder.is_alive() and packet_queue.qsize() < prefill_target:
+        time.sleep(0.001)
+    prefill_duration = time.perf_counter() - prefill_started
 
     total_sent = 0
-    total_failed = 0
-    t_start = time.time()
-
-    def run_once() -> Tuple[int, int]:
-        nonlocal identifier
-        sent, failed = 0, 0
-        reader = LocalCSVReader(csv_path)
-        for record in reader.read_records():
-            try:
-                packet = build_radius_packet(record, identifier, secret)
-            except ValueError as e:
-                failed += 1
-                logger.warning("Bỏ qua record không đóng gói được: %s", e)
-                identifier = (identifier + 1) % 256
-                continue
-
-            sock.sendto(packet, (host, port))
-            sent += 1
-            identifier = (identifier + 1) % 256
-
-            if sent % 500 == 0:
-                logger.info("[RADIUS-UDP] Đã gửi %d gói tới %s:%d", sent, host, port)
-
-            if interval > 0:
-                time.sleep(interval)
-        return sent, failed
+    t_start = time.perf_counter()
+    last_log_at = t_start
+    last_log_sent = 0
+    next_deadline = t_start
 
     logger.info(
-        "[RADIUS-UDP] Bắt đầu gửi từ %s tới %s:%d | rate=%s | loop=%s | secret=%s",
+        "[RADIUS-UDP] Bắt đầu gửi từ %s tới %s:%d | rate=%s | loop=%s | "
+        "prefetch_queue=%d | prefilled=%d | prefill_ms=%.1f | pacing_window_ms=%.1f | "
+        "burst=%d | max_catchup_ms=%.1f | max_packets=%d | secret=%s",
         csv_path, host, port,
         f"{rate} pkt/s" if rate > 0 else "không giới hạn",
-        loop, "(mặc định)" if secret == DEFAULT_SHARED_SECRET else "(tuỳ biến)",
+        loop, queue_size, packet_queue.qsize(), prefill_duration * 1000,
+        pacing_window_ms, burst_size, max_catchup_ms, max_packets,
+        "(mặc định)" if secret == DEFAULT_SHARED_SECRET else "(tuỳ biến)",
     )
 
     try:
         while True:
-            sent, failed = run_once()
-            total_sent += sent
-            total_failed += failed
-            if not loop:
+            batch: List[bytes] = []
+            finished = False
+            while len(batch) < burst_size:
+                item = packet_queue.get()
+                if item is sentinel:
+                    finished = True
+                    break
+                batch.append(item)  # type: ignore[arg-type]
+
+            for packet in batch:
+                sock.send(packet)
+            total_sent += len(batch)
+
+            if rate > 0 and batch:
+                next_deadline += len(batch) / rate
+                now_before_sleep = time.perf_counter()
+                # Không bù backlog quá một pacing window: UDP burst vượt mục tiêu
+                # dễ làm đầy kernel receive buffer dù tốc độ trung bình vẫn đẹp.
+                max_lag = max_catchup_ms / 1000.0
+                if next_deadline < now_before_sleep - max_lag:
+                    next_deadline = now_before_sleep
+                remaining = next_deadline - now_before_sleep
+                if remaining > 0:
+                    time.sleep(remaining)
+
+            now = time.perf_counter()
+            log_elapsed = now - last_log_at
+            if log_elapsed >= 1.0 or finished:
+                logger.info(
+                    "[RADIUS-UDP] stage=sender sent_total=%d send_rate=%.1f_pkt_s "
+                    "target_rate=%.1f queue_depth=%d queue_capacity=%d queue_high_watermark=%d "
+                    "encoded_total=%d encode_failed_total=%d",
+                    total_sent, (total_sent - last_log_sent) / max(log_elapsed, 1e-9), rate,
+                    packet_queue.qsize(), queue_size, counters["queue_high_watermark"],
+                    counters["encoded"], counters["failed"],
+                )
+                last_log_at = now
+                last_log_sent = total_sent
+
+            if finished:
                 break
-            logger.info("[RADIUS-UDP] Hết file, lặp lại (--loop đang bật)...")
     except KeyboardInterrupt:
         logger.info("[RADIUS-UDP] Dừng theo yêu cầu người dùng.")
     finally:
+        stop_event.set()
         sock.close()
+        encoder.join(timeout=2.0)
 
-    duration = time.time() - t_start
+    duration = time.perf_counter() - t_start
     logger.info(
         "[RADIUS-UDP] Hoàn tất: %d gói gửi thành công, %d record bị bỏ qua, %.2fs (%.1f pkt/s)",
-        total_sent, total_failed, duration, total_sent / max(duration, 1e-6),
+        total_sent, counters["failed"], duration, total_sent / max(duration, 1e-6),
     )
 
 
@@ -311,6 +422,14 @@ if __name__ == "__main__":
     parser.add_argument("--rate", type=float, default=50.0, help="Số gói/giây, <=0 nghĩa là gửi nhanh nhất có thể")
     parser.add_argument("--secret", default=DEFAULT_SHARED_SECRET, help="Shared secret dùng tính Request Authenticator")
     parser.add_argument("--loop", action="store_true", help="Lặp lại vô hạn khi đọc hết file CSV")
+    parser.add_argument("--queue-size", type=int, default=50_000,
+                        help="Số packet đã mã hóa được prefetch trong RAM (mặc định 50000)")
+    parser.add_argument("--pacing-window-ms", type=float, default=2.0,
+                        help="Cửa sổ micro-burst để pacing chính xác ở tốc độ cao (mặc định 2ms)")
+    parser.add_argument("--max-packets", type=int, default=0,
+                        help="Dừng sau N packet; 0 nghĩa là gửi hết file hoặc chạy theo --loop")
+    parser.add_argument("--max-catchup-ms", type=float, default=100.0,
+                        help="Giới hạn nợ pacing được bù để tránh burst lớn (mặc định 100ms)")
     args = parser.parse_args()
 
     send_csv_as_radius(
@@ -320,4 +439,8 @@ if __name__ == "__main__":
         rate=args.rate,
         secret=args.secret,
         loop=args.loop,
+        queue_size=args.queue_size,
+        pacing_window_ms=args.pacing_window_ms,
+        max_packets=args.max_packets,
+        max_catchup_ms=args.max_catchup_ms,
     )

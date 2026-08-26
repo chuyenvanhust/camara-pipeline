@@ -14,7 +14,7 @@
 #
 # Usage:
 #   scripts/simulate_radius_device.sh data/radius_log.csv
-#   scripts/simulate_radius_device.sh data/radius_log.csv 50 --loop   # 50 pkt/s, lặp vô hạn
+#   scripts/simulate_radius_device.sh data/radius_log.csv 15000 --loop
 
 set -euo pipefail
 
@@ -27,6 +27,10 @@ set -a; [ -f "$ROOT_DIR/.env" ] && source "$ROOT_DIR/.env"; set +a
 INPUT_FILE="${1:?Thiếu đường dẫn CSV. Usage: scripts/simulate_radius_device.sh <file.csv> [rate] [--loop]}"
 RATE="${2:-50}"
 LOOP_FLAG="${3:-}"
+QUEUE_SIZE="${RADIUS_SENDER_QUEUE_SIZE:-50000}"
+PACING_WINDOW_MS="${RADIUS_SENDER_PACING_WINDOW_MS:-2}"
+MAX_PACKETS="${RADIUS_SENDER_MAX_PACKETS:-0}"
+MAX_CATCHUP_MS="${RADIUS_SENDER_MAX_CATCHUP_MS:-100}"
 
 HOST="${RADIUS_TARGET_HOST:-127.0.0.1}"
 PORT="${RADIUS_TARGET_PORT:-1813}"
@@ -48,4 +52,8 @@ python3 -m pipeline.ingestion.radius_udp_sender \
     --host "$HOST" \
     --port "$PORT" \
     --rate "$RATE" \
+    --queue-size "$QUEUE_SIZE" \
+    --pacing-window-ms "$PACING_WINDOW_MS" \
+    --max-packets "$MAX_PACKETS" \
+    --max-catchup-ms "$MAX_CATCHUP_MS" \
     "${EXTRA_ARGS[@]}"

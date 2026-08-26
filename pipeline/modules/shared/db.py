@@ -17,7 +17,7 @@ DATABASE_URL = os.getenv(
 StateRecord = Tuple[str, str, datetime, str, int, int]
 HistoryRecord = Tuple[str, str, int, int, str, Optional[str], str, datetime]
 AuditRecord = Tuple[str, str, str, str, datetime]
-OutboxEvent = Tuple[str, str, str, str, datetime]
+OutboxEvent = Tuple[str, str, str, str]
 SessionRecord = Tuple[str, str, Optional[str], bool, datetime, str, int, int]
 
 
@@ -129,7 +129,10 @@ class DatabasePool:
             await connection.executemany(
                 """
                 INSERT INTO audit_log(event_id,event_type,msisdn,details,event_time)
-                VALUES($1,$2,$3,$4::jsonb,$5)
+                VALUES(
+                    $1::text,$2::varchar(32),$3::varchar(16),
+                    $4::jsonb,$5::timestamptz
+                )
                 ON CONFLICT(event_id,event_type) DO NOTHING
                 """,
                 records,
@@ -147,9 +150,11 @@ class DatabasePool:
                 event_id, subscription_id, event_type, payload, status,
                 attempts, next_retry_at
             )
-            SELECT $1, subscription_id, $2, $4::jsonb, 'PENDING', 0, NOW()
+            SELECT $1::text, subscription_id, $2::varchar(32),
+                   $4::jsonb, 'PENDING', 0, NOW()
             FROM subscription
-            WHERE msisdn=$3 AND event_type=$2 AND status='ACTIVE'
+            WHERE msisdn=$3::varchar(16)
+              AND event_type=$2::varchar(32) AND status='ACTIVE'
               AND (expires_at IS NULL OR expires_at > NOW())
             ON CONFLICT(event_id, subscription_id) DO NOTHING
             """,

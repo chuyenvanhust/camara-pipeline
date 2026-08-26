@@ -1,5 +1,7 @@
 # requirements.txt
 pytest
+pytest-asyncio
+jinja2
 pydantic
 psycopg2-binary
 aiokafka

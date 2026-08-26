@@ -53,8 +53,4 @@ value và payload notification, nêu ở dưới.
 - `msisdn_sim` — state hiện tại (1 dòng / MSISDN).
 - `sim_swap_history` — lịch sử mọi lần đổi SIM, insert-only qua `copy_records_to_table`.
 - `audit_log`, `notification_log` — dùng chung schema với `device_swap` (phân biệt qua cột
-<<<<<<< ours
   `event_type`).
-=======
-  `event_type`).
->>>>>>> theirs

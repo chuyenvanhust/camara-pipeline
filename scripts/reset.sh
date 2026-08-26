@@ -28,18 +28,11 @@ if [[ ! $REPLY =~ ^[Yy]$ ]]; then
     exit 0
 fi
 
-# 1. Kill process pipeline cũ (nếu container còn sống và còn instance đang chạy dở)
-# Image không có pkill/ps (procps chưa cài) nên duyệt trực tiếp /proc bằng shell builtin
-echo ">>> Dừng process pipeline cũ (nếu có)..."
-docker exec camara-pipeline sh -c '
-    for p in /proc/[0-9]*; do
-        if grep -q "pipeline.run_pipeline" "$p/cmdline" 2>/dev/null; then
-            kill -9 "${p#/proc/}" 2>/dev/null && echo "    ... đã kill PID ${p#/proc/}"
-        fi
-    done
-' || true
-sleep 1
-echo "[OK] Đã dừng process cũ"
+# 1. Restart pipeline service (compose-managed, không cần docker exec kill)
+echo ">>> Restart pipeline service..."
+docker compose restart pipeline 2>/dev/null || true
+sleep 2
+echo "[OK] Pipeline service restarted"
 
 # 2. Xóa và tạo lại Kafka topic đúng số partitions, tránh phụ thuộc auto-create.topics.enable
 echo ">>> Reset Kafka topic: $KAFKA_TOPIC_RAW..."

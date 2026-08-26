@@ -3,7 +3,7 @@ from __future__ import annotations
 import ipaddress
 import logging
 import os
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from pipeline.modules.ip_msisdn.redis_store import IPMappingStore
 from pipeline.modules.shared.base_consumer import BaseKafkaConsumer
@@ -32,7 +32,11 @@ class IPMsisdnConsumer(BaseKafkaConsumer):
     async def process_batch(self, records: List[Any]) -> None:
         assert self.store is not None
         operations = []
-        session_records = []
+        # F-BATCH-DUP-FIX: dict thay vì list — cùng 1 acct_session_id (vd Start rồi
+        # Interim-Update trong cùng batch) trước đây tạo 2 dòng cùng khóa trong 1
+        # lệnh UPSERT -> Postgres từ chối (CardinalityViolationError). records của
+        # process_batch thuộc 1 partition, đã theo thứ tự offset -> ghi đè giữ bản mới nhất.
+        session_by_id: Dict[str, tuple] = {}
         for record in records:
             try:
                 message = record.value
@@ -57,24 +61,45 @@ class IPMsisdnConsumer(BaseKafkaConsumer):
                 raw_session_id = required_text(message, "acct_session_id", "Acct_Session_Id", "Acct-Session-Id")
                 session_id = f"{nas or '-'}:{raw_session_id}"
                 eid = event_id(record)
-                session_records.append((session_id, msisdn, nas, status != "stop", occurred_at,
-                                        eid, record.partition, record.offset))
+                session_by_id[session_id] = (session_id, msisdn, nas, status != "stop", occurred_at,
+                                              eid, record.partition, record.offset)
                 operations.append((record, status, occurred_at, nas, framed_ip, msisdn))
             except InvalidMessageError as exc:
                 await self.send_to_dlq(record, exc)
 
-        await self.db.persist_session_batch(session_records)
+        await self.db.persist_session_batch(list(session_by_id.values()))
+        self.metrics.increment("postgres_records", len(session_by_id))
+        redis_batch = []
+
+        async def flush_redis_batch() -> None:
+            nonlocal redis_batch
+            if redis_batch:
+                changed = await self.store.apply_batch(redis_batch)
+                self.metrics.increment("redis_records", changed)
+                redis_batch = []
+
         for record, status, occurred_at, nas, framed_ip, msisdn in operations:
             if status in {"start", "interim-update"}:
-                await self.store.upsert_mapping(framed_ip, msisdn, occurred_at, event_id(record),
-                                                record.partition, record.offset, nas)
+                redis_batch.append({
+                    "kind": "upsert", "framed_ip": framed_ip, "msisdn": msisdn,
+                    "event_time": occurred_at, "event_id": event_id(record),
+                    "partition": record.partition, "offset": record.offset,
+                    "nas_identifier": nas,
+                })
             elif status == "stop":
-                await self.store.delete_mapping(framed_ip, msisdn, occurred_at,
-                                                record.partition, record.offset)
+                redis_batch.append({
+                    "kind": "delete", "framed_ip": framed_ip, "msisdn": msisdn,
+                    "event_time": occurred_at, "partition": record.partition,
+                    "offset": record.offset,
+                })
             elif status == "accounting-off":
+                await flush_redis_batch()
                 await self.db.mark_nas_sessions_inactive(nas, occurred_at)
-                await self.store.accounting_off(nas, occurred_at)
+                self.metrics.increment("postgres_records")
+                removed = await self.store.accounting_off(nas, occurred_at)
+                self.metrics.increment("redis_records", removed)
             self.metrics.increment("events_detected")
+        await flush_redis_batch()
         self.metrics.increment("success", len(operations))
 
 

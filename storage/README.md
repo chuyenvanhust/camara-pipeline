@@ -1,78 +1,71 @@
 # storage/
 
-Schema PostgreSQL và tài liệu thiết kế cho storage layer.
+Schema PostgreSQL và migration cho storage layer.
 
 ## Files
 
 ```
 storage/
+├── migrate.py                 # Versioned migration runner (checksum + advisory lock)
 ├── migrations/
-│   ├── 001_init_schema.sql   # Tạo 5 bảng chính
-│   ├── 002_indexes.sql       # 5 composite B-Tree index
-│   └── 003_partitions.sql    # Monthly partitions cho radius_sessions
-└── docs/
-    └── schema_design.md      # Tài liệu: lý do chọn partitioning/indexing
+│   ├── 001_init_schema.sql    # State, history, subscription, audit, notification
+│   ├── 002_notification_outbox_index.sql
+│   ├── 003_audit_retention_index.sql
+│   └── 004_go_live_hardening.sql  # event_id, replay-safe state, radius_session_state
+└── README.md
 ```
 
 ## Chạy migration
 
 ```bash
-# Tự động khi docker compose up (entrypoint script)
-# Hoặc thủ công theo thứ tự:
-psql -U camara -d camara_db -f storage/migrations/001_init_schema.sql
-psql -U camara -d camara_db -f storage/migrations/002_indexes.sql
-psql -U camara -d camara_db -f storage/migrations/003_partitions.sql
+# Tự động khi docker compose up (service migrate, chạy trước fastapi/pipeline)
+docker compose up migrate
 
-# Reset (dev only)
+# Hoặc thủ công
+python -m storage.migrate
+
+# Reset dev (truncate — không xóa volume)
 bash scripts/reset_db.sh
 ```
 
+Migration được ghi vào bảng `schema_migrations` với checksum SHA-256. Volume Postgres đã tồn tại vẫn nhận migration mới; migration đã apply không được sửa nội dung.
+
 ## Schema tóm tắt
 
-### `radius_sessions` — bảng chính
-Lưu toàn bộ RADIUS record đã qua pipeline. Partition RANGE by `event_timestamp` (monthly).
+### `msisdn_device` / `msisdn_sim` — current state
 
-| Column | Type | Ghi chú |
-|--------|------|---------|
-| `id` | BIGSERIAL | PK |
-| `acct_session_id` | UUID | Session identifier |
-| `acct_status_type` | VARCHAR(16) | Start / Stop / Interim-Update |
-| `event_timestamp` | TIMESTAMPTZ | Thời điểm sự kiện — partition key |
-| `ingest_timestamp` | TIMESTAMPTZ | Thời điểm record vào pipeline |
-| `msisdn` | VARCHAR(16) | E.164 |
-| `imsi` | CHAR(15) | |
-| `imei` | CHAR(15) | |
-| `rat_type` | VARCHAR(8) | LTE / NR / WCDMA / GSM |
-| `framed_ip` | INET | |
-| `nas_ip` | INET | |
-| `mcc_mnc` | CHAR(6) | |
-| `late_arrival` | BOOLEAN | True nếu record đến muộn > threshold |
+| Column | Ghi chú |
+|--------|---------|
+| `msisdn` | PK, E.164 |
+| `imei_current` / `imsi_current` | Giá trị hiện tại |
+| `last_event_at`, `last_event_id` | Version theo event-time + Kafka offset |
+| `last_source_partition`, `last_source_offset` | Replay-safe ordering |
 
-### `swap_event` — SIM Swap / Device Swap events
-| Column | Type | Ghi chú |
-|--------|------|---------|
-| `id` | BIGSERIAL | PK |
-| `msisdn` | VARCHAR(16) | |
-| `old_imsi` | CHAR(15) | IMSI trước khi swap |
-| `new_imsi` | CHAR(15) | IMSI sau khi swap |
-| `old_imei` | CHAR(15) | IMEI trước (Device Swap) |
-| `new_imei` | CHAR(15) | IMEI sau (Device Swap) |
-| `swap_type` | VARCHAR(16) | `SIM_SWAP` hoặc `DEVICE_SWAP` |
-| `detected_at` | TIMESTAMPTZ | Từ RADIUS event_timestamp |
-| `confirmed_at` | TIMESTAMPTZ | Từ HLR/HSS mock imsi-history |
-| `source` | VARCHAR(32) | `RADIUS_CONFLICT_C` |
+### `device_swap_history` / `sim_swap_history`
 
-### `duplicate_log`, `conflict_log`, `invalid_log`
-Bảng audit — lưu records bị loại kèm lý do. Không partition.
+| Column | Ghi chú |
+|--------|---------|
+| `event_id` | UNIQUE — `{topic}:{partition}:{offset}` |
+| `source_topic`, `source_partition`, `source_offset` | Kafka provenance |
+| `changed_at` | Thời điểm swap |
 
-## Indexes
+### `radius_session_state` — Number Verification
 
-| Index | Bảng | Columns | Dùng bởi |
-|-------|------|---------|---------|
-| `idx_msisdn_ts` | `radius_sessions` | `(msisdn, event_timestamp DESC)` | SIM Swap API, Number Verification |
-| `idx_imsi_ts` | `radius_sessions` | `(imsi, event_timestamp DESC)` | Session lookup, Device Swap |
-| `idx_imei_ts` | `radius_sessions` | `(imei, event_timestamp DESC)` | Device Swap IMEI history |
-| `idx_swap_msisdn` | `swap_event` | `(msisdn, detected_at DESC)` | SIM Swap API — query chính |
-| `idx_swap_imei` | `swap_event` | `(imei, detected_at DESC)` | Device Swap API — query chính |
+| Column | Ghi chú |
+|--------|---------|
+| `acct_session_id` | PK — `{nas}:{session_id}` |
+| `active` | Session Start chưa Stop |
+| `last_event_at` | Dùng cho cửa sổ 24h |
 
-Xem lý do chọn indexes và so sánh phương án thay thế tại [`docs/schema_design.md`](docs/schema_design.md).
+### `audit_log` / `notification_log`
+
+- `audit_log`: `UNIQUE(event_id, event_type)` — idempotent replay
+- `notification_log`: outbox pattern, `UNIQUE(event_id, subscription_id)`, `locked_at` cho claim recovery
+
+### `subscription`
+
+Open Gateway callback registration (`SIM_SWAP` / `DEVICE_SWAP`).
+
+## PostgreSQL runtime
+
+`docker-compose.yml` bật `synchronous_commit=on` cho dữ liệu nghiệp vụ — tránh mất dữ liệu sau khi Kafka offset đã commit.
