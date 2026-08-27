@@ -28,8 +28,8 @@ class DatabasePool:
 
     async def connect(self) -> None:
         if self.pool is None:
-            minimum = int(os.getenv("DB_POOL_MIN", "2"))
-            maximum = int(os.getenv("DB_POOL_MAX", "12"))
+            minimum = int(os.getenv("DB_POOL_MIN", "6"))
+            maximum = int(os.getenv("DB_POOL_MAX", "32"))
             if minimum < 1 or maximum < minimum:
                 raise ValueError("invalid DB_POOL_MIN/DB_POOL_MAX")
             self.pool = await asyncpg.create_pool(
@@ -153,7 +153,7 @@ class DatabasePool:
             SELECT $1::text, subscription_id, $2::varchar(32),
                    $4::jsonb, 'PENDING', 0, NOW()
             FROM subscription
-            WHERE msisdn=$3::varchar(16)
+            WHERE (msisdn=$3::varchar(16) OR msisdn IS NULL)
               AND event_type=$2::varchar(32) AND status='ACTIVE'
               AND (expires_at IS NULL OR expires_at > NOW())
             ON CONFLICT(event_id, subscription_id) DO NOTHING
@@ -173,6 +173,8 @@ class DatabasePool:
         audit: Sequence[AuditRecord],
         outbox: Sequence[OutboxEvent],
     ) -> None:
+        if not (states or history or audit or outbox):
+            return
         assert self.pool is not None
         async with self.pool.acquire(timeout=3) as connection:
             async with connection.transaction():
@@ -225,6 +227,7 @@ class DatabasePool:
                     > (radius_session_state.last_event_at,
                        radius_session_state.source_partition,
                        radius_session_state.source_offset)
+                  AND EXCLUDED.last_event_id IS DISTINCT FROM radius_session_state.last_event_id
                 """,
                 *(list(column) for column in columns),
             )

@@ -22,8 +22,9 @@ from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 
-from api.routers import health, sim_swap, device_swap, number_verification
+from api.routers import health, sim_swap, device_swap, number_verification, ip_msisdn, subscriptions
 from api.dependencies.database import create_pool, close_pool, _pool
+from api.dependencies.redis import create_redis_pool, close_redis_pool
 import asyncpg
 
 
@@ -38,8 +39,12 @@ async def lifespan(app: FastAPI):
     Không dùng @app.on_event("startup") vì deprecated từ FastAPI 0.93.
     """
     await create_pool()
-    yield
-    await close_pool()
+    try:
+        await create_redis_pool()
+        yield
+    finally:
+        await close_redis_pool()
+        await close_pool()
 
 
 app = FastAPI(
@@ -167,3 +172,5 @@ async def db_interface_error_handler(request: Request, exc: asyncpg.InterfaceErr
 app.include_router(sim_swap.router)
 app.include_router(device_swap.router)
 app.include_router(number_verification.router)
+app.include_router(ip_msisdn.router)
+app.include_router(subscriptions.router)

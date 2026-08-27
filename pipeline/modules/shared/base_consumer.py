@@ -7,6 +7,7 @@ import logging
 import os
 import time
 from abc import ABC, abstractmethod
+from datetime import datetime, timezone
 from typing import Any, List, Optional
 
 import redis.asyncio as aioredis
@@ -14,6 +15,7 @@ from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 
 from pipeline.modules.shared.db import DatabasePool
 from pipeline.modules.shared.metrics import ModuleMetrics
+from pipeline.modules.shared.redis_client import create_redis_client
 
 
 logger = logging.getLogger(__name__)
@@ -58,18 +60,12 @@ class BaseKafkaConsumer(ABC):
         self.running = False
         self._stopped = False
         self._telemetry_task: Optional[asyncio.Task] = None
+        self._processed_offsets: dict[Any, int] = {}
 
     async def initialize(self) -> None:
         if self._owns_db:
             await self.db.connect()
-        self.redis = aioredis.Redis(
-            host=os.getenv("REDIS_HOST", "camara-redis"),
-            port=int(os.getenv("REDIS_PORT", "6379")),
-            db=int(os.getenv("REDIS_DB", "0")),
-            decode_responses=True,
-            socket_connect_timeout=5,
-            socket_timeout=5,
-        )
+        self.redis = create_redis_client()
         await self.redis.ping()
         self.consumer = AIOKafkaConsumer(
             self.topic,
@@ -165,7 +161,27 @@ class BaseKafkaConsumer(ABC):
                             if attempt == MAX_BATCH_RETRIES:
                                 raise
                             await asyncio.sleep(min(2 ** attempt, 10))
-                    self.metrics.observe_batch(time.monotonic() - batch_started)
+                    batch_duration = time.monotonic() - batch_started
+                    self.metrics.observe_batch(batch_duration)
+                    now_utc = datetime.now(timezone.utc)
+                    e2e_lags_ms = []
+                    for record in records:
+                        val = getattr(record, "value", None)
+                        if isinstance(val, dict):
+                            ingest_ts = val.get("ingest_timestamp")
+                            if ingest_ts:
+                                try:
+                                    dt = datetime.fromisoformat(str(ingest_ts).replace("Z", "+00:00"))
+                                    lag_ms = max(0.0, (now_utc - dt).total_seconds() * 1000.0)
+                                    e2e_lags_ms.append(lag_ms)
+                                except Exception:
+                                    pass
+                    if e2e_lags_ms:
+                        self.metrics.observe_e2e_lag(
+                            avg_ms=sum(e2e_lags_ms) / len(e2e_lags_ms),
+                            max_ms=max(e2e_lags_ms),
+                            count=len(e2e_lags_ms),
+                        )
 
                 # Kafka key cố định partition, nên cùng một thuê bao không bị tách
                 # qua hai shard. Mỗi partition vẫn được duyệt theo offset; chỉ thứ tự
@@ -178,6 +194,14 @@ class BaseKafkaConsumer(ABC):
                 }
                 if offsets:
                     await self.consumer.commit(offsets)
+                    self._processed_offsets.update(offsets)
+                    lag = 0
+                    for partition in self.consumer.assignment():
+                        highwater = self.consumer.highwater(partition)
+                        processed = self._processed_offsets.get(partition)
+                        if highwater is not None and processed is not None:
+                            lag += max(0, highwater - processed)
+                    self.metrics.set_kafka_lag(lag)
         finally:
             await self.stop()
 

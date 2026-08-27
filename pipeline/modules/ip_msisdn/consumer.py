@@ -3,6 +3,7 @@ from __future__ import annotations
 import ipaddress
 import logging
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 from pipeline.modules.ip_msisdn.redis_store import IPMappingStore
@@ -67,14 +68,18 @@ class IPMsisdnConsumer(BaseKafkaConsumer):
             except InvalidMessageError as exc:
                 await self.send_to_dlq(record, exc)
 
+        stage_started = time.monotonic()
         await self.db.persist_session_batch(list(session_by_id.values()))
+        self.metrics.observe_stage("postgres", time.monotonic() - stage_started)
         self.metrics.increment("postgres_records", len(session_by_id))
         redis_batch = []
 
         async def flush_redis_batch() -> None:
             nonlocal redis_batch
             if redis_batch:
+                stage_started = time.monotonic()
                 changed = await self.store.apply_batch(redis_batch)
+                self.metrics.observe_stage("redis", time.monotonic() - stage_started)
                 self.metrics.increment("redis_records", changed)
                 redis_batch = []
 
@@ -94,9 +99,13 @@ class IPMsisdnConsumer(BaseKafkaConsumer):
                 })
             elif status == "accounting-off":
                 await flush_redis_batch()
+                stage_started = time.monotonic()
                 await self.db.mark_nas_sessions_inactive(nas, occurred_at)
+                self.metrics.observe_stage("postgres", time.monotonic() - stage_started)
                 self.metrics.increment("postgres_records")
+                stage_started = time.monotonic()
                 removed = await self.store.accounting_off(nas, occurred_at)
+                self.metrics.observe_stage("redis", time.monotonic() - stage_started)
                 self.metrics.increment("redis_records", removed)
             self.metrics.increment("events_detected")
         await flush_redis_batch()

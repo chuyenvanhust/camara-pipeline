@@ -1,65 +1,110 @@
-# `pipeline/modules/device_swap/` — Module 2: Phát hiện đổi thiết bị (IMEI)
+# `pipeline/modules/device_swap/` — Module 2: Phát Hiện Đổi Thiết Bị (IMEI Tracking)
 
-Consumer group: `cg-device-swap`. Theo dõi IMEI hiện tại gắn với mỗi MSISDN; khi IMEI thay
-đổi so với lần gần nhất, ghi nhận đây là sự kiện **Device Swap**, phục vụ API
-**Device Swap** của CAMARA (callback cho subscriber khi thuê bao đổi máy — hữu ích cho các
-use case chống gian lận, xác thực 2 lớp).
+Consumer Group: `cg-device-swap`. Module này theo dõi mã định danh thiết bị phần cứng di động (**IMEI / IMEISV**) gắn với mỗi số thuê bao (**MSISDN**). Khi phát hiện thuê bao chuyển thẻ SIM sang một thiết bị khác (IMEI thay đổi so với bản ghi gần nhất), hệ thống ghi nhận sự kiện **Device Swap**, phục vụ trực tiếp cho chuẩn API **CAMARA Device Swap** (chống gian lận tài chính, xác thực bảo mật 2 lớp).
 
-| File | Vai trò |
-|---|---|
-| `consumer.py` | `DeviceSwapConsumer` — logic phát hiện swap, ghi state/history/audit/notification |
-| `notifier.py` | Stub deprecated — xem giải thích outbox pattern ở `../shared/README.md` |
+---
 
-## Luồng xử lý 1 message (khái niệm, xem thực thi tối ưu ở batch bên dưới)
+## 1. Sơ đồ luồng phát hiện Đổi Thiết Bị (Device Swap Flow)
 
-1. Lấy `msisdn` + `imei` mới từ message. Thiếu 1 trong 2 → bỏ qua (`ignored`).
-2. Tra IMEI hiện tại: **Redis trước** (`device:<msisdn>`), **Postgres sau** nếu cache miss
-   (`msisdn_device` table).
-3. Nếu chưa từng thấy MSISDN này (không có ở cả Redis lẫn Postgres) → coi là lần đầu ghi
-   nhận thiết bị, upsert state, **không** tính là swap, **không** ghi history/audit.
-4. Nếu IMEI mới == IMEI cũ → không có gì thay đổi, bỏ qua.
-5. Nếu khác → validate `event_time` từ message (xem mục timestamp bên dưới). Nếu hợp lệ:
-   ghi nhận Device Swap — cập nhật state, insert `device_swap_history`, insert `audit_log`
-   (`event_type='DEVICE_SWAP'`), và với mỗi subscription đang active của MSISDN này cho event
-   type `DEVICE_SWAP`, insert `notification_log` (status `PENDING`).
+```mermaid
+flowchart TD
+    MSG["Kafka Record (radius.accounting.raw)"] --> PARSE["Parse & Validate:<br/>- msisdn (E.164)<br/>- imei (3GPP VSA 20)<br/>- event_timestamp (UTC)"]
 
-## Xử lý timestamp — vì sao không fallback về `now()`
+    PARSE --> CACHE_LOOKUP["Tra cứu Trạng Thái Hiện Tại (State Lookup):<br/>1. Redis: MGET device:MSISDN<br/>2. Cache Miss: PostgreSQL batch_get_device_state()"]
 
-`_parse_event_time()` đọc `timestamp`/`event_timestamp` từ message, parse ISO format. **Nếu
-parse thất bại, trả về `None` thay vì âm thầm dùng `datetime.now()`.** Caller (cả
-`process_message` và `process_batch`) khi nhận `None` sẽ tăng counter `errors`, log warning,
-và **bỏ qua message đó hoàn toàn** — không ghi swap event với timestamp sai.
+    CACHE_LOOKUP --> DECISION{So sánh IMEI Mới vs IMEI Cũ}
 
-Lý do: nếu fallback về `now()`, một message bị trễ hàng giờ do retry/network delay sẽ bị ghi
-nhận với timestamp xử lý thay vì timestamp thật sự xảy ra ở GGSN, làm sai lệch toàn bộ dữ
-liệu lịch sử swap (order sai, khoảng cách giữa 2 lần swap sai) — hậu quả xa hơn ảnh hưởng cả
-tới các API dùng field như `LastTimeSIMChange`/tương đương cho device swap.
+    DECISION -->|Chưa có dữ liệu cũ<br/>(Lần đầu thấy MSISDN)| INIT["Khởi tạo trạng thái ban đầu:<br/>- Upsert msisdn_device<br/>- KHÔNG tính là Swap<br/>- KHÔNG ghi History/Outbox"]
 
-## `process_batch()` — chiến lược tối ưu round-trip DB/Redis
+    DECISION -->|IMEI Mới == IMEI Cũ| SAME["Không đổi máy:<br/>- Bỏ qua (ignored counter +1)"]
 
-Vì phải tra cứu state hiện tại cho **nhiều MSISDN cùng lúc** trước khi biết ai swap ai không,
-batch được xử lý theo từng giai đoạn thay vì lặp tuần tự gọi DB cho từng message:
+    DECISION -->|Bản ghi cũ hơn<br/>(Out-of-Order / Duplicate)| OLD["Sự kiện đến trễ / trùng event_id:<br/>- Bỏ qua (ignored counter +1)"]
 
-1. Lọc message hợp lệ (có đủ `msisdn` + `imei`).
-2. `MGET` toàn bộ `device:<msisdn>` unique trong batch — 1 round-trip Redis.
-3. Với các MSISDN cache-miss, `batch_get_current_imei()` — 1 round-trip Postgres
-   (`WHERE msisdn = ANY($1::text[])`) thay vì N query riêng.
-4. Duyệt từng message theo state đã có trong bộ nhớ (`redis_state` dict, được cập nhật ngay
-   sau mỗi message xử lý trong batch để message thứ 2 của cùng 1 MSISDN trong cùng batch thấy
-   đúng state mới nhất — quan trọng nếu 1 thuê bao đổi máy 2 lần liên tiếp trong cùng 1 batch).
-5. Gom toàn bộ thao tác ghi (`init_records`, `swap_upserts`, `swap_records`, `swap_audit`,
-   `notification_records`) vào list, rồi gọi **1 lần duy nhất**
-   `db.commit_device_swap_batch()` — atomic transaction, xem chi tiết ở
-   [`../shared/README.md`](../shared/README.md).
-6. Redis chỉ được cập nhật (`MSET`) **sau khi** Postgres commit thành công — Redis không nằm
-   trong transaction Postgres (khác engine), nên coi Redis là projection có thể rebuild từ
-   Postgres, cập nhật sau để tránh trạng thái Redis "nói đã swap" nhưng Postgres rollback.
+    DECISION -->|IMEI Mới != IMEI Cũ<br/>& Phiên bản mới hơn| SWAP_EVENT["PHÁT HIỆN SỰ KIỆN DEVICE SWAP:<br/>1. Cập nhật In-memory State<br/>2. Chuẩn bị Atomic DB Transaction"]
 
-## Bảng Postgres liên quan
+    SWAP_EVENT --> ATOMIC_TX["Thực Thi Giao Dịch PostgreSQL (Atomic Transaction):<br/>- Upsert msisdn_device (State mới)<br/>- Insert device_swap_history (Lịch sử)<br/>- Insert audit_log (Kiểm toán)<br/>- Insert notification_log (Outbox status=PENDING)"]
 
-- `msisdn_device` — state hiện tại (1 dòng / MSISDN), upsert qua `ON CONFLICT`.
-- `device_swap_history` — lịch sử mọi lần swap, insert-only, dùng `copy_records_to_table`
-  cho hiệu năng cao khi batch lớn.
-- `audit_log` — audit chung toàn hệ thống, chỉ ghi khi thực sự có swap (không ghi cho lần đầu
-  gặp MSISDN).
-- `notification_log` — outbox, xem `../shared/README.md`.
+    INIT --> ATOMIC_TX
+    ATOMIC_TX --> REDIS_SYNC["Cập nhật Redis Cache:<br/>MSET device:MSISDN"]
+    SAME --> COMMIT_OFFSET["Commit Kafka Offset"]
+    OLD --> COMMIT_OFFSET
+    REDIS_SYNC --> COMMIT_OFFSET
+```
+
+---
+
+## 2. Chiến lược Tối ưu hóa Batching (`process_batch`)
+
+Để đạt thông lượng hàng chục nghìn message/giây, module thực hiện xử lý batch theo quy trình 5 bước nghiêm ngặt:
+
+1. **Trích xuất & Gom nhóm MSISDN**:
+   - Lọc các bản ghi hợp lệ trong batch, gom tập hợp các `msisdn` duy nhất.
+2. **Đọc State Đa Tầng 2 Bước (Two-Tier State Read)**:
+   - **Bước 1**: Đọc song song toàn bộ danh sách MSISDN từ Redis bằng 1 lệnh `MGET` duy nhất (`device:<msisdn>`).
+   - **Bước 2**: Với các MSISDN bị cache miss, thực hiện đúng 1 truy vấn PostgreSQL:
+     ```sql
+     SELECT msisdn, imei_current AS value, last_event_at, last_event_id,
+            last_source_partition, last_source_offset
+     FROM msisdn_device
+     WHERE msisdn = ANY($1::text[])
+     ```
+3. **Phát Hiện & Cập Nhật State Nội Bộ (In-batch State Mutation)**:
+   - Khi duyệt qua từng bản ghi trong batch, state in-memory của MSISDN được cập nhật ngay lập tức.
+   - Điều này đảm bảo tính đúng đắn khi một thuê bao đổi máy nhiều lần liên tiếp trong cùng một batch (bản ghi thứ 2 sẽ so sánh với kết quả của bản ghi thứ 1).
+   - Sử dụng `dict` theo `msisdn` để giữ lại bản ghi mới nhất cho mỗi thuê bao, tránh xung đột `CardinalityViolationError` khi thực thi câu lệnh SQL `ON CONFLICT DO UPDATE`.
+4. **Giao dịch Cơ sở dữ liệu Nguyên tử (`db.persist_device_batch`)**:
+   - Mở 1 `connection.transaction()` duy nhất để thực thi đồng thời cả 4 thao tác ghi.
+5. **Đồng bộ Read Cache (`redis.mset`)**:
+   - Chỉ cập nhật cache Redis **sau khi** PostgreSQL commit thành công, đảm bảo Redis luôn là hình chiếu trung thực của dữ liệu nguồn.
+
+---
+
+## 3. Cấu trúc Bảng Cơ Sở Dữ Liệu
+
+### Bảng `msisdn_device` (Trạng thái hiện tại)
+```sql
+CREATE TABLE msisdn_device (
+    msisdn VARCHAR(16) PRIMARY KEY,
+    imei_current VARCHAR(32) NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_event_at TIMESTAMPTZ NOT NULL,
+    last_event_id VARCHAR(128) NOT NULL,
+    last_source_partition INT NOT NULL,
+    last_source_offset BIGINT NOT NULL
+);
+```
+
+### Bảng `device_swap_history` (Lịch sử đổi thiết bị)
+```sql
+CREATE TABLE device_swap_history (
+    id BIGSERIAL PRIMARY KEY,
+    event_id VARCHAR(128) NOT NULL UNIQUE,
+    source_topic VARCHAR(128) NOT NULL,
+    source_partition INT NOT NULL,
+    source_offset BIGINT NOT NULL,
+    msisdn VARCHAR(16) NOT NULL,
+    imei_old VARCHAR(32),
+    imei_new VARCHAR(32) NOT NULL,
+    changed_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
+
+---
+
+## 4. Định dạng Payload Thông báo Outbox (CAMARA Schema)
+
+Khi phát hiện sự kiện Device Swap, hệ thống sinh payload JSON ghi vào `notification_log`:
+
+```json
+{
+  "event_id": "radius:9f8a7b6c5d4e3f2a1b0c...",
+  "event_type": "DEVICE_SWAP",
+  "msisdn": "+84981234567",
+  "details": {
+    "imei_old": "860123045678901",
+    "imei_new": "860987065432109",
+    "event_time": "2026-08-27T08:31:00.000000+00:00"
+  }
+}
+```

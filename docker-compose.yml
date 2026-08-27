@@ -39,6 +39,10 @@ services:
     image: confluentinc/cp-kafka:7.5.0
     container_name: camara-kafka
     restart: unless-stopped
+    # Kafka cần thời gian đóng replica/log và xóa ephemeral broker-id khỏi
+    # ZooKeeper. Timeout mặc định 10s có thể SIGKILL broker cũ (exit 137), làm
+    # container mới gặp NodeExists cho tới khi ZooKeeper hết session timeout.
+    stop_grace_period: 60s
     depends_on:
       zookeeper:
         condition: service_healthy
@@ -60,9 +64,17 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: ${KAFKA_MIN_INSYNC_REPLICAS:-2}
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: ${KAFKA_REPLICATION_FACTOR:-3}
       KAFKA_MIN_INSYNC_REPLICAS: ${KAFKA_MIN_INSYNC_REPLICAS:-2}
-      KAFKA_HEAP_OPTS: -Xmx${KAFKA_HEAP_MB:-1536}m -Xms${KAFKA_HEAP_MB:-1536}m
-      KAFKA_NUM_NETWORK_THREADS: ${KAFKA_NUM_NETWORK_THREADS:-4}
-      KAFKA_NUM_IO_THREADS: ${KAFKA_NUM_IO_THREADS:-8}
+      # reset.sh cần xóa topic nghiệp vụ một cách tường minh. Khai báo rõ thay
+      # vì phụ thuộc default khác nhau giữa các Kafka image/version.
+      KAFKA_DELETE_TOPIC_ENABLE: "true"
+      KAFKA_AUTO_LEADER_REBALANCE_ENABLE: "true"
+      KAFKA_LEADER_IMBALANCE_CHECK_INTERVAL_SECONDS: "5"
+      KAFKA_LEADER_IMBALANCE_PER_BROKER_PERCENTAGE: "1"
+      KAFKA_NUM_NETWORK_THREADS: ${KAFKA_NUM_NETWORK_THREADS:-8}
+      KAFKA_NUM_IO_THREADS: ${KAFKA_NUM_IO_THREADS:-16}
+      KAFKA_SOCKET_SEND_BUFFER_BYTES: 1048576
+      KAFKA_SOCKET_RECEIVE_BUFFER_BYTES: 1048576
+      KAFKA_SOCKET_REQUEST_MAX_BYTES: 104857600
     healthcheck:
       test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list"]
       interval: 5s
@@ -98,7 +110,7 @@ services:
     image: postgres:15-alpine
     container_name: camara-postgres
     restart: unless-stopped
-    command: ["postgres", "-c", "synchronous_commit=on", "-c", "max_connections=120", "-c", "shared_buffers=512MB", "-c", "effective_cache_size=1536MB", "-c", "work_mem=8MB", "-c", "max_wal_size=2GB", "-c", "checkpoint_timeout=15min"]
+    command: ["postgres", "-c", "synchronous_commit=on", "-c", "max_connections=150", "-c", "shared_buffers=1GB", "-c", "effective_cache_size=3GB", "-c", "work_mem=16MB", "-c", "max_wal_size=4GB", "-c", "checkpoint_timeout=15min"]
     networks: [camara-network]
     environment:
       POSTGRES_USER: ${POSTGRES_LOCAL_USER:-postgres}
@@ -186,18 +198,18 @@ services:
     environment:
       <<: *pipeline-environment
       METRICS_PORT: "9200"
-      KAFKA_TOPIC_PARTITIONS: ${KAFKA_TOPIC_PARTITIONS:-12}
+      KAFKA_TOPIC_PARTITIONS: ${KAFKA_TOPIC_PARTITIONS:-16}
       KAFKA_REPLICATION_FACTOR: ${KAFKA_REPLICATION_FACTOR:-3}
       # F-PARALLEL: số instance CHẠY SONG SONG THẬT (asyncio task riêng, mỗi task
       # là 1 member Kafka riêng trong group -> partition được rebalance chia thật
       # ra nhiều task, không còn 1 task ôm hết partition). Xem run_pipeline.py.
-      CONSUMERS_PER_GROUP: ${CONSUMERS_PER_GROUP:-1}
+      CONSUMERS_PER_GROUP: ${CONSUMERS_PER_GROUP:-4}
       BATCH_MAX_RECORDS: ${BATCH_MAX_RECORDS:-4000}
       BATCH_TIMEOUT_MS: ${BATCH_TIMEOUT_MS:-20}
-      PROCESSING_PARTITION_CONCURRENCY: ${PROCESSING_PARTITION_CONCURRENCY:-2}
+      PROCESSING_PARTITION_CONCURRENCY: ${PROCESSING_PARTITION_CONCURRENCY:-3}
       THROUGHPUT_LOG_INTERVAL_SECONDS: ${THROUGHPUT_LOG_INTERVAL_SECONDS:-10}
-      DB_POOL_MIN: ${PIPELINE_DB_POOL_MIN:-4}
-      DB_POOL_MAX: ${PIPELINE_DB_POOL_MAX:-24}
+      DB_POOL_MIN: ${PIPELINE_DB_POOL_MIN:-6}
+      DB_POOL_MAX: ${PIPELINE_DB_POOL_MAX:-32}
     command: ["python", "-m", "pipeline.run_pipeline"]
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:9200/metrics >/dev/null"]
@@ -227,15 +239,17 @@ services:
       <<: *pipeline-environment
       RADIUS_SHARED_SECRET: ${RADIUS_SHARED_SECRET:-camara-radius-dev-secret}
       THROUGHPUT_LOG_INTERVAL_SECONDS: ${THROUGHPUT_LOG_INTERVAL_SECONDS:-10}
-      RADIUS_UDP_RECEIVE_BUFFER_BYTES: ${RADIUS_UDP_RECEIVE_BUFFER_BYTES:-16777216}
-      RADIUS_UDP_QUEUE_MAX_RECORDS: ${RADIUS_UDP_QUEUE_MAX_RECORDS:-20000}
-      RADIUS_UDP_KAFKA_BATCH_RECORDS: ${RADIUS_UDP_KAFKA_BATCH_RECORDS:-500}
-      RADIUS_UDP_KAFKA_BATCH_WAIT_MS: ${RADIUS_UDP_KAFKA_BATCH_WAIT_MS:-2}
-      RADIUS_UDP_KAFKA_MAX_INFLIGHT_BATCHES: ${RADIUS_UDP_KAFKA_MAX_INFLIGHT_BATCHES:-8}
+      RADIUS_UDP_RECEIVE_BUFFER_BYTES: ${RADIUS_UDP_RECEIVE_BUFFER_BYTES:-33554432}
+      RADIUS_UDP_QUEUE_MAX_RECORDS: ${RADIUS_UDP_QUEUE_MAX_RECORDS:-100000}
+      RADIUS_UDP_KAFKA_BATCH_RECORDS: ${RADIUS_UDP_KAFKA_BATCH_RECORDS:-250}
+      RADIUS_UDP_KAFKA_BATCH_WAIT_MS: ${RADIUS_UDP_KAFKA_BATCH_WAIT_MS:-5}
+      RADIUS_UDP_KAFKA_MAX_INFLIGHT_BATCHES: ${RADIUS_UDP_KAFKA_MAX_INFLIGHT_BATCHES:-32}
+      RADIUS_ACK_CACHE_MAX_RECORDS: ${RADIUS_ACK_CACHE_MAX_RECORDS:-500000}
+      RADIUS_ACK_CACHE_TTL_SECONDS: ${RADIUS_ACK_CACHE_TTL_SECONDS:-120}
     command: ["python", "-m", "pipeline.ingestion.producer", "--udp", "--port", "1813"]
     stop_grace_period: 30s
-    mem_limit: ${RADIUS_INGESTION_MEM_LIMIT:-512m}
-    cpus: ${RADIUS_INGESTION_CPUS:-1}
+    mem_limit: ${RADIUS_INGESTION_MEM_LIMIT:-1g}
+    cpus: ${RADIUS_INGESTION_CPUS:-2}
 
   notification-dispatcher:
     build:

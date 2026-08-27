@@ -8,7 +8,7 @@ import os
 import socket
 import struct
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, AsyncIterator, Dict, Tuple
 
 logger = logging.getLogger(__name__)
@@ -30,8 +30,11 @@ class RadiusEnvelope:
 class PacketReader:
     DEFAULT_RADIUS_PORT = 1813
     VENDOR_3GPP = 10415
-    STANDARD = {40: "acct_status_type", 44: "acct_session_id", 45: "acct_session_time",
-                31: "msisdn", 8: "framed_ip", 4: "nas_ip", 32: "nas_identifier"}
+    STANDARD = {
+        40: "acct_status_type", 41: "acct_delay_time", 44: "acct_session_id",
+        45: "acct_session_time", 55: "event_timestamp", 31: "msisdn",
+        8: "framed_ip", 4: "nas_ip", 32: "nas_identifier",
+    }
     VENDOR = {1: "imsi", 20: "imei", 21: "rat_type", 8: "mcc_mnc"}
     STATUS = {1: "start", 2: "stop", 3: "interim-update", 7: "accounting-on", 8: "accounting-off"}
 
@@ -99,18 +102,25 @@ class PacketReader:
                     if len(value) != 4:
                         raise PacketDecodeError(f"{name} must contain four bytes")
                     result[name] = socket.inet_ntoa(value)
-                elif attr_type in {40, 45}:
+                elif attr_type in {40, 41, 45, 55}:
                     if len(value) != 4:
                         raise PacketDecodeError(f"{name} must contain a 32-bit integer")
                     number = int.from_bytes(value, "big")
-                    result[name] = self.STATUS.get(number, number) if attr_type == 40 else number
+                    if attr_type == 40:
+                        result[name] = self.STATUS.get(number, number)
+                    elif attr_type == 55:
+                        result[name] = datetime.fromtimestamp(number, timezone.utc).isoformat()
+                    else:
+                        result[name] = number
                 else:
                     result[name] = self._text(value)
             offset += attr_len
 
-        now = datetime.now(timezone.utc).isoformat()
-        result["event_timestamp"] = now
-        result["ingest_timestamp"] = now
+        received_at = datetime.now(timezone.utc)
+        if "event_timestamp" not in result:
+            delay = max(int(result.get("acct_delay_time", 0)), 0)
+            result["event_timestamp"] = (received_at - timedelta(seconds=delay)).isoformat()
+        result["ingest_timestamp"] = received_at.isoformat()
         return result
 
     def _decode_vendor(self, value: bytes, result: Dict[str, Any]) -> None:

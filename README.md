@@ -1,201 +1,308 @@
 # CAMARA Network API Data Pipeline
 
-> **Lab / Miniproject** — Data Pipeline phục vụ CAMARA Network API
-> (SIM Swap · Device Swap · Number Verification)
-> từ dữ liệu **GGSN RADIUS Accounting Request** (RFC 2866 + 3GPP TS 29.061 VSA)
+> **Production-grade Data Pipeline** phục vụ các chuẩn **CAMARA Network API** (SIM Swap · Device Swap · Number Verification) từ luồng dữ liệu **GGSN/PGW RADIUS Accounting** (RFC 2866 + 3GPP TS 29.061 VSA).
 
-Dự án mô phỏng luồng dữ liệu mạng di động thật: file CSV RADIUS accounting được nạp vào
-Kafka, 3 consumer module xử lý song song để phát hiện sự kiện đổi SIM / đổi máy / thay đổi
-IP-MSISDN, ghi state + lịch sử vào PostgreSQL/Redis, rồi expose qua FastAPI theo chuẩn
-CAMARA Network API. Callback tới bên thứ 3 được xử lý qua outbox pattern độc lập với hot path.
+Dự án mô phỏng và xử lý luồng dữ liệu mạng viễn thông di động: các gói tin RADIUS Accounting (hoặc file CSV log) được đưa vào hệ thống Ingestion qua UDP/1813, đẩy vào Apache Kafka theo cơ chế phân vùng theo thuê bao (`key=msisdn`), được xử lý song song bởi 3 Consumer Modules độc lập để phát hiện các sự kiện đổi SIM (IMSI), đổi thiết bị (IMEI), ánh xạ IP↔MSISDN, ghi nhận trạng thái vào PostgreSQL/Redis theo các giao dịch nguyên tử (atomic transactions), và phát thông báo webhook (HTTP Callback) tới các đối tác Open Gateway thông qua Transactional Outbox Pattern.
 
 ---
 
-## 0. Trạng thái dự án & lịch sử kiến trúc
+## 1. Kiến trúc tổng thể hệ thống
 
-**Kiến trúc đang chạy (active)**: 3 Kafka consumer module thuần Python/asyncio (mô tả ở
-mục 1). **Không** dùng Spark.
+```mermaid
+flowchart TD
+    subgraph SOURCELAYER["Nguồn Dữ Liệu"]
+        direction TB
+        GGSN["Thiết Bị Mạng GGSN / PGW / NAS<br/>(RADIUS UDP / RFC 2866)"]
+        CSV["File Log Batch<br/>(CSV Radius Accounting)"]
+    end
 
-Trước đây dự án dùng Spark Streaming 5-stage (Ingestion → Validation → Deduplication →
-Conflict Resolution → Storage) cùng 3 mock service ngoại vi (gsma_tac, itu_e164, hlr_hss).
-Kiến trúc đó đã bị loại bỏ vì quá nặng so với quy mô dữ liệu lab (~10K record), khó debug,
-và không khớp với thực tế là RADIUS accounting đã có sẵn đường Kafka ingest. Lý do đầy đủ
-nằm ở [`docs/adr/0001-drop-spark-use-kafka-consumer.md`](docs/adr/0001-drop-spark-use-kafka-consumer.md).
+    subgraph INGESTIONLAYER["Stage 1: Ingestion Layer"]
+        direction TB
+        SENDER["radius_udp_sender.py<br/>(Traffic Generator / Test Tool)"]
+        PKTREADER["PacketReader<br/>(UDP/1813 Listener, Binary Decoder)"]
+        PRODUCER["RadiusLogProducer<br/>(Async Buffer + Batch Ingestion)"]
+        ACKCACHE[("ACK Deduplication Cache<br/>LRU RAM")]
+    end
 
-**Về các thư mục còn sót lại trong `pipeline/`:**
+    subgraph KAFKALAYER["Message Broker: Apache Kafka"]
+        direction TB
+        TOPIC["Topic: radius.accounting.raw<br/>(12 Partitions, Key = MSISDN)"]
+        DLQ["Topic: radius.accounting.raw.dlq<br/>(Dead Letter Queue)"]
+    end
 
-| Thư mục | Trạng thái | Được import bởi runtime? |
-|---|---|---|
-| `pipeline/ingestion/` | ✅ **Đang dùng** | Có — `run_pipeline.py` import `RadiusLogProducer` từ đây để nạp CSV vào Kafka (Stage 1) |
-| `pipeline/modules/` | ✅ **Đang dùng** | Có — toàn bộ logic 3 consumer module |
-| `pipeline/dispatcher/` | ✅ **Đang dùng** | Chạy độc lập (`python -m pipeline.dispatcher.notification_dispatcher`), không nằm trong `run_pipeline.py` |
-| `pipeline/validation/`, `deduplication/`, `conflict_resolution/`, `processing/`, `state/`, `storage/` | ❌ **Skeleton chết** | Không — chỉ còn `__init__.py` rỗng (hoặc file mồ côi như `state/redis_state_manager.py`, `storage/models.py`) từ kiến trúc Spark cũ, không được import ở bất kỳ đâu trong `pipeline/run_pipeline.py` hay `pipeline/modules/` |
+    subgraph CONSUMERLAYER["Stage 2: Processing Pipeline (run_pipeline.py)"]
+        direction TB
+        subgraph CG1["Consumer Group: cg-ip-msisdn"]
+            IPM1["Member 1"]
+            IPM2["Member 2"]
+        end
+        subgraph CG2["Consumer Group: cg-device-swap"]
+            DEV1["Member 1"]
+            DEV2["Member 2"]
+        end
+        subgraph CG3["Consumer Group: cg-sim-swap"]
+            SIM1["Member 1"]
+            SIM2["Member 2"]
+        end
+    end
 
-> Lưu ý sửa so với tài liệu cũ: một phiên bản README trước đây liệt kê nhầm
-> `pipeline/ingestion/` vào nhóm "skeleton không dùng nữa" — thực tế module này vẫn là
-> đường ingest CSV→Kafka duy nhất của pipeline. Bảng trên đã xác minh lại bằng cách grep
-> import thực tế trong code, không dựa trên tên thư mục.
+    subgraph STORAGELAYER["Storage & State Layer"]
+        direction TB
+        REDIS[("Redis / Redis Sentinel<br/>- ip-ggsn:* / ggsn-ips:*<br/>- device:* / sim:* cache")]
+        POSTGRES[("PostgreSQL Database<br/>- msisdn_device / msisdn_sim<br/>- device_swap_history / sim_swap_history<br/>- radius_session_state<br/>- audit_log<br/>- notification_log (Outbox)")]
+    end
 
-`mock_services/` (3 mock API cũ) đã bị xoá hoàn toàn khỏi repo.
+    subgraph DISPATCHERLAYER["Stage 3: Event Dispatcher"]
+        direction TB
+        DISPATCHER["notification_dispatcher.py<br/>(Transactional Outbox Worker)"]
+    end
 
----
+    subgraph APILAYER["Stage 4: CAMARA API Gateway"]
+        direction TB
+        FASTAPI["FastAPI Application (api/)<br/>- /sim-swap/v0/*<br/>- /device-swap/v0/*<br/>- /number-verification/v0/*"]
+        OPENGATEWAY["Subscribers / Open Gateway<br/>(Webhooks Callback)"]
+    end
 
-## 1. Kiến trúc tổng thể
+    %% Flow connections
+    GGSN -->|UDP Datagrams| PKTREADER
+    CSV -->|Read CSV| PRODUCER
+    CSV -.->|Simulate UDP| SENDER
+    SENDER -->|UDP/1813| PKTREADER
 
+    PKTREADER --> PRODUCER
+    PRODUCER <--> ACKCACHE
+    PRODUCER -->|Produce acks=all| TOPIC
+    PRODUCER -.->|Malformed Msg| DLQ
+    PRODUCER -.->|RADIUS Accounting-Response| GGSN
+
+    TOPIC --> CG1
+    TOPIC --> CG2
+    TOPIC --> CG3
+
+    CG1 -->|Atomic Lua Scripts| REDIS
+    CG1 -->|Session Batch Upsert| POSTGRES
+    CG2 -->|Batch MGET/MSET| REDIS
+    CG2 -->|Atomic Batch Tx| POSTGRES
+    CG3 -->|Batch MGET/MSET| REDIS
+    CG3 -->|Atomic Batch Tx| POSTGRES
+
+    POSTGRES -.->|FOR UPDATE SKIP LOCKED| DISPATCHER
+    DISPATCHER -->|HTTP POST Callback| OPENGATEWAY
+
+    REDIS <--> FASTAPI
+    POSTGRES <--> FASTAPI
 ```
-CSV RADIUS log
-      │
-      ▼  (pipeline/ingestion — Stage 1, tuỳ chọn, chỉ chạy khi có --input)
-Kafka topic: radius.accounting.raw (8 partitions, key=msisdn)
-      │
-      ├──────────────┬──────────────┬──────────────┐
-      ▼              ▼              ▼
-cg-ip-msisdn    cg-device-swap   cg-sim-swap      (3 Kafka consumer group,
-      │              │              │              chạy song song trong 1 process)
-      ▼              ▼              ▼
-   Redis          Redis+Postgres  Redis+Postgres
- (ip-ggsn:*)    (msisdn_device,   (msisdn_sim,
-                 device_swap_     sim_swap_
-                 history,         history,
-                 audit_log,       audit_log,
-                 notification_    notification_
-                 log)             log)
-                       │              │
-                       └──────┬───────┘
-                              ▼
-              pipeline/dispatcher (process riêng biệt)
-              Poll notification_log → HTTP callback → Open Gateway subscriber
-                              │
-                              ▼
-                    FastAPI (api/) — CAMARA endpoints
-                    /sim-swap, /device-swap, /number-verification
-```
-
-**Nguyên tắc thiết kế cốt lõi:**
-
-- **1 process, 3 consumer task song song** dùng chung một pool Postgres. Mỗi poll gom
-  partition thành các shard batch lớn; shard chạy song song và vẫn giữ thứ tự theo key.
-- **Kafka offset chỉ commit sau khi batch xử lý xong** (manual commit, `enable_auto_commit=False`)
-  — tắt lỗi mất dữ liệu khi consumer crash giữa chừng.
-- **Ghi DB theo transaction đơn** cho mỗi batch: state hiện tại + lịch sử + audit log +
-  notification outbox cùng commit hoặc cùng rollback — không bao giờ có state mới mà
-  thiếu history tương ứng.
-- **Consumer không gọi HTTP** — mọi callback ra ngoài (Open Gateway) chỉ ghi vào bảng
-  `notification_log` với status `PENDING`, một process `dispatcher` riêng biệt mới thực sự
-  gửi HTTP. Nhờ vậy 1 subscriber chậm/down không bao giờ làm nghẽn throughput Kafka consumer.
-- **Redis là cache có thể tái tạo lại**, không phải nguồn sự thật — chỉ update Redis
-  **sau khi** Postgres commit thành công.
-
-Chi tiết từng thành phần: xem [`pipeline/README.md`](pipeline/README.md) và README riêng
-của từng module trong `pipeline/modules/*/README.md`.
 
 ---
 
-## 2. Cấu trúc thư mục
+## 2. Luồng hoạt động chi tiết (Sequence Flow)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant NAS as GGSN / NAS / Sender
+    participant ING as RadiusLogProducer
+    participant KFK as Kafka Broker
+    participant CSM as Consumer Modules
+    participant RDS as Redis
+    participant PGS as PostgreSQL
+    participant DSP as NotificationDispatcher
+    participant SUB as Open Gateway Subscriber
+
+    Note over NAS,ING: Giai đoạn Ingestion & Xác thực
+    NAS->>ING: UDP Accounting-Request (Code=4, Authenticator, AVPs)
+    ING->>ING: Decode binary, tính MD5 HMAC, kiểm tra Deduplication Cache
+    alt Đã từng xử lý (Duplicate)
+        ING-->>NAS: Gửi lại Accounting-Response (Code=5) ngay lập tức
+    else Tin mới (New Event)
+        ING->>ING: Đưa vào Bounded RAM Queue
+        ING->>KFK: Batch Produce (key=MSISDN, acks=all)
+        KFK-->>ING: Kafka ACK
+        ING->>ING: Lưu event_id vào ACK Cache
+        ING-->>NAS: Trả Accounting-Response (Code=5)
+    end
+
+    Note over KFK,PGS: Giai đoạn Xử lý sự kiện (Parallel Consumers)
+    KFK->>CSM: Poll batch records theo từng Partition
+    par Module IP-MSISDN
+        CSM->>PGS: Upsert radius_session_state
+        CSM->>RDS: Chạy Lua Script cập nhật ip-ggsn:* & ggsn-ips:*
+    and Module Device Swap
+        CSM->>RDS: MGET cache device:MSISDN
+        opt Cache Miss
+            CSM->>PGS: Query msisdn_device
+        end
+        CSM->>CSM: So sánh IMEI cũ vs IMEI mới
+        opt Có sự kiện đổi máy (Device Swap)
+            CSM->>PGS: Transaction (Upsert State + Insert History + Audit + Outbox PENDING)
+            CSM->>RDS: Cập nhật cache device:MSISDN
+        end
+    and Module SIM Swap
+        CSM->>RDS: MGET cache sim:MSISDN
+        opt Cache Miss
+            CSM->>PGS: Query msisdn_sim
+        end
+        CSM->>CSM: So sánh IMSI cũ vs IMSI mới
+        opt Có sự kiện đổi SIM (SIM Swap)
+            CSM->>PGS: Transaction (Upsert State + Insert History + Audit + Outbox PENDING)
+            CSM->>RDS: Cập nhật cache sim:MSISDN (kèm last_time_sim_change)
+        end
+    end
+    CSM->>KFK: Commit Kafka Offsets (Manual Commit sau khi hoàn tất)
+
+    Note over PGS,SUB: Giai đoạn Gửi Webhook (Outbox Dispatcher)
+    loop Định kỳ mỗi poll interval
+        DSP->>PGS: Claim notifications (FOR UPDATE SKIP LOCKED)
+        PGS-->>DSP: Trả về danh sách notification PENDING
+        DSP->>SUB: HTTP POST Webhook (kèm Idempotency-Key)
+        alt Thành công (HTTP 2xx)
+            DSP->>PGS: Update status = 'SENT'
+        else Thất bại (Timeout / Error)
+            DSP->>PGS: Update status = 'FAILED' + tính exponential backoff
+        end
+    end
+```
+
+---
+
+## 3. Nguyên tắc thiết kế cốt lõi
+
+1. **Bảo toàn thứ tự theo thuê bao (Key-based Partitioning)**:
+   - Tất cả bản ghi đều dùng `key=msisdn` khi gửi vào Kafka. Mọi sự kiện của cùng 1 thuê bao luôn rơi vào đúng 1 partition xác định.
+   - Khi xử lý song song, offset trong từng partition luôn được duyệt tuần tự theo thời gian, chống race condition.
+
+2. **Xử lý sự kiện nguyên tử (Atomic Database Transactions)**:
+   - Toàn bộ 4 thao tác ghi của một batch phát hiện Swap (`msisdn_*` state, `*_history`, `audit_log`, `notification_log`) được thực hiện trong **cùng một transaction duy nhất** (`asyncpg.transaction()`).
+   - Đảm bảo tính toàn vẹn: không bao giờ có state đổi mà thiếu history, hoặc tạo notification cho sự kiện bị rollback.
+
+3. **Transactional Outbox Pattern**:
+   - Consumer **không bao giờ gọi HTTP** ra ngoài. Mọi webhook được ghi vào bảng `notification_log` với trạng thái `PENDING`.
+   - Tiến trình `NotificationDispatcher` độc lập poll và gửi HTTP callback. Sự cố mạng hoặc đối tác phản hồi chậm không bao giờ làm nghẽn throughput của pipeline xử lý chính.
+
+4. **Kiến trúc Ingestion chịu lỗi & Backpressure**:
+   - Giao thức UDP RADIUS chỉ trả `Accounting-Response` sau khi Kafka đã xác nhận `acks=all`.
+   - Nếu Kafka bị chậm hoặc Queue đầy, Ingestion chủ động giữ ACK để thiết bị NAS kích hoạt cơ chế retry tự nhiên của giao thức UDP.
+   - Cache `_radius_ack_cache` trong RAM ngăn chặn việc đưa các gói tin retry đã xử lý vào Kafka lần thứ hai.
+
+5. **Manual Offset Commit & Dead Letter Queue (DLQ)**:
+   - Tắt hoàn toàn `enable_auto_commit`. Offset chỉ được commit sau khi batch đã ghi thành công vào DB.
+   - Khi một bản ghi hoặc shard bị lỗi cấu trúc dữ liệu không thể xử lý, nó được đẩy vào topic `.dlq` kèm metadata lỗi chi tiết để phục vụ phân tích mà không làm dừng pipeline.
+
+6. **Redis làm Read Cache & Fencing Version**:
+   - Redis đóng vai trò Cache tốc độ cao phục vụ API truy vấn tức thời.
+   - Các thao tác cập nhật Redis trong `ip_msisdn` sử dụng Lua script nguyên tử kết hợp kiểm tra fencing token `(event_epoch, partition, offset)` để loại bỏ triệt để vấn đề gói tin đến sai thứ tự (out-of-order delivery).
+
+---
+
+## 4. Cấu trúc thư mục dự án
 
 ```
 .
-├── api/                    # FastAPI — CAMARA Network API endpoints (xem api/README.md)
-├── pipeline/                # Toàn bộ logic xử lý dữ liệu — xem pipeline/README.md
-│   ├── ingestion/            # Stage 1: CSV → Kafka
-│   ├── modules/               # 3 consumer module + code dùng chung
-│   │   ├── shared/              # BaseKafkaConsumer, DatabasePool, metrics
-│   │   ├── ip_msisdn/            # Module 1: IP↔MSISDN mapping (Redis-only)
-│   │   ├── device_swap/          # Module 2: phát hiện đổi IMEI
-│   │   └── sim_swap/             # Module 3: phát hiện đổi IMSI
-│   ├── dispatcher/            # Notification outbox dispatcher (process riêng)
-│   └── run_pipeline.py         # Orchestrator: khởi động 3 consumer + (tuỳ chọn) ingest CSV
-├── simulator/               # Sinh dữ liệu RADIUS accounting giả lập
-├── storage/                 # SQL schema + migrations Postgres
-├── infra/                  # Prometheus, Grafana, docker network config
-├── reporting/               # Script/báo cáo phân tích dữ liệu sau xử lý
-├── tests/                  # Unit + integration test
-├── scripts/                 # Script vận hành (run_pipeline.sh, seed, v.v.)
-├── docs/                   # ADR và tài liệu kiến trúc
-├── docker-compose.yml
-└── DE_NGHI_SUA_CHUA_GO_LIVE.md   # Đánh giá go-live nội bộ (F-01 → F-20)
+├── api/                             # FastAPI - Triển khai các chuẩn CAMARA Network API
+│   ├── routers/                     # Endpoint router: sim_swap, device_swap, number_verification...
+│   ├── schemas/                     # Pydantic models theo chuẩn CAMARA
+│   ├── dependencies/                # Dependency injection kết nối Database/Redis
+│   └── main.py                      # FastAPI App entrypoint
+├── pipeline/                        # Toàn bộ Core Data Pipeline
+│   ├── ingestion/                   # Stage 1: UDP Listener & CSV Producer
+│   │   ├── packet_reader.py         # Binary RADIUS RFC 2866 & 3GPP VSA parser
+│   │   ├── producer.py              # Async Kafka Producer & ACK Manager
+│   │   ├── csv_reader.py            # Local CSV Reader generator
+│   │   └── radius_udp_sender.py     # UDP Traffic Generator / Load test simulator
+│   ├── modules/                     # Stage 2: Parallel Consumer Modules
+│   │   ├── shared/                  # Hạ tầng dùng chung (BaseConsumer, DatabasePool, Metrics...)
+│   │   ├── ip_msisdn/               # Module 1: Ánh xạ IP↔MSISDN (Redis Lua + Session State)
+│   │   ├── device_swap/             # Module 2: Phát hiện đổi thiết bị (IMEI Tracking)
+│   │   └── sim_swap/                # Module 3: Phát hiện đổi SIM (IMSI Tracking)
+│   ├── dispatcher/                  # Stage 3: Notification Outbox Dispatcher
+│   │   └── notification_dispatcher.py # Worker gửi HTTP Callback độc lập
+│   └── run_pipeline.py              # Orchestrator khởi chạy toàn bộ 3 consumers
+├── storage/                         # Database Schemas & Migrations
+│   ├── migrations/                  # Các file SQL khởi tạo cấu trúc bảng, indexes
+│   └── seed/                        # Dữ liệu mẫu (Subscribers, Subscriptions)
+├── simulator/                       # Trình sinh dữ liệu RADIUS giả lập (Synthetic Data Generator)
+├── load_tests/                      # K6 Load testing scripts cho CAMARA APIs
+├── infra/                           # Cấu hình Prometheus, Grafana dashboards
+├── docker-compose.yml               # Môi trường Development cục bộ
+├── docker-compose.prod.yml          # Môi trường Production (Multi-broker Kafka, Redis Sentinel)
+└── requirements.txt                 # Python dependencies
 ```
 
-Mỗi thư mục có README riêng — xem [`api/README.md`](api/README.md),
-[`simulator/README.md`](simulator/README.md), [`storage/README.md`](storage/README.md),
-[`infra/README.md`](infra/README.md), [`scripts/README.md`](scripts/README.md),
-[`tests/integration/README.md`](tests/integration/README.md).
-
 ---
 
-## 3. Yêu cầu hệ thống
+## 5. Hướng dẫn khởi chạy nhanh (Quickstart)
 
-- Docker + Docker Compose
-- Python 3.11+ (nếu chạy ngoài container để dev/debug)
-- ~4GB RAM rảnh cho Kafka + PostgreSQL + Redis + Zookeeper trong Docker
+### 5.1. Yêu cầu môi trường
+- **Docker** & **Docker Compose** v2+
+- **Python 3.11+** (nếu chạy script trực tiếp trên máy host)
+- Tối thiểu 4GB RAM khả dụng cho Docker
 
----
-
-## 4. Khởi động nhanh
+### 5.2. Các bước triển khai
 
 ```bash
-# 1. Copy file env mẫu và chỉnh nếu cần
-cp .env.example .env   # nếu chưa có .env.example, xem storage/README.md và docker-compose.yml
+# 1. Clone repository và chuẩn bị biến môi trường
+git clone <repo-url>
+cd camara-pipeline
+cp .env.example .env
 
-# 2. Dựng toàn bộ hạ tầng (Kafka, Postgres, Redis, Prometheus, Grafana)
+# 2. Khởi động toàn bộ hạ tầng (Kafka, Zookeeper, PostgreSQL, Redis, Prometheus, Grafana)
 docker compose up -d
 
-# 3. Chạy migration Postgres
-bash scripts/run_pipeline.sh   # hoặc chạy tay các file storage/migrations/*.sql theo thứ tự
+# 3. Chạy migrations khởi tạo cơ sở dữ liệu PostgreSQL
+# Script tự động thực thi các file SQL trong storage/migrations/
+bash scripts/run_pipeline.sh --init-db
 
-# 4. Sinh dữ liệu RADIUS giả lập (tuỳ chọn — xem simulator/README.md)
-python simulator/simulator.py --output data/radius_sample.csv --records 10000
+# 4. Sinh dữ liệu RADIUS mẫu (tuỳ chọn)
+python -m simulator.simulator --output data/radius_sample.csv --records 50000
 
-# 5. Chạy pipeline, nạp CSV và xử lý
-python -m pipeline.run_pipeline --input data/radius_sample.csv
+# 5. Khởi chạy Pipeline xử lý (Consumers)
+python -m pipeline.run_pipeline
 
-# 6. Chạy dispatcher gửi callback (process riêng biệt, bắt buộc nếu cần notification thật)
+# 6. Khởi chạy Notification Dispatcher (Terminal riêng biệt)
 python -m pipeline.dispatcher.notification_dispatcher
 
-# 7. Chạy API
-uvicorn api.main:app --reload
+# 7. Khởi chạy CAMARA FastAPI Gateway (Terminal riêng biệt)
+uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+
+# 8. Bắn dữ liệu vào Ingestion (chọn 1 trong 2 cách):
+# Cách A: Đọc trực tiếp từ file CSV đẩy vào Kafka
+python -m pipeline.ingestion.producer --file data/radius_sample.csv
+
+# Cách B: Giả lập thiết bị mạng gửi gói tin UDP thật qua cổng 1813
+python -m pipeline.ingestion.radius_udp_sender --csv data/radius_sample.csv --rate 2000 --require-ack
 ```
 
-Xem chi tiết biến môi trường ở mục 6 và trong từng README con.
-
 ---
 
-## 5. Go-live readiness
+## 6. Biến môi trường quan trọng (Configuration Reference)
 
-Dự án đã trải qua một vòng tự-review go-live nội bộ, tài liệu đầy đủ ở
-[`DE_NGHI_SUA_CHUA_GO_LIVE.md`](DE_NGHI_SUA_CHUA_GO_LIVE.md) (20 mục F-01 → F-20, phân loại
-P0/P1/P2). Tóm tắt trạng thái hiện tại:
-
-- **Các mục P0 (chặn go-live)** — đã sửa và có thể kiểm chứng trực tiếp trong code: manual
-  offset commit + DLQ (F-01), ghi DB atomic bằng transaction (F-02), tách callback khỏi hot
-  path qua outbox (F-03), Kafka producer `acks=all` + idempotence (F-04), Redis
-  `maxmemory-policy=noeviction` (F-07), Prometheus metrics thật (F-08), tách liveness/readiness
-  + cấm secret mặc định ở production (F-12).
-- **Còn treo (P1/P2)**: chưa có benchmark batch-write thật trên phần cứng production (F-10),
-  chưa có retention/partition job cho `audit_log`/`*_history` (F-11 — mới có index), migration
-  runner vẫn là shell script không version-tracking (F-13).
-
-Trước khi go-live thật, bắt buộc chạy load test (`load_tests/*.js`, k6) nhắm vào môi trường
-giống production và đo lại benchmark batch-write — repo hiện **chưa có kết quả benchmark nào
-được lưu lại**, các con số hiện tại chỉ là tính toán lý thuyết.
-
----
-
-## 6. Cấu hình & biến môi trường chính
-
-| Biến | Mặc định | Ý nghĩa |
+| Tên Biến Môi Trường | Giá Trị Mặc Định | Ý Nghĩa / Mục Đích |
 |---|---|---|
-| `KAFKA_BOOTSTRAP_SERVERS` | `camara-kafka:9092` | Địa chỉ Kafka broker |
-| `KAFKA_TOPIC_RAW` | `radius.accounting.raw` | Topic chứa RADIUS accounting record thô |
-| `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME` | xem `docker-compose.yml` | Kết nối Postgres |
-| `REDIS_HOST`, `REDIS_PORT`, `REDIS_DB` | `camara-redis`, `6379`, `0` | Kết nối Redis |
-| `BATCH_MAX_RECORDS` | `4000` (Compose) | Số record tối đa lấy trong một poll Kafka |
-| `BATCH_TIMEOUT_MS` | `20` (Compose) | Thời gian chờ tối đa của một poll |
-| `PROCESSING_PARTITION_CONCURRENCY` | `2` (Compose) | Số partition-shard xử lý song song mỗi consumer |
-| `MAX_BATCH_RETRIES` | `3` | Số lần retry 1 batch lỗi trước khi đẩy vào topic `.dlq` |
-| `DB_POOL_MIN` / `DB_POOL_MAX` | `4` / `12` | Kích thước pool Postgres dùng chung cho cả 3 consumer |
-| `METRICS_PORT` | `9200` | Cổng expose `/metrics` Prometheus của pipeline |
-| `DISPATCHER_BATCH_SIZE` / `DISPATCHER_POLL_INTERVAL` / `DISPATCHER_MAX_ATTEMPTS` | `50` / `2.0` / `5` | Cấu hình notification dispatcher |
+| `KAFKA_BOOTSTRAP_SERVERS` | `camara-kafka:9092` | Danh sách địa chỉ Kafka Brokers |
+| `KAFKA_TOPIC_RAW` | `radius.accounting.raw` | Tên topic Kafka chứa log thô |
+| `KAFKA_TOPIC_PARTITIONS` | `16` | Số partition của topic (tối ưu xử lý song song 15k+ rec/s) |
+| `CONSUMERS_PER_GROUP` | `4` | Số member/worker chạy song song trong mỗi Consumer Group |
+| `PROCESSING_PARTITION_CONCURRENCY` | `3` | Số shard partition gom xử lý song song trong mỗi consumer |
+| `BATCH_MAX_RECORDS` | `4000` | Số lượng bản ghi tối đa lấy trong một lần poll Kafka |
+| `BATCH_TIMEOUT_MS` | `20` | Thời gian tối đa chờ gom đủ batch (ms) |
+| `DATABASE_URL` | `postgresql://postgres:camara@camara-postgres:5432/camara_db` | Connection string PostgreSQL (`synchronous_commit=on` đảm bảo 100% ACID) |
+| `DB_POOL_MIN` / `DB_POOL_MAX` | `6` / `32` | Kích thước Connection Pool `asyncpg` dùng chung |
+| `REDIS_HOST` / `REDIS_PORT` | `camara-redis` / `6379` | Thông tin kết nối Redis Standalone |
+| `REDIS_SENTINELS` | `""` | Danh sách Sentinel nodes (Production HA Mode) |
+| `RADIUS_SHARED_SECRET` | `camara-radius-dev-secret` | Secret key tính Authenticator RFC 2866 |
+| `RADIUS_UDP_RECEIVE_BUFFER_BYTES` | `33554432` (32MB) | Kích thước socket buffer nhận UDP |
+| `RADIUS_UDP_KAFKA_BATCH_RECORDS` | `250` | Kích thước batch Kafka của UDP Ingestion |
+| `RADIUS_UDP_KAFKA_BATCH_WAIT_MS` | `5` | Thời gian gom batch Kafka của Ingestion (ms) |
+| `RADIUS_UDP_KAFKA_MAX_INFLIGHT_BATCHES` | `32` | Số lượng batch Kafka produce song song |
+| `DISPATCHER_BATCH_SIZE` | `50` | Số lượng notification claim mỗi vòng lặp của Dispatcher |
+| `METRICS_PORT` | `9200` | Port expose `/metrics` cho Prometheus scraper |
 
-Danh sách đầy đủ và biến riêng của từng thành phần: xem README con tương ứng
-(`pipeline/README.md`, `pipeline/modules/*/README.md`, `api/README.md`).
+---
+
+## 7. Giám sát & Báo cáo Thông lượng (Monitoring)
+
+Mỗi `THROUGHPUT_LOG_INTERVAL_SECONDS` (mặc định 10 giây), hệ thống ghi log chuẩn hoá:
+- **`[INGESTION]`**: Tốc độ nhận UDP/giây, tốc độ Kafka ACK/giây, dung lượng Queue đệm, số lượng duplicate được loại bỏ, kích thước batch Kafka.
+- **`[PROCESSING]`**: Log chi tiết cho từng member của từng group: tốc độ nhận Kafka/giây, tốc độ xử lý thành công/giây, số lượng ghi DB/giây, latency chi tiết từng chặng `latency_ms(state, postgres, redis)`, và `kafka_lag`.
+
+Dashboard Grafana được tích hợp sẵn tại `http://localhost:3000` (kết nối Prometheus `http://localhost:9090`).

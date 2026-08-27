@@ -12,15 +12,21 @@ _EVENTS_DETECTED = None
 _BATCH_ERRORS = None
 _BATCH_LATENCY = None
 _STAGE_RECORDS = None
+_STAGE_LATENCY = None
+_KAFKA_LAG = None
+
+
+_E2E_LATENCY = None
 
 
 def _init_prometheus():
     """Initialize Prometheus metrics if prometheus_client is available."""
-    global _prom_initialized, _BATCH_PROCESSED, _EVENTS_DETECTED, _BATCH_ERRORS, _BATCH_LATENCY, _STAGE_RECORDS
+    global _prom_initialized, _BATCH_PROCESSED, _EVENTS_DETECTED, _BATCH_ERRORS
+    global _BATCH_LATENCY, _STAGE_RECORDS, _STAGE_LATENCY, _KAFKA_LAG, _E2E_LATENCY
     if _prom_initialized:
         return
     try:
-        from prometheus_client import Counter, Histogram
+        from prometheus_client import Counter, Gauge, Histogram
         _BATCH_PROCESSED = Counter(
             "pipeline_batch_processed_total",
             "Tổng records đã xử lý",
@@ -46,6 +52,21 @@ def _init_prometheus():
             "Records completed at each pipeline stage",
             ["group_id", "stage"],
         )
+        _STAGE_LATENCY = Histogram(
+            "pipeline_stage_latency_seconds",
+            "Latency of internal pipeline stages",
+            ["group_id", "stage"],
+        )
+        _KAFKA_LAG = Gauge(
+            "pipeline_kafka_lag_records",
+            "Approximate records behind the Kafka high watermark",
+            ["group_id", "member"],
+        )
+        _E2E_LATENCY = Histogram(
+            "pipeline_e2e_message_lag_seconds",
+            "Độ trễ từ khi gói tin vào Ingestion đến khi hoàn tất ghi DB/Redis",
+            ["group_id"],
+        )
         _prom_initialized = True
     except ImportError:
         logger.debug("prometheus_client not installed — Prometheus metrics disabled")
@@ -55,6 +76,7 @@ def _init_prometheus():
 class ModuleMetrics:
     def __init__(self, name: str):
         self.name = name
+        self.member: str | None = None
         self.counters: Dict[str, int] = {
             "processed": 0,
             "success": 0,
@@ -69,6 +91,12 @@ class ModuleMetrics:
             "redis_records": 0,
         }
         self.processing_seconds = 0.0
+        self.stage_seconds: Dict[str, float] = {}
+        self.stage_calls: Dict[str, int] = {}
+        self.e2e_lag_sum_ms = 0.0
+        self.e2e_lag_max_ms = 0.0
+        self.e2e_lag_count = 0
+        self.kafka_lag = 0
         # F-08: Initialize Prometheus counters
         _init_prometheus()
         if _STAGE_RECORDS is not None:
@@ -95,17 +123,49 @@ class ModuleMetrics:
         if _BATCH_LATENCY is not None:
             _BATCH_LATENCY.labels(group_id=self.name).observe(seconds)
 
+    def observe_stage(self, stage: str, seconds: float) -> None:
+        self.stage_seconds[stage] = self.stage_seconds.get(stage, 0.0) + seconds
+        self.stage_calls[stage] = self.stage_calls.get(stage, 0) + 1
+        if _STAGE_LATENCY is not None:
+            _STAGE_LATENCY.labels(group_id=self.name, stage=stage).observe(seconds)
+
+    def observe_e2e_lag(self, avg_ms: float, max_ms: float, count: int = 1) -> None:
+        """Đo độ trễ bản tin từ lúc vào pipeline (ingest_timestamp) đến khi ghi DB/Redis."""
+        self.e2e_lag_sum_ms += avg_ms * count
+        self.e2e_lag_count += count
+        self.e2e_lag_max_ms = max(self.e2e_lag_max_ms, max_ms)
+        if _E2E_LATENCY is not None:
+            _E2E_LATENCY.labels(group_id=self.name).observe(avg_ms / 1000.0)
+
+    def set_kafka_lag(self, records: int) -> None:
+        self.kafka_lag = max(0, records)
+        if _KAFKA_LAG is not None:
+            _KAFKA_LAG.labels(
+                group_id=self.name, member=self.member or "1/1"
+            ).set(self.kafka_lag)
+
+    def _stage_average_ms(
+        self, stage: str, previous_seconds: Dict[str, float], previous_calls: Dict[str, int]
+    ) -> float:
+        seconds = self.stage_seconds.get(stage, 0.0) - previous_seconds.get(stage, 0.0)
+        calls = self.stage_calls.get(stage, 0) - previous_calls.get(stage, 0)
+        return seconds * 1000 / calls if calls else 0.0
+
     def get(self, metric: str) -> int:
         return self.counters.get(metric, 0)
 
     def log_summary(self):
         event_name = self._event_name()
+        data_loss = self.get("errors") + self.get("dlq")
         logger.info(
-            "[PROCESSING][%s][FINAL] received=%d success=%d ignored=%d %s=%d "
-            "postgres=%d redis=%d errors=%d dlq=%d batches=%d",
-            self.name, self.get("processed"), self.get("success"), self.get("ignored"),
-            event_name, self.get("events_detected"), self.get("postgres_records"),
-            self.get("redis_records"), self.get("errors"), self.get("dlq"), self.get("batches"),
+            "[PROCESSING][%s][member=%s][SUMMARY] "
+            "received=%d | success=%d | ignored=%d | %s=%d | "
+            "db_writes(pg=%d, rds=%d) | data_loss=%d (err=%d, dlq=%d) | batches=%d",
+            self.name, self.member or "1/1",
+            self.get("processed"), self.get("success"), self.get("ignored"),
+            event_name, self.get("events_detected"),
+            self.get("postgres_records"), self.get("redis_records"),
+            data_loss, self.get("errors"), self.get("dlq"), self.get("batches"),
         )
 
     def _event_name(self) -> str:
@@ -118,6 +178,10 @@ class ModuleMetrics:
     async def log_periodically(self, interval: float) -> None:
         previous = dict(self.counters)
         previous_seconds = self.processing_seconds
+        previous_stage_seconds = dict(self.stage_seconds)
+        previous_stage_calls = dict(self.stage_calls)
+        previous_e2e_sum = self.e2e_lag_sum_ms
+        previous_e2e_count = self.e2e_lag_count
         loop = asyncio.get_running_loop()
         previous_log_at = loop.time()
         while True:
@@ -132,25 +196,44 @@ class ModuleMetrics:
             events_delta = current["events_detected"] - previous["events_detected"]
             errors_delta = current["errors"] - previous["errors"]
             dlq_delta = current["dlq"] - previous["dlq"]
+            loss_delta = errors_delta + dlq_delta
+            loss_total = current["errors"] + current["dlq"]
+
+            e2e_count_window = self.e2e_lag_count - previous_e2e_count
+            e2e_sum_window = self.e2e_lag_sum_ms - previous_e2e_sum
+            e2e_avg_ms = (e2e_sum_window / e2e_count_window) if e2e_count_window else 0.0
+            e2e_max_ms = self.e2e_lag_max_ms
+            self.e2e_lag_max_ms = 0.0  # Reset max for next window
+
             status = "ERROR" if errors_delta or dlq_delta else "OK"
             level = logging.ERROR if status == "ERROR" else logging.INFO
             event_name = self._event_name()
             logger.log(
                 level,
-                "[PROCESSING][%s][%s] window=%.1fs kafka=%.1f/s success=%.1f/s "
-                "postgres=%.1f/s redis=%.1f/s batch_avg=%.1fms "
-                "%s=%d(+%d) ignored=%d errors=%d(+%d) dlq=%d(+%d) "
-                "totals(received=%d,success=%d,postgres=%d,redis=%d,batches=%d)",
-                self.name, status, elapsed,
+                "[PROCESSING][%s][member=%s][%s] window=%.1fs | "
+                "Throughput: recv=%.1f/s success=%.1f/s (pg=%.1f/s, rds=%.1f/s) | "
+                "Latency: batch_avg=%.1fms stage(state=%.1fms, pg=%.1fms, rds=%.1fms) e2e_lag=%.1fms(max=%.1fms) | "
+                "Swaps/Events: %s=%d(+%d) ignored=%d | "
+                "Quality/Loss: kafka_lag=%d data_loss=%d(+%d) (err=%d, dlq=%d) | "
+                "Totals: recv=%d, ok=%d, pg=%d, rds=%d, batches=%d",
+                self.name, self.member or "1/1", status, elapsed,
                 received_delta / elapsed, success_delta / elapsed,
                 (current["postgres_records"] - previous["postgres_records"]) / elapsed,
                 (current["redis_records"] - previous["redis_records"]) / elapsed,
                 (seconds_delta * 1000 / batch_delta) if batch_delta else 0.0,
-                event_name, current["events_detected"], events_delta,
-                current["ignored"], current["errors"], errors_delta,
-                current["dlq"], dlq_delta, current["processed"], current["success"],
-                current["postgres_records"], current["redis_records"], current["batches"],
+                self._stage_average_ms("state", previous_stage_seconds, previous_stage_calls),
+                self._stage_average_ms("postgres", previous_stage_seconds, previous_stage_calls),
+                self._stage_average_ms("redis", previous_stage_seconds, previous_stage_calls),
+                e2e_avg_ms, e2e_max_ms,
+                event_name, current["events_detected"], events_delta, current["ignored"],
+                self.kafka_lag, loss_total, loss_delta, current["errors"], current["dlq"],
+                current["processed"], current["success"], current["postgres_records"],
+                current["redis_records"], current["batches"],
             )
             previous = current
             previous_seconds = self.processing_seconds
+            previous_stage_seconds = dict(self.stage_seconds)
+            previous_stage_calls = dict(self.stage_calls)
+            previous_e2e_sum = self.e2e_lag_sum_ms
+            previous_e2e_count = self.e2e_lag_count
             previous_log_at = now

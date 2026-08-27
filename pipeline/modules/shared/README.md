@@ -1,97 +1,154 @@
-# `pipeline/modules/shared/` — Hạ tầng dùng chung cho 3 consumer module
+# `pipeline/modules/shared/` — Hạ Tầng Dùng Chung (Shared Infrastructure)
 
-Không phải 1 module xử lý sự kiện — đây là code nền tảng mà `ip_msisdn`, `device_swap`,
-`sim_swap` đều kế thừa/import. Sửa file trong này ảnh hưởng tới cả 3 module cùng lúc.
+Thư mục `pipeline/modules/shared/` cung cấp các lớp trừu tượng nền tảng, hệ thống kết nối cơ sở dữ liệu, quản lý phiên bản tin cậy, chuẩn hoá dữ liệu viễn thông và hệ thống telemetry giám sát hiệu năng cho toàn bộ các Consumer Modules.
 
-| File | Nội dung |
-|---|---|
-| `base_consumer.py` | `BaseKafkaConsumer` — vòng lặp đọc Kafka, retry, DLQ, manual commit |
-| `db.py` | `DatabasePool` — pool Postgres dùng chung + toàn bộ query/transaction |
-| `metrics.py` | `ModuleMetrics` — counter in-memory + export Prometheus |
-| `notification.py` | Hàm `send_callback()` gửi HTTP với backoff — hiện chỉ còn dùng bởi `dispatcher/`, không còn được consumer gọi trực tiếp |
+---
 
-## `BaseKafkaConsumer` (`base_consumer.py`)
+## 1. Sơ đồ quan hệ lớp chi tiết (Class Diagram)
 
-Lớp trừu tượng mọi consumer module đều kế thừa. Có 1 abstract method bắt buộc override
-(`process_message`, xử lý từng message riêng lẻ — giữ lại để tương thích ngược) và 1 method
-nên override để có hiệu năng tốt (`process_batch`, mặc định fallback gọi `process_message`
-tuần tự nếu subclass không override).
+```mermaid
+classDiagram
+    class BaseKafkaConsumer {
+        <<Abstract>>
+        +str topic
+        +str group_id
+        +str bootstrap_servers
+        +DatabasePool db
+        +Redis redis
+        +AIOKafkaConsumer consumer
+        +AIOKafkaProducer dlq_producer
+        +ModuleMetrics metrics
+        +bool running
+        +bool _owns_db
+        +initialize()
+        +send_to_dlq(record, error)
+        +process_batch(records)*
+        +run()
+        +stop()
+    }
 
-**Vòng lặp chính (`run()`):**
+    class DatabasePool {
+        +str dsn
+        +Pool pool
+        +connect()
+        +close()
+        -_fetch_state(table, value_col, msisdns)
+        +batch_get_device_state(msisdns)
+        +batch_get_sim_state(msisdns)
+        -_upsert_state(conn, table, col, records)
+        -_insert_history(conn, table, old_c, new_c, records)
+        -_insert_audit(conn, records)
+        -_insert_outbox(conn, events)
+        -_persist_swap_batch(...)
+        +persist_sim_batch(states, history, audit, outbox)
+        +persist_device_batch(states, history, audit, outbox)
+        +persist_session_batch(records)
+        +mark_nas_sessions_inactive(nas, time)
+        +claim_notifications(limit)
+        +mark_notification_sent(id)
+        +mark_notification_failed(id, attempts, max, err)
+        +recover_stale_notifications()
+    }
 
-1. `consumer.getmany(timeout_ms=BATCH_TIMEOUT_MS, max_records=BATCH_MAX_RECORDS)` — batch
-   thích ứng: nếu throughput cao thì gom đủ `BATCH_MAX_RECORDS` (mặc định 500) rồi mới xử lý;
-   nếu thưa thì tối đa `BATCH_TIMEOUT_MS` (mặc định 100ms) là flush, tránh latency cao khi ít
-   dữ liệu.
-2. Xử lý **theo từng partition riêng** (`for tp, tp_messages in data.items()`) — quan trọng
-   vì offset phải commit đúng theo partition, gộp chung nhiều partition vào 1 lần commit có
-   thể commit nhầm offset.
-3. Gọi `process_batch()`. Nếu lỗi: retry tối đa `MAX_BATCH_RETRIES` lần (mặc định 3) với
-   exponential backoff (`min(2**attempt, 10)` giây).
-4. Nếu vẫn lỗi sau khi hết số lần retry: đẩy toàn bộ batch (kèm lỗi, offset, partition gốc)
-   vào topic `<topic>.dlq` — **không** bỏ dữ liệu, không crash cả pipeline vì 1 batch lỗi.
-5. **Chỉ commit offset sau khi bước 3 hoặc 4 hoàn tất** (`enable_auto_commit=False` khi khởi
-   tạo `AIOKafkaConsumer`). Đây là điểm mấu chốt cho durability: nếu consumer crash giữa lúc
-   xử lý, khi restart sẽ đọc lại đúng batch chưa commit thay vì mất dữ liệu.
+    class ModuleMetrics {
+        +str name
+        +str member
+        +dict counters
+        +float processing_seconds
+        +dict stage_seconds
+        +dict stage_calls
+        +int kafka_lag
+        +increment(metric, amount)
+        +observe_batch(seconds)
+        +observe_stage(stage, seconds)
+        +set_kafka_lag(records)
+        +log_summary()
+        +log_periodically(interval)
+        -_stage_average_ms(stage, prev_sec, prev_calls)
+    }
 
-**Vì sao dùng manual commit thay vì auto-commit:** auto-commit của Kafka chạy theo timer độc
-lập với việc xử lý xong hay chưa — nếu consumer crash giữa chừng, offset có thể đã bị
-auto-commit dù batch chưa ghi xong xuống DB, dẫn đến mất dữ liệu vĩnh viễn (message đó không
-bao giờ được đọc lại). Manual commit sau khi xử lý xong loại bỏ hoàn toàn rủi ro này, đổi lại
-phải tự viết logic retry/DLQ.
+    class EventsModule {
+        <<Static Helpers>>
+        +canonical_msisdn(message) str
+        +parse_event_time(message) datetime
+        +normalize_status(value) str
+        +event_id(record) str
+        +required_text(message, *keys) str
+    }
 
-**Shutdown:** consumer con không tự bắt `SIGINT`/`SIGTERM` — chỉ set `self.running = False`
-khi được orchestrator (`run_pipeline.py`) yêu cầu dừng, để tránh 1 module dừng lệch nhịp so
-với 2 module còn lại.
+    class RedisClientModule {
+        <<Factory>>
+        +create_redis_client(**overrides) Redis
+        -_sentinel_nodes(raw) list
+    }
 
-## `DatabasePool` (`db.py`)
+    BaseKafkaConsumer o-- DatabasePool
+    BaseKafkaConsumer o-- ModuleMetrics
+    BaseKafkaConsumer ..> EventsModule : uses
+    BaseKafkaConsumer ..> RedisClientModule : uses
+```
 
-Bọc `asyncpg.Pool`, cấu hình qua env `DB_HOST`/`DB_PORT`/`DB_USER`/`DB_PASSWORD`/`DB_NAME`
-(hoặc `DATABASE_URL` trực tiếp). Pool size mặc định `min=4, max=12` — **dùng chung cho cả 3
-consumer trong 1 process**, không phải mỗi consumer 1 pool riêng, vì `run_pipeline.py` tạo
-1 `DatabasePool` rồi truyền (`db=shared_db`) vào cả 3. `acquire(timeout=10)` — nếu pool cạn,
-fail rõ ràng sau 10s thay vì treo vô hạn.
+---
 
-Có 2 nhóm method:
+## 2. Chi tiết các thành phần trong `shared/`
 
-- **Single-record** (`get_current_imei`, `upsert_device_state`, `record_device_swap_history`,
-  `insert_audit_log`, `insert_notification_log`, ...): mỗi lời gọi 1 round-trip DB riêng,
-  giữ lại cho `process_message()` (đường xử lý từng message, ít dùng trong production).
-- **Batch/atomic** (`batch_get_current_imei`, `batch_upsert_*`, và quan trọng nhất là
-  `commit_sim_swap_batch` / `commit_device_swap_batch`): dùng cho `process_batch()`, tối ưu
-  round-trip DB.
+### 2.1. `BaseKafkaConsumer` (`base_consumer.py`)
+Lớp cơ sở trừu tượng cho tất cả các consumer trong hệ thống:
+- **Vòng lặp tiêu thụ (`run()`)**: Sử dụng `AIOKafkaConsumer.getmany()` gom tối đa `BATCH_MAX_RECORDS` hoặc chờ `BATCH_TIMEOUT_MS`.
+- **Partition Concurrency & Sharding**: Phân chia các partitions nhận được thành `PROCESSING_PARTITION_CONCURRENCY` shards chạy song song (`asyncio.gather`), đảm bảo thứ tự offset trong từng partition luôn tuần tự.
+- **Manual Offset Commit**: Chỉ commit offset sau khi xử lý thành công batch hoặc sau khi đẩy dữ liệu lỗi vào DLQ (`enable_auto_commit=False`).
+- **Dead Letter Queue (DLQ)**: Khi một record hoặc batch bị lỗi cấu trúc dữ liệu nghiêm trọng vượt quá `MAX_BATCH_RETRIES` (mặc định 3 lần), toàn bộ thông tin nguồn (topic, partition, offset, error_type, payload) được đẩy vào `<topic>.dlq`.
 
-**`commit_sim_swap_batch()` / `commit_device_swap_batch()`** là phần quan trọng nhất của file
-này. Toàn bộ 4 loại ghi cho 1 batch — upsert state hiện tại, insert lịch sử swap (qua
-`copy_records_to_table`, nhanh hơn nhiều `executemany` cho insert thuần), insert audit log, và
-insert notification log (status `PENDING`) — chạy trong **cùng một `conn.transaction()`**.
-Nếu bất kỳ bước nào lỗi, toàn bộ rollback: không bao giờ tồn tại trạng thái "đã đổi SIM trong
-bảng state nhưng thiếu bản ghi lịch sử tương ứng", và không bao giờ tạo notification cho 1
-sự kiện mà cuối cùng không được ghi nhận.
+### 2.2. `DatabasePool` (`db.py`)
+Lớp bọc `asyncpg.Pool` tối ưu hoá hiệu năng cho PostgreSQL:
+- **Single Connection Pool**: Quản lý connection pool duy nhất dùng chung cho toàn bộ các worker trong tiến trình, cấu hình qua `DB_POOL_MIN` và `DB_POOL_MAX`.
+- **Giao dịch Nguyên Tử 4 Bảng (`_persist_swap_batch`)**:
+  Thực thi trong cùng 1 `connection.transaction()`:
+  1. `_upsert_state`: Upsert bảng state hiện tại (`msisdn_sim` hoặc `msisdn_device`) qua mệnh đề `UNNEST` kết hợp điều kiện so sánh phiên bản `(last_event_at, last_source_partition, last_source_offset)`.
+  2. `_insert_history`: Ghi nhật ký lịch sử đổi SIM/thiết bị (`sim_swap_history`, `device_swap_history`).
+  3. `_insert_audit`: Ghi vết kiểm toán hệ thống (`audit_log`).
+  4. `_insert_outbox`: Ghi thông báo chờ gửi (`notification_log`) cho các subscription đang hoạt động.
+- **Session State Tracking (`persist_session_batch`)**: Cập nhật trạng thái phiên RADIUS Accounting vào bảng `radius_session_state` với cơ chế chống ghi đè phiên bản cũ.
 
-## `ModuleMetrics` (`metrics.py`)
+### 2.3. `ModuleMetrics` (`metrics.py`)
+Hệ thống thu thập và xuất dữ liệu đo lường (Telemetry):
+- **Prometheus Exporter**: Tự động đăng ký các metrics chuẩn:
+  - `pipeline_batch_processed_total` (Counter)
+  - `pipeline_events_detected_total` (Counter)
+  - `pipeline_batch_errors_total` (Counter)
+  - `pipeline_batch_latency_seconds` (Histogram)
+  - `pipeline_stage_latency_seconds` (Histogram theo stage: state, postgres, redis)
+  - `pipeline_kafka_lag_records` (Gauge theo từng member)
+  - `pipeline_e2e_message_lag_seconds` (Histogram đo độ trễ từ lúc gói tin vào Ingestion đến khi hoàn tất ghi DB/Redis)
+- **Sliding-Window Structured Logger**: Định kỳ in ra log phân khối trực quan (`|`), theo dõi riêng biệt:
+  - Throughput (`recv`, `success`, `pg`, `rds`)
+  - Latency (`batch_avg`, `stage(state, pg, rds)`, `e2e_lag(max)`)
+  - Sự kiện Swap (`events_detected(+delta)`, `ignored`)
+  - **Giám sát thất thoát (`data_loss = errors + dlq`)**
+  - Số liệu tích lũy (`Totals`).
 
-Counter in-memory đơn giản (`processed`, `success`, `ignored`, `events_detected`, `errors`,
-`notifications_sent`, `notifications_failed`) dùng cho heartbeat log của orchestrator. Đồng
-thời **tự động** đẩy song song sang Prometheus (`Counter`) cho 3 metric: `processed`,
-`events_detected`, `errors` — có label `group_id` để phân biệt 3 consumer group trên cùng 1
-dashboard Grafana. Nếu `prometheus_client` chưa cài, phần Prometheus tự tắt (log debug), phần
-counter in-memory vẫn hoạt động bình thường — không phụ thuộc cứng vào Prometheus.
+### 2.4. `redis_client.py`
+Khởi tạo kết nối Redis hỗ trợ 2 chế độ:
+- **Chế độ Standalone (Môi trường Dev)**: Kết nối trực tiếp qua `REDIS_HOST` và `REDIS_PORT`.
+- **Chế độ Sentinel HA (Môi trường Production)**: Tự động khám phá Master Node thông qua danh sách Sentinel Nodes (`REDIS_SENTINELS`), hỗ trợ tự động failover mà không làm gián đoạn pipeline.
 
-## Outbox pattern (F-03) — vì sao tách callback khỏi consumer
+### 2.5. `events.py`
+Bộ công cụ chuẩn hoá và kiểm tra ràng buộc dữ liệu:
+- `canonical_msisdn()`: Chuẩn hoá số thuê bao theo định dạng quốc tế E.164 (bắt đầu bằng dấu `+`, từ 8 đến 15 chữ số).
+- `parse_event_time()`: Phân giải timestamp từ chuỗi ISO-8601 hoặc Unix epoch thành đối tượng `datetime` có múi giờ chuẩn UTC.
+- `normalize_status()`: Chuẩn hoá các trạng thái phiên RADIUS (`start`, `stop`, `interim-update`, `accounting-on`, `accounting-off`).
+- `event_id()`: Tạo khóa định danh duy nhất cho sự kiện để đảm bảo tính Idempotency.
 
-`notification.py` chứa `send_callback()` (HTTP POST + exponential backoff), nhưng **không
-còn được gọi trực tiếp bởi bất kỳ consumer nào**. Lý do: nếu consumer gọi HTTP ngay trong lúc
-xử lý batch, 1 subscriber Open Gateway chậm hoặc down sẽ làm nghẽn toàn bộ throughput Kafka
-consumer (batch tiếp theo phải chờ HTTP timeout của batch trước).
+> 📖 **Báo cáo Kỹ thuật Chuyên sâu**: Đọc tài liệu phân tích kiến trúc chi tiết tại [`docs/BAO_CAO_KY_THUAT_PIPELINE.md`](../../docs/BAO_CAO_KY_THUAT_PIPELINE.md).
 
-Thay vào đó: consumer chỉ `INSERT INTO notification_log (..., status='PENDING')` trong cùng
-transaction Postgres ở bước ghi DB (xem `commit_*_batch` ở trên). Một process hoàn toàn tách
-biệt — `pipeline/dispatcher/notification_dispatcher.py` — poll bảng này định kỳ và mới thực
-sự gọi `send_callback`-tương-đương. Xem chi tiết dispatcher ở
-[`../../README.md`](../../README.md) (mục `dispatcher/`) vì code dispatcher nằm ngoài
-`modules/`.
+---
 
-File `sim_swap/notifier.py` và `device_swap/notifier.py` chỉ còn là stub log cảnh báo
-deprecated — giữ lại cho tương thích ngược, an toàn để xoá sau khi xác nhận dispatcher chạy
-ổn định.
+## 3. Ràng buộc toàn vẹn & Fencing Versioning
+
+Để đảm bảo dữ liệu không bị sai lệch khi các sự kiện mạng đến sai thứ tự (Out-of-Order Delivery), hệ thống áp dụng cơ chế Fencing Tuple 3 thành phần:
+
+$$\text{Version} = (\text{event\_timestamp}, \text{source\_partition}, \text{source\_offset})$$
+
+Một bản ghi mới chỉ được phép cập nhật trạng thái nếu:
+
+$$(\text{incoming.event\_timestamp}, \text{incoming.partition}, \text{incoming.offset}) > (\text{current.last\_event\_at}, \text{current.partition}, \text{current.offset})$$

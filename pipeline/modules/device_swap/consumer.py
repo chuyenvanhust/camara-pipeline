@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 from pipeline.modules.shared.base_consumer import BaseKafkaConsumer
@@ -51,7 +52,9 @@ class DeviceSwapConsumer(BaseKafkaConsumer):
         if not parsed:
             return
 
+        stage_started = time.monotonic()
         state = await self._load_state(list({item[1] for item in parsed}))
+        self.metrics.observe_stage("state", time.monotonic() - stage_started)
         # F-BATCH-DUP-FIX: dict thay vì list — nếu CÙNG msisdn xuất hiện nhiều lần
         # trong 1 batch (nhiều bản ghi RADIUS liên tiếp của cùng thuê bao), UPSERT
         # nhiều dòng CÙNG msisdn trong 1 lệnh SQL sẽ bị Postgres từ chối
@@ -65,6 +68,9 @@ class DeviceSwapConsumer(BaseKafkaConsumer):
             eid = event_id(record)
             previous = state.get(msisdn)
             version = (occurred_at, record.partition, record.offset)
+            if previous and previous.get("last_event_id") == eid:
+                self.metrics.increment("ignored")
+                continue
             if previous and version <= (previous["last_event_at"], previous["last_source_partition"], previous["last_source_offset"]):
                 self.metrics.increment("ignored")
                 continue
@@ -83,11 +89,15 @@ class DeviceSwapConsumer(BaseKafkaConsumer):
             outbox.append((eid, "DEVICE_SWAP", msisdn, details))
             self.metrics.increment("events_detected")
 
+        stage_started = time.monotonic()
         await self.db.persist_device_batch(list(states_by_msisdn.values()), history, audit, outbox)
+        self.metrics.observe_stage("postgres", time.monotonic() - stage_started)
         self.metrics.increment("postgres_records", len(states_by_msisdn))
         if cache_updates:
             assert self.redis is not None
+            stage_started = time.monotonic()
             await self.redis.mset(cache_updates)
+            self.metrics.observe_stage("redis", time.monotonic() - stage_started)
             self.metrics.increment("redis_records", len(cache_updates))
         self.metrics.increment("success", len(parsed))
 

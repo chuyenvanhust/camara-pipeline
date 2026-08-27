@@ -9,6 +9,11 @@ class InvalidMessageError(ValueError):
 
 
 def event_id(record: Any) -> str:
+    value = getattr(record, "value", None)
+    if isinstance(value, Mapping):
+        radius_event_id = value.get("radius_event_id")
+        if radius_event_id:
+            return str(radius_event_id)
     return f"{record.topic}:{record.partition}:{record.offset}"
 
 

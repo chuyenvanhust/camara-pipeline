@@ -12,10 +12,58 @@
 #   test trên Windows/macOS (Docker Desktop chạy trong 1 VM, host ở đây là VM
 #   đó chứ không phải Windows thật) -> giữ docker-compose.yml mặc định an toàn
 #   cho dev Windows, chỉ bật host networking khi thật sự chạy trên Linux.
+# - Production bổ sung Redis master + 2 replica + 3 Sentinel. Pipeline/API tự
+#   discovery master qua REDIS_SENTINELS và tiếp tục sau failover.
 services:
+  redis-replica-1: &redis-replica
+    image: redis:7-alpine
+    restart: unless-stopped
+    networks: [camara-network]
+    command: ["redis-server", "--replicaof", "camara-redis", "6379", "--appendonly", "yes", "--maxmemory", "512mb", "--maxmemory-policy", "noeviction"]
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    mem_limit: ${REDIS_REPLICA_MEM_LIMIT:-640m}
+
+  redis-replica-2:
+    <<: *redis-replica
+
+  redis-sentinel-1: &redis-sentinel
+    image: redis:7-alpine
+    restart: unless-stopped
+    networks: [camara-network]
+    command: ["sh", "-c", "cp /config/sentinel.conf /tmp/sentinel.conf && exec redis-sentinel /tmp/sentinel.conf"]
+    volumes:
+      - ./infra/redis/sentinel.conf:/config/sentinel.conf:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      redis-replica-1:
+        condition: service_healthy
+      redis-replica-2:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    mem_limit: ${REDIS_SENTINEL_MEM_LIMIT:-128m}
+
+  redis-sentinel-2:
+    <<: *redis-sentinel
+
+  redis-sentinel-3:
+    <<: *redis-sentinel
+
   radius-ingestion:
     network_mode: host
-    ports: []   # network_mode: host không dùng ports mapping
+    networks: !reset []
+    ports: !reset []   # network_mode: host không dùng ports mapping
     environment:
       RADIUS_UDP_SO_REUSEPORT: "true"
       # F-PARALLEL-FIX: network_mode: host gỡ container khỏi bridge network
@@ -33,6 +81,32 @@ services:
     # Gỡ giới hạn cpus/mem mặc định cho dev (2 cpu/2g) để tận dụng phần cứng mạnh hơn:
     cpus: ${PIPELINE_CPUS_PROD:-4}
     mem_limit: ${PIPELINE_MEM_LIMIT_PROD:-4g}
+    environment:
+      REDIS_SENTINELS: redis-sentinel-1:26379,redis-sentinel-2:26379,redis-sentinel-3:26379
+      REDIS_MASTER_NAME: camara-master
+    depends_on:
+      redis-sentinel-1:
+        condition: service_healthy
+      redis-sentinel-2:
+        condition: service_healthy
+      redis-sentinel-3:
+        condition: service_healthy
+
+  fastapi:
+    environment:
+      REDIS_SENTINELS: redis-sentinel-1:26379,redis-sentinel-2:26379,redis-sentinel-3:26379
+      REDIS_MASTER_NAME: camara-master
+    depends_on:
+      redis-sentinel-1:
+        condition: service_healthy
+      redis-sentinel-2:
+        condition: service_healthy
+      redis-sentinel-3:
+        condition: service_healthy
+
+  grafana:
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD is required in production}
 
   kafka-1:
     cpus: ${KAFKA_CPUS_PROD:-4}

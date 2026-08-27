@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 from pipeline.modules.shared.base_consumer import BaseKafkaConsumer
@@ -51,7 +52,9 @@ class SimSwapConsumer(BaseKafkaConsumer):
         if not parsed:
             return
 
+        stage_started = time.monotonic()
         state = await self._load_state(list({item[1] for item in parsed}))
+        self.metrics.observe_stage("state", time.monotonic() - stage_started)
         # F-BATCH-DUP-FIX: xem giải thích trong device_swap/consumer.py
         states_by_msisdn: Dict[str, tuple] = {}
         history, audit, outbox = [], [], []
@@ -60,6 +63,9 @@ class SimSwapConsumer(BaseKafkaConsumer):
             eid = event_id(record)
             previous = state.get(msisdn)
             version = (occurred_at, record.partition, record.offset)
+            if previous and previous.get("last_event_id") == eid:
+                self.metrics.increment("ignored")
+                continue
             if previous and version <= (previous["last_event_at"], previous["last_source_partition"], previous["last_source_offset"]):
                 self.metrics.increment("ignored")
                 continue
@@ -78,11 +84,15 @@ class SimSwapConsumer(BaseKafkaConsumer):
             outbox.append((eid, "SIM_SWAP", msisdn, details))
             self.metrics.increment("events_detected")
 
+        stage_started = time.monotonic()
         await self.db.persist_sim_batch(list(states_by_msisdn.values()), history, audit, outbox)
+        self.metrics.observe_stage("postgres", time.monotonic() - stage_started)
         self.metrics.increment("postgres_records", len(states_by_msisdn))
         if cache_updates:
             assert self.redis is not None
+            stage_started = time.monotonic()
             await self.redis.mset(cache_updates)
+            self.metrics.observe_stage("redis", time.monotonic() - stage_started)
             self.metrics.increment("redis_records", len(cache_updates))
         self.metrics.increment("success", len(parsed))
 

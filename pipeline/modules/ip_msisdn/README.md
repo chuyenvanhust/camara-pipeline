@@ -1,56 +1,103 @@
-# `pipeline/modules/ip_msisdn/` — Module 1: Ánh xạ IP ↔ MSISDN
+# `pipeline/modules/ip_msisdn/` — Module 1: Ánh Xạ IP ↔ MSISDN
 
-Consumer group: `cg-ip-msisdn`. Duy trì ánh xạ **Framed-IP-Address ↔ MSISDN** hiện đang hoạt
-động, phục vụ tra cứu ngược "IP này là của thuê bao nào" — nền tảng cho API
-**Number Verification** của CAMARA (xác thực số điện thoại dựa trên IP nguồn kết nối).
+Consumer Group: `cg-ip-msisdn`. Module này chịu trách nhiệm duy trì ánh xạ thời gian thực giữa **Địa chỉ IP mạng (Framed-IP-Address)** và **Số điện thoại thuê bao (MSISDN)** theo phiên dữ liệu di động, phục vụ trực tiếp cho chuẩn API **CAMARA Number Verification** (Xác thực số điện thoại tự động qua kết nối mạng di động mà không cần OTP SMS).
 
-Đây là module **duy nhất trong 3 module không đụng tới Postgres** — toàn bộ state chỉ nằm
-trong Redis, coi RADIUS accounting session là dữ liệu tồn tại ngắn hạn, không cần lịch sử lâu
-dài như đổi SIM/đổi máy.
+---
 
-| File | Vai trò |
-|---|---|
-| `consumer.py` | `IPMsisdnConsumer` — nhận diện Start/Interim-Update/Stop/Accounting-Off, gọi `redis_store` |
-| `redis_store.py` | `IPMappingStore` — thao tác Redis trực tiếp (single-record, dùng cho `process_message`) |
+## 1. Luồng xử lý sự kiện & Vòng đời phiên (Flow Diagram)
 
-## Cấu trúc dữ liệu Redis
+```mermaid
+flowchart TD
+    MSG["Kafka Message (radius.accounting.raw)"] --> PARSE["Parse & Chuẩn hoá:<br/>- msisdn (E.164)<br/>- framed_ip (IPv4)<br/>- nas_identifier<br/>- acct_session_id<br/>- acct_status_type"]
 
-- `ip-ggsn:<framed_ip>` → JSON `{"msisdn": "...", "timestamp": "..."}`, TTL 24h
-  (`SESSION_TTL_SECONDS`), refresh TTL mỗi lần có Interim-Update.
-- `ggsn-ips:<nas_identifier>` → Redis SET chứa tất cả `framed_ip` đang active trên 1 GGSN/NAS
-  cụ thể — key phụ để hỗ trợ xoá hàng loạt khi có sự kiện Accounting-Off (GGSN restart, mất
-  toàn bộ session đang track).
+    PARSE --> TYPE_BRANCH{acct_status_type?}
 
-## Logic xử lý theo loại sự kiện RADIUS
+    %% Start / Interim
+    TYPE_BRANCH -->|Start / Interim-Update| UPSERT_FLOW["1. Upsert Session State (PostgreSQL)<br/>radius_session_state<br/>2. Chạy UPSERT_LUA (Redis)<br/>- SET ip-ggsn:IP (TTL 24h)<br/>- ZADD ggsn-ips:NAS IP"]
+    
+    %% Stop
+    TYPE_BRANCH -->|Stop| STOP_FLOW["1. Update Session Inactive (PostgreSQL)<br/>2. Chạy DELETE_LUA (Redis)<br/>- Kiểm tra đúng MSISDN sở hữu<br/>- DEL ip-ggsn:IP<br/>- ZREM ggsn-ips:NAS IP"]
 
-| `acct_status_type` | Hành động |
-|---|---|
-| `Start` / `Interim-Update` | Upsert `ip-ggsn:<ip>` với MSISDN + timestamp mới, thêm `ip` vào set `ggsn-ips:<nas_id>`, refresh TTL cả hai key |
-| `Stop` | Đọc giá trị hiện tại của `ip-ggsn:<ip>`, **chỉ xoá nếu MSISDN trong Redis khớp với MSISDN trong message Stop** — tránh xoá nhầm session mới nếu IP đã được cấp lại cho thuê bao khác trước khi Stop cũ tới nơi (out-of-order delivery) |
-| `Accounting-Off` | GGSN báo mất toàn bộ session — đọc set `ggsn-ips:<nas_id>`, xoá toàn bộ `ip-ggsn:*` tương ứng, xoá luôn set |
-| Khác / thiếu field bắt buộc | Tăng counter `ignored`, không làm gì thêm |
+    %% Accounting-Off
+    TYPE_BRANCH -->|Accounting-Off| ACCT_OFF_FLOW["Trạm GGSN/NAS Khởi Động Lại / Mất Điện:<br/>1. UPDATE radius_session_state SET active=FALSE<br/>2. Quét ZRANGEBYSCORE ggsn-ips:NAS<br/>3. Chạy ACCOUNTING_OFF_LUA xoá hàng loạt IP của NAS"]
 
-## `process_batch()` — batch hoá thao tác Redis
+    %% Accounting-On
+    TYPE_BRANCH -->|Accounting-On| IGNORE["Bỏ qua (Trạm NAS sẵn sàng)"]
 
-Không xử lý từng message riêng lẻ (`process_message` chỉ giữ để tương thích ngược) mà gom cả
-batch rồi thực hiện theo 3 nhóm, mỗi nhóm dùng Redis pipeline (`transaction=False`, vì các
-lệnh trong 1 batch độc lập nhau, không cần atomic chéo):
+    UPSERT_FLOW --> COMMIT_STAGE["Ghi nhận DB Batch & Redis Pipeline"]
+    STOP_FLOW --> COMMIT_STAGE
+    ACCT_OFF_FLOW --> COMMIT_STAGE
+    IGNORE --> END_STAGE["Commit Offset"]
+    COMMIT_STAGE --> END_STAGE
+```
 
-1. **Upsert** (Start/Interim-Update): gom hết vào 1 `pipeline`, mỗi upsert là 2-3 lệnh
-   (`SET` + `SADD` + `EXPIRE`), chỉ 1 round-trip network cho cả batch.
-2. **Delete** (Stop): trước tiên `MGET` toàn bộ key cần kiểm tra ownership trong 1 round-trip,
-   sau đó mới `pipeline` các lệnh xoá cho những entry thực sự khớp MSISDN.
-3. **Accounting-Off**: xử lý tuần tự từng NAS (sự kiện hiếm, số lượng nhỏ trong 1 batch, và
-   bản thân nó đã là thao tác gộp xoá nhiều key).
+---
 
-Cách này giảm số round-trip Redis từ O(số message) xuống O(số nhóm thao tác) — quan trọng vì
-Redis là single-threaded, latency network dồn lại nhanh nếu gọi tuần tự từng lệnh.
+## 2. Cấu trúc lưu trữ dữ liệu kép (PostgreSQL & Redis)
 
-## Khi đọc/sửa code này cần lưu ý
+Module quản lý trạng thái phiên trên cả hai hệ thống lưu trữ:
 
-- Field tên message hỗ trợ cả 2 kiểu (RADIUS attribute gốc và tên đã chuẩn hoá):
-  `Framed_IP_Address`/`framed_ip`, `Calling-StationId`/`Calling_Station_Id`/`msisdn`,
-  `NAS-Identifier`/`NAS_Identifier`/`nas_identifier` — do dữ liệu simulator và dữ liệu CSV
-  thật có thể khác convention đặt tên.
-- Không có audit log hay history table cho module này — nếu sau này cần truy vết lịch sử IP
-  (ví dụ phục vụ điều tra), cần bổ sung bảng Postgres tương tự `device_swap_history`.
+### 2.1. Redis (Read Cache phục vụ CAMARA API)
+1. **`ip-ggsn:<framed_ip>`** (Key-Value String, TTL 86400s / 24h):
+   - Lưu trữ JSON thông tin phiên hiện tại:
+     ```json
+     {
+       "msisdn": "+84981234567",
+       "nas_identifier": "GGSN-HN-01",
+       "event_timestamp": "2026-08-27T08:30:00+00:00",
+       "event_epoch": 1787819400.0,
+       "event_id": "radius:a1b2c3d4...",
+       "source_partition": 2,
+       "source_offset": 105432
+     }
+     ```
+2. **`ggsn-ips:<nas_identifier>`** (Sorted Set):
+   - Member: `framed_ip`
+   - Score: `event_epoch`
+   - Mục đích: Đóng vai trò Reverse Index giúp thu hồi và xoá hàng loạt tất cả địa chỉ IP của một trạm NAS khi xảy ra sự kiện `Accounting-Off`.
+
+### 2.2. PostgreSQL (Persistent Session History & Audit)
+Bảng `radius_session_state` lưu trữ trạng thái phiên bền vững:
+```sql
+CREATE TABLE radius_session_state (
+    acct_session_id VARCHAR(128) PRIMARY KEY, -- NAS:session_id
+    msisdn VARCHAR(16) NOT NULL,
+    nas_identifier VARCHAR(64),
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    last_event_at TIMESTAMPTZ NOT NULL,
+    last_event_id VARCHAR(128) NOT NULL,
+    source_partition INT NOT NULL,
+    source_offset BIGINT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
+
+---
+
+## 3. Các Lua Scripts đảm bảo tính nguyên tử (Atomicity & Fencing)
+
+Để chống race condition khi các gói tin mạng đến sai thứ tự (ví dụ gói `Stop` đến trước gói `Interim-Update`), module sử dụng các script Lua thực thi nguyên tử trên Redis:
+
+### 3.1. `UPSERT_LUA`
+- Kiểm tra phiên bản của bản ghi cũ trong Redis:
+  $$\text{Chấp nhận nếu: } \text{epoch}_{\text{mới}} > \text{epoch}_{\text{cũ}} \lor (\text{epoch bằng nhau} \land \text{offset}_{\text{mới}} > \text{offset}_{\text{cũ}})$$
+- Nếu IP trước đó thuộc NAS khác, tự động xóa IP khỏi `ggsn-ips:<nas_cu>`.
+- Ghi đè key `ip-ggsn:<ip>` với TTL mới và cập nhật `ggsn-ips:<nas_moi>`.
+
+### 3.2. `DELETE_LUA`
+- **Ownership Check**: Đọc giá trị hiện tại của `ip-ggsn:<ip>`, chỉ cho phép xóa nếu `msisdn` trong Redis **trùng khớp hoàn toàn** với `msisdn` trong sự kiện `Stop`.
+- Điều này ngăn chặn việc gói tin `Stop` bị trễ vô tình xóa mất phiên mới của thuê bao khác đã được cấp lại cùng địa chỉ IP đó.
+
+### 3.3. `ACCOUNTING_OFF_LUA`
+- Đọc danh sách IP từ Sorted Set của NAS, xóa các key `ip-ggsn:<ip>` có thời gian sự kiện nhỏ hơn hoặc bằng thời điểm xảy ra `Accounting-Off`.
+
+---
+
+## 4. Cơ chế Batching trong `process_batch()`
+
+1. **Khử trùng lặp nội bộ Batch (Deduplication per Batch)**:
+   - Nếu cùng một `acct_session_id` xuất hiện nhiều lần trong 1 batch (ví dụ `Start` rồi `Interim-Update`), chỉ bản ghi có offset mới nhất được đưa vào danh sách Upsert PostgreSQL nhằm tránh lỗi `CardinalityViolationError` trong câu lệnh SQL.
+2. **PostgreSQL Batch Upsert**:
+   - Sử dụng `db.persist_session_batch()` ghi toàn bộ session trong batch chỉ qua **1 round-trip duy nhất**.
+3. **Redis Pipeline Execution**:
+   - `store.apply_batch()` đưa tất cả các lệnh Lua vào 1 Redis Pipeline (`transaction=False`), giảm thiểu network round-trip overhead xuống Redis.

@@ -5,11 +5,8 @@ cd "$ROOT_DIR"
 
 case "${1:-}" in
   up)
-    # F-PARALLEL: đọc PIPELINE_REPLICAS/RADIUS_INGESTION_REPLICAS từ .env để scale
-    # thật số container — Docker Compose không tự đọc biến này, phải qua --scale.
-    docker compose up -d --build \
-      --scale "pipeline=${PIPELINE_REPLICAS:-1}" \
-      --scale "radius-ingestion=${RADIUS_INGESTION_REPLICAS:-1}"
+    # Dùng chung một quy trình bootstrap/health-check, tránh hai script lệch nhau.
+    exec bash scripts/run_pipeline.sh
     ;;
   down) docker compose down ;;
   status) docker compose ps ;;

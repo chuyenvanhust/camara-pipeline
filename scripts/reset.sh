@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # scripts/reset.sh
-# Reset toàn bộ state của pipeline: Kafka topic (xóa + tạo lại đúng 4 partitions),
+# Reset toàn bộ state của pipeline: Kafka topic (xóa + tạo lại đúng số partitions),
 # Postgres (truncate các bảng dữ liệu), Redis (flush toàn bộ).
 # Chạy trước khi bash scripts/run_pipeline.sh nếu nghi ngờ dữ liệu bị double-ingest,
 # đứng bậy do process cũ chưa được dọn sạch, hoặc muốn có baseline sạch để đo lại benchmark.
@@ -15,6 +15,9 @@ set -a; [ -f "$ROOT_DIR/.env" ] && source "$ROOT_DIR/.env"; set +a
 KAFKA_TOPIC_RAW="${KAFKA_TOPIC_RAW:-radius.accounting.raw}"
 KAFKA_PARTITIONS="${KAFKA_TOPIC_PARTITIONS:-12}"
 KAFKA_REPL="${KAFKA_REPLICATION_FACTOR:-3}"
+KAFKA_CONSUMER_GROUPS="${KAFKA_CONSUMER_GROUPS:-cg-ip-msisdn cg-device-swap cg-sim-swap}"
+POSTGRES_USER="${POSTGRES_LOCAL_USER:-postgres}"
+POSTGRES_DB="${POSTGRES_LOCAL_DB:-camara_db}"
 
 echo "=================================================="
 echo ">>> CẢNH BÁO: Sắp reset toàn bộ state pipeline"
@@ -30,54 +33,88 @@ if [[ ! $REPLY =~ ^[Yy]$ ]]; then
     exit 0
 fi
 
-# 1. Restart pipeline service (compose-managed, không cần docker exec kill)
-echo ">>> Restart pipeline service..."
-docker compose restart pipeline 2>/dev/null || true
-sleep 2
-echo "[OK] Pipeline service restarted"
+RESET_TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/camara-reset.XXXXXX")"
+trap 'rm -rf -- "$RESET_TMP_DIR"' EXIT
+
+# 1. Dừng toàn bộ producer/consumer trước khi xóa topic. Nếu để ingestion hoặc
+# pipeline chạy, Kafka auto-create/client ensure-topic có thể tạo lại topic ngay
+# giữa lúc script đang chờ xóa và gây vòng lặp "Topic already exists".
+echo ">>> Dừng producer/consumer để khóa luồng ghi Kafka..."
+docker compose stop pipeline radius-ingestion notification-dispatcher >/dev/null
+echo "[OK] Producer/consumer đã dừng"
+
+if ! docker exec camara-kafka kafka-broker-api-versions \
+    --bootstrap-server localhost:9092 >/dev/null 2>&1; then
+    echo "[ERROR] Kafka broker chưa sẵn sàng. Chạy bash scripts/run_pipeline.sh trước." >&2
+    exit 1
+fi
+
+# Offset cũ có thể lớn hơn log mới sau khi tạo lại topic, khiến consumer bỏ qua
+# dữ liệu hoặc phát sinh OffsetOutOfRange. Xóa group khi mọi consumer đã dừng.
+echo ">>> Xóa consumer-group offsets cũ..."
+for group in $KAFKA_CONSUMER_GROUPS; do
+    if docker exec camara-kafka kafka-consumer-groups \
+        --bootstrap-server localhost:9092 --delete --group "$group" \
+        >"$RESET_TMP_DIR/kafka-group.log" 2>&1; then
+        echo "    [OK] $group"
+    elif grep -Eqi "does not exist|Group.*not found" "$RESET_TMP_DIR/kafka-group.log"; then
+        echo "    [SKIP] $group chưa tồn tại"
+    else
+        echo "[ERROR] Không xóa được consumer group $group:" >&2
+        cat "$RESET_TMP_DIR/kafka-group.log" >&2
+        exit 1
+    fi
+done
 
 # 2. Xóa và tạo lại Kafka topic đúng số partitions, tránh phụ thuộc auto-create.topics.enable
 echo ">>> Reset Kafka topic: $KAFKA_TOPIC_RAW..."
 if docker exec camara-kafka kafka-topics --bootstrap-server localhost:9092 \
-    --list 2>/dev/null | grep -qx "$KAFKA_TOPIC_RAW"; then
-    docker exec camara-kafka kafka-topics --bootstrap-server localhost:9092 \
-        --delete --topic "$KAFKA_TOPIC_RAW"
+    --list 2>/dev/null | grep -Fqx "$KAFKA_TOPIC_RAW"; then
+    if ! docker exec camara-kafka kafka-topics --bootstrap-server localhost:9092 \
+        --delete --topic "$KAFKA_TOPIC_RAW" >"$RESET_TMP_DIR/kafka-delete.log" 2>&1; then
+        echo "[ERROR] Không gửi được lệnh xóa topic:" >&2
+        cat "$RESET_TMP_DIR/kafka-delete.log" >&2
+        exit 1
+    fi
     echo "[OK] Đã gửi lệnh xóa topic"
 else
     echo "    ... topic chưa tồn tại, bỏ qua bước xóa"
 fi
 
-# Việc xóa vật lý segment file trên Kafka bị trễ theo log.segment.delete.delay.ms
-# (mặc định 60s) nên topic có thể vẫn còn tồn tại trong --list rất lâu sau lệnh --delete.
-# Thay vì đợi rồi tạo 1 lần, retry --create liên tục và coi lỗi "already exists"
-# là dấu hiệu "còn đang xóa dở" để thử lại, tối đa 90s.
-echo ">>> Đợi topic bị xóa hẳn và tạo lại (có thể mất tới ~60-90s)..."
-CREATED=0
-for i in $(seq 1 45); do
-    if docker exec camara-kafka kafka-topics --bootstrap-server localhost:9092 \
-        --create --topic "$KAFKA_TOPIC_RAW" --partitions "$KAFKA_PARTITIONS" \
-        --replication-factor "$KAFKA_REPL" 2>/tmp/reset_kafka_create.log; then
-        CREATED=1
+# Chờ metadata không còn topic rồi mới tạo đúng một lần. Không spam --create:
+# lỗi "already exists" khi delete bất đồng bộ là trạng thái chờ, không phải lỗi tạo.
+echo ">>> Đợi Kafka xác nhận topic đã bị xóa..."
+DELETED=0
+for i in $(seq 1 60); do
+    if ! docker exec camara-kafka kafka-topics --bootstrap-server localhost:9092 \
+        --list 2>/dev/null | grep -Fqx "$KAFKA_TOPIC_RAW"; then
+        DELETED=1
         break
     fi
-    if ! grep -q "already exists" /tmp/reset_kafka_create.log; then
-        echo "    ... lỗi không mong đợi khi tạo topic:"
-        cat /tmp/reset_kafka_create.log
-        exit 1
+    if (( i % 5 == 0 )); then
+        echo "    ... vẫn đang xóa (${i}/60)"
     fi
-    echo "    ... topic cũ chưa xóa xong, thử lại (${i}/45)"
     sleep 2
 done
 
-if [ "$CREATED" -ne 1 ]; then
-    echo "    [!] Không tạo được topic sau 90s. Kiểm tra: docker compose logs kafka --tail 50"
+if [ "$DELETED" -ne 1 ]; then
+    echo "[ERROR] Topic chưa bị xóa sau 120s. Kiểm tra: docker compose logs --tail 100 kafka-1 kafka-2 kafka-3" >&2
+    exit 1
+fi
+
+echo ">>> Tạo topic mới: partitions=$KAFKA_PARTITIONS, replication=$KAFKA_REPL..."
+if ! docker exec camara-kafka kafka-topics --bootstrap-server localhost:9092 \
+    --create --topic "$KAFKA_TOPIC_RAW" --partitions "$KAFKA_PARTITIONS" \
+    --replication-factor "$KAFKA_REPL" >"$RESET_TMP_DIR/kafka-create.log" 2>&1; then
+    echo "[ERROR] Không tạo được topic:" >&2
+    cat "$RESET_TMP_DIR/kafka-create.log" >&2
     exit 1
 fi
 echo "[OK] Kafka topic đã sẵn sàng với $KAFKA_PARTITIONS partitions"
 
 # 3. Truncate Postgres
 echo ">>> Reset Postgres..."
-docker exec camara-postgres psql -U postgres -d camara_db -c \
+docker exec camara-postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c \
     "TRUNCATE sim_swap_history, device_swap_history, msisdn_sim, msisdn_device, audit_log RESTART IDENTITY CASCADE;"
 echo "[OK] Postgres đã được truncate"
 
@@ -87,5 +124,6 @@ docker exec camara-redis redis-cli FLUSHALL > /dev/null
 echo "[OK] Redis đã được flush"
 
 echo "=================================================="
-echo ">>> Reset hoàn tất. Chạy: bash scripts/run_pipeline.sh"
+echo ">>> Reset hoàn tất. Producer/consumer đang dừng."
+echo ">>> Khởi động lại bằng: bash scripts/run_pipeline.sh"
 echo "=================================================="

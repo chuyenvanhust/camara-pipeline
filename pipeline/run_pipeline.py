@@ -25,8 +25,8 @@ async def ensure_topics(bootstrap_servers: str, topics: list[str]) -> None:
         for topic in topics:
             try:
                 await admin.create_topics([NewTopic(
-                    topic, num_partitions=int(os.getenv("KAFKA_TOPIC_PARTITIONS", "8")),
-                    replication_factor=int(os.getenv("KAFKA_REPLICATION_FACTOR", "1")),
+                    topic, num_partitions=int(os.getenv("KAFKA_TOPIC_PARTITIONS", "16")),
+                    replication_factor=int(os.getenv("KAFKA_REPLICATION_FACTOR", "3")),
                 )])
                 logger.info("Created Kafka topic %s", topic)
             except TopicAlreadyExistsError:
@@ -59,17 +59,18 @@ async def run_pipeline(duration: int | None = None) -> None:
     # đúng 1 instance/group ôm hết mọi partition, dù chạy 8-12 partition cũng
     # chỉ xử lý tuần tự trong 1 task). Đặt KAFKA_TOPIC_PARTITIONS >= số instance
     # nhiều nhất trong 1 group, nếu không instance dư sẽ rảnh (idle member).
-    consumers_per_group = max(1, int(os.getenv("CONSUMERS_PER_GROUP", "1")))
+    consumers_per_group = max(1, int(os.getenv("CONSUMERS_PER_GROUP", "4")))
     consumer_specs = [
         (IPMsisdnConsumer, "cg-ip-msisdn"),
         (DeviceSwapConsumer, "cg-device-swap"),
         (SimSwapConsumer, "cg-sim-swap"),
     ]
-    consumers = [
-        cls(raw_topic, group_id, database)
-        for cls, group_id in consumer_specs
-        for _ in range(consumers_per_group)
-    ]
+    consumers = []
+    for cls, group_id in consumer_specs:
+        for member_index in range(consumers_per_group):
+            consumer = cls(raw_topic, group_id, database)
+            consumer.metrics.member = f"{member_index + 1}/{consumers_per_group}"
+            consumers.append(consumer)
     tasks = {
         asyncio.create_task(consumer.run(), name=f"{consumer.group_id}-{i}"): consumer
         for i, consumer in enumerate(consumers)
