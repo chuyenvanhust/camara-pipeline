@@ -21,7 +21,9 @@ class DeviceSwapConsumer(BaseKafkaConsumer):
 
     async def _load_state(self, msisdns: List[str]) -> Dict[str, Dict[str, Any]]:
         assert self.redis is not None
+        mget_started = time.monotonic()
         cached = await self.redis.mget([self._cache_key(value) for value in msisdns])
+        self.metrics.observe_redis_mget(time.monotonic() - mget_started)
         state: Dict[str, Dict[str, Any]] = {}
         missing: List[str] = []
         for msisdn, raw in zip(msisdns, cached):
@@ -35,8 +37,12 @@ class DeviceSwapConsumer(BaseKafkaConsumer):
             except (TypeError, ValueError, InvalidMessageError):
                 pass
             missing.append(msisdn)
+        hits = len(msisdns) - len(missing)
+        self.metrics.set_cache_hit_ratio(hits, len(msisdns))
         if missing:
+            fb_started = time.monotonic()
             state.update(await self.db.batch_get_device_state(missing))
+            self.metrics.observe_postgres_fallback(time.monotonic() - fb_started)
         return state
 
     async def process_batch(self, records: List[Any]) -> None:

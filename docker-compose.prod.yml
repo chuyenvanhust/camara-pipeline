@@ -5,7 +5,9 @@
 # Dùng kèm file gốc:
 #   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build \
 #     --scale radius-ingestion=${RADIUS_INGESTION_REPLICAS:-4} \
-#     --scale pipeline=${PIPELINE_REPLICAS:-2}
+#     --scale pipeline-ip-msisdn=${PIPELINE_IP_REPLICAS:-2} \
+#     --scale pipeline-device-swap=${PIPELINE_DEVICE_REPLICAS:-2} \
+#     --scale pipeline-sim-swap=${PIPELINE_SIM_REPLICAS:-2}
 #
 # Vì sao cần override riêng thay vì sửa thẳng docker-compose.yml:
 # - `network_mode: host` bỏ qua `ports:`/network alias, không tương thích khi
@@ -76,11 +78,7 @@ services:
     # kernel Linux tự load-balance datagram giữa các container -> parallel thật,
     # mỗi container là 1 process riêng, không còn bị GIL của asyncio chia sẻ.
 
-  pipeline:
-    # Không cần network_mode: host — pipeline chỉ là Kafka/Postgres/Redis client
-    # thuần TCP, scale qua nhiều container độc lập là đủ để rebalance partition
-    # (xem CONSUMERS_PER_GROUP trong docker-compose.yml + run_pipeline.py).
-    # Gỡ giới hạn cpus/mem mặc định cho dev (2 cpu/2g) để tận dụng phần cứng mạnh hơn:
+  pipeline-ip-msisdn: &pipeline-prod-override
     cpus: ${PIPELINE_CPUS_PROD:-4}
     mem_limit: ${PIPELINE_MEM_LIMIT_PROD:-4g}
     environment:
@@ -96,6 +94,12 @@ services:
         condition: service_healthy
       redis-sentinel-3:
         condition: service_healthy
+
+  pipeline-device-swap:
+    <<: *pipeline-prod-override
+
+  pipeline-sim-swap:
+    <<: *pipeline-prod-override
 
   fastapi:
     environment:

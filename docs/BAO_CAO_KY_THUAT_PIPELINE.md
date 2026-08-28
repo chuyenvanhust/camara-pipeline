@@ -9,7 +9,7 @@
 1. [Tổng quan Kiến trúc Hệ thống](#1-tổng-quan-kiến-trúc-hệ-thống)
 2. [Tầng Tiếp Nhận Dữ Liệu (Ingestion Layer)](#2-tầng-tiếp-nhận-dữ-liệu-ingestion-layer)
    - 2.1. `pipeline/ingestion/packet_reader.py`: Giải mã Nhị phân RFC 2866 & 3GPP VSA
-   - 2.2. `pipeline/ingestion/producer.py`: Buffer Hàng đợi Bất đồng bộ, Deduplication ACK & Multi-worker Producer
+   - 2.2. `pipeline/ingestion/producer.py`: Buffer Hàng đợi Bất đồng bộ & Multi-worker Producer
 3. [Tầng Hạ Tầng Dùng Chung (Shared Infrastructure)](#3-tầng-hạ-tầng-dùng-chung-shared-infrastructure)
    - 3.1. `pipeline/modules/shared/base_consumer.py`: Sharding Phân vùng Song song, Manual Commit & Đo Lag Bản Tin E2E
    - 3.2. `pipeline/modules/shared/db.py`: Giao dịch Nguyên tử 4 Bảng, Fencing Versioning & Batch UNNEST
@@ -27,11 +27,9 @@
 
 ```mermaid
 flowchart TD
-    GGSN["Thiết Bị Mạng GGSN / PGW (UDP/1813)"] -->|RFC 2866 Datagram| PR["PacketReader (SO_REUSEPORT)"]
+    GGSN["External RADIUS Capture Server<br/>(Durable Mirror Source)"] -->|Mirrored UDP/1813| PR["PacketReader (SO_REUSEPORT)"]
     PR -->|asyncio.Queue| PROD["RadiusLogProducer (4 Publisher Workers)"]
-    PROD <-->|LRU Cache| DEDUP[("ACK Cache (RAM)")]
     PROD -->|Produce acks=all| KAFKA["Apache Kafka (16 Partitions)"]
-    PROD -.->|Accounting-Response| GGSN
 
     KAFKA --> CG_IP["IP-MSISDN Consumer (4 Members)"]
     KAFKA --> CG_DEV["Device Swap Consumer (4 Members)"]
@@ -56,8 +54,8 @@ flowchart TD
 
 #### Kỹ thuật 1: Giải mã nhị phân không sử dụng thư viện ngoài (Zero-dependency Binary Parser)
 - Đọc trực tiếp cấu trúc nhị phân 20-byte RADIUS Header theo định dạng Big-Endian (`struct.unpack`):
-  - Byte 0: `Code` (4 = Accounting-Request, 5 = Accounting-Response).
-  - Byte 1: `Identifier` (Mã định danh gói tin dùng để map với Response).
+  - Byte 0: `Code` (ingestion chỉ chấp nhận 4 = Accounting-Request).
+  - Byte 1: `Identifier` của gói RADIUS.
   - Byte 2–3: `Length` (Độ dài toàn bộ gói tin).
   - Byte 4–19: `Request Authenticator` (16 bytes chuỗi xác thực ngẫu nhiên).
 - Duyệt vòng lặp bóc tách các cặp thuộc tính TLV (Type-Length-Value) với độ phức tạp $O(N)$ tuyến tính theo độ dài gói tin.
@@ -69,10 +67,11 @@ flowchart TD
   - Subtype `21`: **`3GPP-RAT-Type`** (Loại sóng mạng: 1=UTRAN, 2=GERAN, 6=EUTRAN/LTE).
   - Subtype `8`: **`3GPP-SGSN-MCC-MNC`** (Mã mạng quốc gia và nhà mạng viễn thông).
 
-#### Kỹ thuật 3: Tính toán MD5 Response Authenticator theo chuẩn RFC 2866
-- Gói tin phản hồi `Accounting-Response` (Code=5) được ký xác thực MD5:
-  $$\text{Response Authenticator} = \text{MD5}(\text{Code} + \text{ID} + \text{Length} + \text{Request Authenticator} + \text{Attributes} + \text{Shared Secret})$$
-- Đảm bảo thiết bị trạm GGSN/NAS xác thực được tính toàn vẹn và nguồn gốc phản hồi.
+#### Kỹ thuật 3: Xác thực MD5 Request Authenticator
+- `PacketReader` tính lại Request Authenticator từ header, AVP và shared secret rồi
+  so sánh constant-time bằng `hmac.compare_digest` trước khi giải mã record.
+- Đây là kiểm tra tính toàn vẹn đầu vào, không tạo RADIUS response và không quản lý
+  session với thiết bị mạng.
 
 #### Kỹ thuật 4: Kernel Socket Load Balancing (`SO_REUSEPORT`) & Gắn Thẻ Thời Gian Ingest
 - Socket UDP được cấu hình cờ `SO_REUSEPORT` và buffer nhận tối đa 32MB (`SO_RCVBUF`). Khi chạy nhiều tiến trình Ingestion trên Linux, Kernel tự động băm (hash) 4-tuple (`src_ip, src_port, dst_ip, dst_port`) phân bổ gói tin đều cho các tiến trình mà không cần Proxy trung gian.
@@ -89,17 +88,24 @@ flowchart TD
 - Các bản ghi DLQ hoặc bản ghi không có key được phân bổ đều theo `event_id` hoặc Round-Robin `_rr_counter`, ngăn ngừa hiện tượng dồn ép bộ nhớ vào worker 0.
 
 #### Kỹ thuật 2: Khống Chế Inflight Toàn Cục Trực Tiếp qua Semaphore (`RADIUS_UDP_KAFKA_TOTAL_MAX_INFLIGHT_BATCHES`)
-- Sử dụng `asyncio.Semaphore(total_inflight_limit)` để khống chế trần tổng số Kafka produce futures đồng thời trên toàn bộ các workers (mặc định 64 batches = 16.000 records).
+- Sử dụng `asyncio.Semaphore(total_inflight_limit)` để khống chế trần tổng số Kafka produce futures đồng thời trên toàn bộ workers (mặc định 24 batches = 12.000 records với batch tối đa 500).
+- Mỗi worker giữ baseline 4 batch để bảo vệ latency và tự nâng lên 6 khi queue shard đạt 50%; concurrency giảm lại khi pressure kết thúc.
+- Các worker được ánh xạ cố định lên một pool Kafka producer độc lập (mặc định 4).
+  Một MSISDN luôn thuộc cùng worker và producer, nên loại bỏ contention của một
+  producer duy nhất trong khi vẫn giữ thứ tự record theo thuê bao/Kafka key.
 - Ngăn ngừa tình trạng áp lực bộ nhớ và biến động latency khi Kafka Cluster gặp hiện tượng nghẽn I/O hoặc rebalance.
 
-#### Kỹ thuật 3: Bộ Nhớ Đệm Khử Trùng Lặp ACK (`_radius_ack_cache` LRU RAM)
-- Quản lý 500.000 khóa định danh sự kiện (`radius_event_id`) trong bộ nhớ `OrderedDict` với thời gian sống TTL 120 giây.
-- Khi nhận được gói tin retry từ NAS cho một sự kiện đã được ghi nhận vào Kafka trước đó, hệ thống **trả ngay Accounting-Response từ Cache RAM** mà không ghi trùng lặp vào Kafka, tiết kiệm 100% tài nguyên xử lý của tầng Consumer.
+#### Kỹ thuật 3: Passive Mirror Boundary
+- Capture server bên ngoài là nguồn bền vững và sở hữu ACK/response/replay.
+- Ingestion không giữ pending request, retry heap hay ACK cache. Mỗi datagram hợp lệ
+  được chuẩn hóa và chuyển một chiều tới Kafka; queue đầy hoặc publish lỗi được ghi
+  nhận là `data_loss` để vận hành replay từ nguồn.
 
-#### Kỹ thuật 4: Multi-Socket Traffic Generator (`--num-sockets 8`) & `select.select()` Multiplex ACK Receiver
+#### Kỹ thuật 4: Multi-Socket Fire-and-Forget Traffic Generator (`--num-sockets 8`)
 - `radius_udp_sender.py` hỗ trợ gửi từ $N$ UDP client sockets độc lập (mỗi socket sở hữu 1 source port riêng từ OS), kích hoạt 100% cơ chế Kernel `SO_REUSEPORT` của Linux phía receiver.
-- Thread lắng nghe `receive_responses()` sử dụng **`select.select(sockets, [], [], 0.02)`** để multiplex lắng nghe phản hồi ACK trên tất cả các sockets đồng thời.
-- Mỗi gói tin được lưu `socket_idx` nguồn để khi retry được phát đi từ đúng socket ban đầu, loại bỏ hoàn toàn tình trạng nghẽn timeout giả khi benchmark ở tốc độ cao 15.000 pkt/s.
+- Một sender loop sở hữu token bucket và round-robin qua các socket. Công cụ không
+  nhận response hoặc retry nên số đo `actual` phản ánh tốc độ phát mirror, không bị
+  trộn với RTT hay lưu lượng retry.
 
 ---
 
@@ -108,7 +114,7 @@ flowchart TD
 ### 3.1. `pipeline/modules/shared/base_consumer.py` — Lớp Cơ Sở Xử Lý Song Song & Đo Lag Bản Tin E2E
 
 #### Kỹ thuật 1: Phân mảnh Phân vùng Song song (Partition-Concurrency Sharding)
-- Khi nhận một tập hợp các partition từ `getmany()`, Consumer gom các partition thành $K$ shards (`PROCESSING_PARTITION_CONCURRENCY = 3`).
+- Khi nhận một tập hợp các partition từ `getmany()`, Consumer gom các partition thành $K$ shards (`PROCESSING_PARTITION_CONCURRENCY = 2`).
 - Thực thi $K$ shards song song qua `asyncio.gather()`:
   - Các partition khác nhau được xử lý đồng thời.
   - Các bản ghi trong cùng một partition luôn được duyệt tuần tự theo thứ tự tăng dần của `offset`, đảm bảo tính đúng đắn về mặt thời gian cho từng thuê bao di động.
@@ -173,9 +179,12 @@ flowchart TD
 - Phân định rõ ràng các Counter trong Ingestion Exporter:
   - `radius_ingestion_invalid_total`: Record không hợp lệ sent to DLQ.
   - `radius_ingestion_dlq_published_total`: Record DLQ published to Kafka `.dlq`.
-  - `radius_ingestion_publish_failed_total`: Kafka produce failure (NAS will retry).
-  - `radius_ingestion_queue_rejected_for_retry_total`: RAM queue full (NAS will retry).
+  - `radius_ingestion_kafka_persisted_total`: Record được Kafka xác nhận theo cấu hình producer.
+  - `radius_ingestion_publish_failed_total`: Record mirror không ghi được Kafka.
+  - `radius_ingestion_queue_dropped_total`: RAM queue đầy và record mirror bị bỏ.
+  - `radius_ingestion_queue_capacity_records`: Capacity dùng tính queue pressure theo tỷ lệ.
   - `radius_ingestion_worker_queue_depth_records{worker="N"}`: RAM queue depth per worker shard.
+  - `radius_ingestion_worker_slot_wait_seconds{worker="N"}`: Thời gian worker bị chặn bởi giới hạn inflight cục bộ.
 
 ---
 
@@ -210,8 +219,8 @@ flowchart TD
 | File / Module | Kỹ Thuật Trọng Điểm | Lợi Ích & Mục Đích Kỹ Thuật |
 |---|---|---|
 | [`packet_reader.py`](../pipeline/ingestion/packet_reader.py) | - RFC 2866 Binary TLV Parser<br/>- 3GPP VSA (Vendor 10415)<br/>- MD5 Authenticator<br/>- `SO_REUSEPORT` | - Giải mã cực nhanh không phụ thuộc thư viện ngoài<br/>- Kernel load-balancing đa tiến trình<br/>- Xác thực tính toàn vẹn gói tin |
-| [`producer.py`](../pipeline/ingestion/producer.py) | - Key-Sharded Queues per MSISDN<br/>- Global Inflight Semaphore<br/>- LRU ACK Cache (500k)<br/>- Split Metrics Exporter | - Bảo đảm thứ tự tuần tự tuyệt đối theo MSISDN<br/>- Khống chế trần inflight toàn process<br/>- Trả ACK tức thì cho retry gói tin<br/>- Giám sát chi tiết metrics không bị mất dấu |
-| [`radius_udp_sender.py`](../pipeline/ingestion/radius_udp_sender.py) | - Multi-Socket Sending (`--num-sockets 8`)<br/>- `select.select()` ACK Receiver<br/>- Retries Matching Socket Index | - Kích hoạt 100% Kernel SO_REUSEPORT load balancing<br/>- Drain ACK đa socket không bị timeout giả khi load-test |
+| [`producer.py`](../pipeline/ingestion/producer.py) | - Key-Sharded Queues per MSISDN<br/>- Global Inflight Semaphore<br/>- Passive mirror boundary<br/>- Split Metrics Exporter | - Bảo đảm thứ tự gửi theo MSISDN<br/>- Khống chế trần inflight toàn process<br/>- Không mang state giao thức RADIUS<br/>- Định vị queue/Kafka bottleneck và data loss |
+| [`radius_udp_sender.py`](../pipeline/ingestion/radius_udp_sender.py) | - Multi-Socket Sending (`--num-sockets 8`)<br/>- Token-bucket pacing<br/>- Pre-encoding/cache AVP | - Kích hoạt SO_REUSEPORT load balancing<br/>- Tạo tải fire-and-forget ổn định, không lẫn ACK/retry |
 | [`base_consumer.py`](../pipeline/modules/shared/base_consumer.py) | - Partition Sharding (`asyncio.gather`)<br/>- Manual Offset Commit<br/>- Fast Float Epoch Lag (`ingest_epoch_s`) | - Khai thác tối đa I/O đa nhân<br/>- Chống mất mát dữ liệu khi sập nguồn<br/>- Tính lag E2E cực nhanh (500x speedup) |
 | [`db.py`](../pipeline/modules/shared/db.py) | - Dynamic Connection Pool (`max=200`)<br/>- Giao dịch 4 bảng nguyên tử<br/>- Batch `UNNEST` SQL<br/>- Fencing Versioning Tuple | - Tiết kiệm bộ nhớ RAM Postgres<br/>- Bảo đảm 100% tính toàn vẹn ACID<br/>- Ghi hàng loạt tốc độ cao (< 25ms/batch)<br/>- Chống ghi đè gói tin đến sai thứ tự |
 | [`metrics.py`](../pipeline/modules/shared/metrics.py) | - Random Sampling 10% Histogram<br/>- In-Memory Sliding Window<br/>- Per-Worker Queue Depth Gauge | - Thu thập dữ liệu Histogram không thiên lệch<br/>- Tích hợp chuẩn Dashboard Grafana<br/>- Giám sát chi tiết RAM queue của từng worker |

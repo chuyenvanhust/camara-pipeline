@@ -51,23 +51,26 @@ docker compose up --build migrate
 
 echo ">>> Starting application services..."
 docker compose up -d --build \
-  --scale "pipeline=${PIPELINE_REPLICAS:-1}" \
+  --scale "pipeline-ip-msisdn=${PIPELINE_IP_REPLICAS:-1}" \
+  --scale "pipeline-device-swap=${PIPELINE_DEVICE_REPLICAS:-1}" \
+  --scale "pipeline-sim-swap=${PIPELINE_SIM_REPLICAS:-1}" \
   --scale "radius-ingestion=${RADIUS_INGESTION_REPLICAS:-1}"
 echo ">>> Waiting for API and pipeline health checks..."
 for _ in $(seq 1 60); do
   API_HEALTH="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' fastapi-app 2>/dev/null || true)"
-  # F-PARALLEL: pipeline không còn container_name cố định (để scale được) ->
-  # kiểm tra health của TẤT CẢ replica hiện có, không phải 1 tên container cứng.
-  PIPELINE_IDS="$(docker compose ps -q pipeline)"
+  PIPELINE_SERVICES="pipeline-ip-msisdn pipeline-device-swap pipeline-sim-swap"
   PIPELINE_ALL_HEALTHY=true
-  if [ -z "$PIPELINE_IDS" ]; then
-    PIPELINE_ALL_HEALTHY=false
-  else
-    for cid in $PIPELINE_IDS; do
+  for svc in $PIPELINE_SERVICES; do
+    sids="$(docker compose ps -q "$svc")"
+    if [ -z "$sids" ]; then
+      PIPELINE_ALL_HEALTHY=false
+      break
+    fi
+    for cid in $sids; do
       st="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid" 2>/dev/null || true)"
       [ "$st" = healthy ] || PIPELINE_ALL_HEALTHY=false
     done
-  fi
+  done
   if [ "$API_HEALTH" = healthy ] && [ "$PIPELINE_ALL_HEALTHY" = true ]; then
     docker compose ps
     echo "[OK] Stack is ready. UDP RADIUS listener: localhost:1813"
@@ -76,6 +79,6 @@ for _ in $(seq 1 60); do
   sleep 2
 done
 docker compose ps
-docker compose logs --tail 80 migrate fastapi pipeline radius-ingestion
+docker compose logs --tail 80 migrate fastapi pipeline-ip-msisdn pipeline-device-swap pipeline-sim-swap radius-ingestion
 echo "[ERROR] Stack did not become healthy within 120 seconds." >&2
 exit 1

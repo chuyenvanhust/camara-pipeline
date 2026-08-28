@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import os
+import time
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -25,6 +27,21 @@ class DatabasePool:
     def __init__(self, dsn: str = DATABASE_URL):
         self.dsn = dsn
         self.pool: Optional[asyncpg.Pool] = None
+        self.metrics: Optional[Any] = None
+
+    def set_metrics(self, metrics: Any) -> None:
+        self.metrics = metrics
+
+    @asynccontextmanager
+    async def acquire(self, timeout: float = 3.0, metrics: Optional[Any] = None):
+        assert self.pool is not None
+        start = time.monotonic()
+        async with self.pool.acquire(timeout=timeout) as connection:
+            acquired_in = time.monotonic() - start
+            m = metrics or getattr(self, "metrics", None)
+            if m is not None and hasattr(m, "observe_db_pool_acquire"):
+                m.observe_db_pool_acquire(acquired_in)
+            yield connection
 
     async def connect(self) -> None:
         if self.pool is None:
@@ -47,26 +64,25 @@ class DatabasePool:
             self.pool = None
 
     async def _fetch_state(
-        self, table: str, value_column: str, msisdns: Sequence[str]
+        self, table: str, value_column: str, msisdns: Sequence[str], metrics: Optional[Any] = None
     ) -> Dict[str, Dict[str, Any]]:
         if not msisdns:
             return {}
-        assert self.pool is not None
         query = f"""
             SELECT msisdn, {value_column} AS value, last_event_at, last_event_id,
                    last_source_partition, last_source_offset
             FROM {table}
             WHERE msisdn = ANY($1::text[])
         """
-        async with self.pool.acquire(timeout=3) as connection:
+        async with self.acquire(timeout=3, metrics=metrics) as connection:
             rows = await connection.fetch(query, list(msisdns))
         return {row["msisdn"]: dict(row) for row in rows}
 
-    async def batch_get_device_state(self, msisdns: Sequence[str]):
-        return await self._fetch_state("msisdn_device", "imei_current", msisdns)
+    async def batch_get_device_state(self, msisdns: Sequence[str], metrics: Optional[Any] = None):
+        return await self._fetch_state("msisdn_device", "imei_current", msisdns, metrics=metrics)
 
-    async def batch_get_sim_state(self, msisdns: Sequence[str]):
-        return await self._fetch_state("msisdn_sim", "imsi_current", msisdns)
+    async def batch_get_sim_state(self, msisdns: Sequence[str], metrics: Optional[Any] = None):
+        return await self._fetch_state("msisdn_sim", "imsi_current", msisdns, metrics=metrics)
 
     async def _upsert_state(
         self,
@@ -185,7 +201,7 @@ class DatabasePool:
         if not (states or history or audit or outbox):
             return
         assert self.pool is not None
-        async with self.pool.acquire(timeout=3) as connection:
+        async with self.acquire(timeout=3) as connection:
             async with connection.transaction():
                 await self._upsert_state(connection, table, value_column, states)
                 await self._insert_history(
@@ -211,7 +227,7 @@ class DatabasePool:
             return
         assert self.pool is not None
         columns = list(zip(*records))
-        async with self.pool.acquire(timeout=3) as connection:
+        async with self.acquire(timeout=3) as connection:
             await connection.execute(
                 """
                 INSERT INTO radius_session_state(
@@ -245,7 +261,7 @@ class DatabasePool:
         self, nas_identifier: str, event_time: datetime
     ) -> None:
         assert self.pool is not None
-        async with self.pool.acquire(timeout=3) as connection:
+        async with self.acquire(timeout=3) as connection:
             await connection.execute(
                 """
                 UPDATE radius_session_state
@@ -258,7 +274,7 @@ class DatabasePool:
 
     async def recover_stale_notifications(self) -> None:
         assert self.pool is not None
-        async with self.pool.acquire(timeout=3) as connection:
+        async with self.acquire(timeout=3) as connection:
             await connection.execute(
                 """
                 UPDATE notification_log
@@ -271,7 +287,7 @@ class DatabasePool:
 
     async def claim_notifications(self, limit: int) -> List[Dict[str, Any]]:
         assert self.pool is not None
-        async with self.pool.acquire(timeout=3) as connection:
+        async with self.acquire(timeout=3) as connection:
             async with connection.transaction():
                 rows = await connection.fetch(
                     """
@@ -305,7 +321,7 @@ class DatabasePool:
         assert self.pool is not None
         status = "DEAD" if attempts >= max_attempts else "FAILED"
         delay = min(2 ** max(attempts, 1), 300)
-        async with self.pool.acquire(timeout=3) as connection:
+        async with self.acquire(timeout=3) as connection:
             await connection.execute(
                 """
                 UPDATE notification_log
@@ -321,7 +337,7 @@ class DatabasePool:
 
     async def _update_notification(self, notification_id: int, assignment: str) -> None:
         assert self.pool is not None
-        async with self.pool.acquire(timeout=3) as connection:
+        async with self.acquire(timeout=3) as connection:
             await connection.execute(
                 f"UPDATE notification_log SET {assignment} WHERE id=$1",
                 notification_id,

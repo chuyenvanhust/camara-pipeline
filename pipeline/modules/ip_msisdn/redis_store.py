@@ -66,6 +66,9 @@ return 1
 class IPMappingStore:
     def __init__(self, redis_client: aioredis.Redis):
         self.redis = redis_client
+        self._upsert_script = self.redis.register_script(UPSERT_LUA)
+        self._delete_script = self.redis.register_script(DELETE_LUA)
+        self._acct_off_script = self.redis.register_script(ACCOUNTING_OFF_LUA)
 
     @staticmethod
     def _ip_key(framed_ip: str) -> str:
@@ -85,14 +88,18 @@ class IPMappingStore:
                               "event_timestamp": event_time.isoformat(), "event_epoch": epoch,
                               "event_id": event_id, "source_partition": partition,
                               "source_offset": offset})
-        result = await self.redis.eval(UPSERT_LUA, 1, self._ip_key(framed_ip),
-                                       framed_ip, nas, epoch, partition, offset, payload, ttl)
+        result = await self._upsert_script(
+            keys=[self._ip_key(framed_ip)],
+            args=[framed_ip, nas, epoch, partition, offset, payload, ttl]
+        )
         return bool(result)
 
     async def delete_mapping(self, framed_ip: str, msisdn: str, event_time: datetime,
                              partition: int, offset: int) -> bool:
-        result = await self.redis.eval(DELETE_LUA, 1, self._ip_key(framed_ip),
-                                       framed_ip, msisdn, event_time.timestamp(), partition, offset)
+        result = await self._delete_script(
+            keys=[self._ip_key(framed_ip)],
+            args=[framed_ip, msisdn, event_time.timestamp(), partition, offset]
+        )
         return bool(result)
 
     async def apply_batch(self, operations: List[Dict[str, Any]],
@@ -101,6 +108,7 @@ class IPMappingStore:
 
         Each Lua invocation remains atomic. A non-transactional pipeline only batches
         network I/O; Redis still executes commands in the original Kafka offset order.
+        Script execution uses EVALSHA via registered Script instances to minimize network size.
         """
         if not operations:
             return 0
@@ -118,15 +126,16 @@ class IPMappingStore:
                         "source_partition": operation["partition"],
                         "source_offset": operation["offset"],
                     })
-                    pipe.eval(
-                        UPSERT_LUA, 1, self._ip_key(framed_ip), framed_ip, nas, epoch,
-                        operation["partition"], operation["offset"], payload, ttl,
+                    self._upsert_script(
+                        keys=[self._ip_key(framed_ip)],
+                        args=[framed_ip, nas, epoch, operation["partition"], operation["offset"], payload, ttl],
+                        client=pipe
                     )
                 else:
-                    pipe.eval(
-                        DELETE_LUA, 1, self._ip_key(framed_ip), framed_ip,
-                        operation["msisdn"], event_time.timestamp(),
-                        operation["partition"], operation["offset"],
+                    self._delete_script(
+                        keys=[self._ip_key(framed_ip)],
+                        args=[framed_ip, operation["msisdn"], event_time.timestamp(), operation["partition"], operation["offset"]],
+                        client=pipe
                     )
             results = await pipe.execute()
         return sum(bool(result) for result in results)
@@ -142,7 +151,11 @@ class IPMappingStore:
                 break
             async with self.redis.pipeline(transaction=False) as pipe:
                 for address in addresses:
-                    pipe.eval(ACCOUNTING_OFF_LUA, 1, self._ip_key(address), address, nas_identifier, cutoff)
+                    self._acct_off_script(
+                        keys=[self._ip_key(address)],
+                        args=[address, nas_identifier, cutoff],
+                        client=pipe
+                    )
                 await pipe.execute()
             removed += len(addresses)
         if await self.redis.zcard(reverse_key) == 0:

@@ -44,6 +44,27 @@ async def run_pipeline(duration: int | None = None) -> None:
         except NotImplementedError:
             pass
 
+    all_specs = [
+        (IPMsisdnConsumer, "cg-ip-msisdn", ["ip-msisdn", "cg-ip-msisdn"]),
+        (DeviceSwapConsumer, "cg-device-swap", ["device-swap", "cg-device-swap"]),
+        (SimSwapConsumer, "cg-sim-swap", ["sim-swap", "cg-sim-swap"]),
+    ]
+    env_groups_raw = os.getenv("PIPELINE_GROUPS", "").strip()
+    if env_groups_raw:
+        requested = {g.strip().lower() for g in env_groups_raw.split(",") if g.strip()}
+        consumer_specs = [
+            (cls, group_id)
+            for cls, group_id, aliases in all_specs
+            if any(alias in requested for alias in aliases)
+        ]
+        if not consumer_specs:
+            raise ValueError(
+                f"No matching consumers found for PIPELINE_GROUPS={env_groups_raw!r}. "
+                f"Valid group names/aliases are: ip-msisdn, device-swap, sim-swap."
+            )
+    else:
+        consumer_specs = [(cls, group_id) for cls, group_id, _ in all_specs]
+
     bootstrap = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "camara-kafka:9092")
     raw_topic = os.getenv("KAFKA_TOPIC_RAW", "radius.accounting.raw")
     dlq_topic = f"{raw_topic}.dlq"
@@ -53,18 +74,7 @@ async def run_pipeline(duration: int | None = None) -> None:
     database = DatabasePool()
     await database.connect()
 
-    # F-PARALLEL: CONSUMERS_PER_GROUP instance ĐỘC LẬP cho mỗi group — mỗi
-    # instance là 1 AIOKafkaConsumer/1 member riêng trong CÙNG group_id, nên
-    # Kafka rebalance chia partition thật ra cho từng instance (trước đây luôn
-    # đúng 1 instance/group ôm hết mọi partition, dù chạy 8-12 partition cũng
-    # chỉ xử lý tuần tự trong 1 task). Đặt KAFKA_TOPIC_PARTITIONS >= số instance
-    # nhiều nhất trong 1 group, nếu không instance dư sẽ rảnh (idle member).
     consumers_per_group = max(1, int(os.getenv("CONSUMERS_PER_GROUP", "4")))
-    consumer_specs = [
-        (IPMsisdnConsumer, "cg-ip-msisdn"),
-        (DeviceSwapConsumer, "cg-device-swap"),
-        (SimSwapConsumer, "cg-sim-swap"),
-    ]
     consumers = []
     for cls, group_id in consumer_specs:
         for member_index in range(consumers_per_group):

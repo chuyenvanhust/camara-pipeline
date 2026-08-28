@@ -1,6 +1,6 @@
 # `pipeline/` — Lõi Xử Lý Dữ Liệu RADIUS Accounting
 
-Thư mục `pipeline/` chứa toàn bộ logic tiếp nhận dữ liệu RADIUS Accounting từ thiết bị mạng viễn thông (hoặc file CSV), đưa vào message broker Apache Kafka, phân phối và xử lý song song qua 3 Consumer Modules độc lập, cập nhật trạng thái vào cơ sở dữ liệu PostgreSQL / Redis, và phân phối webhook callback qua Transactional Outbox Dispatcher.
+Thư mục `pipeline/` chứa logic nhận bản mirror RADIUS Accounting từ capture server ngoài hệ thống (hoặc file CSV), ghi Apache Kafka, xử lý song song qua ba Consumer Modules và cập nhật PostgreSQL/Redis. RADIUS ACK/response và độ bền nguồn không thuộc repo này.
 
 ---
 
@@ -13,17 +13,14 @@ flowchart TD
         CSVPROD["CSV File Reader<br/>LocalCSVReader"]
         QUEUE[("Bounded Ingestion Queue<br/>asyncio.Queue (RAM)")]
         KPROD["Kafka Async Producer<br/>(Batching + acks=all)"]
-        ACKMGMT["ACK Cache & Manager<br/>(LRU Cache + Deduplication)"]
         
         UDP -->|Decode RFC 2866| QUEUE
         CSVPROD -->|Read records| QUEUE
         QUEUE --> KPROD
-        KPROD <--> ACKMGMT
-        ACKMGMT -.->|Accounting-Response| UDP
     end
 
     subgraph BROKER["2. Message Broker (Apache Kafka)"]
-        TOPIC["Topic: radius.accounting.raw<br/>12 Partitions, Partition Key: MSISDN"]
+        TOPIC["Topic: radius.accounting.raw<br/>16 Partitions, Partition Key: MSISDN"]
         DLQ["Topic: radius.accounting.raw.dlq<br/>Error / Malformed Messages"]
         
         KPROD -->|Partitioned Send| TOPIC
@@ -166,10 +163,10 @@ classDiagram
     class RadiusLogProducer {
         +str bootstrap_servers
         +str topic
-        +AIOKafkaProducer _producer
-        +asyncio.Queue _queue
+        +list~AIOKafkaProducer~ _producers
+        +list~asyncio.Queue~ _worker_queues
         +PacketReader _packet_reader
-        +start()
+        +start(producer_count)
         +stop()
         +publish_csv(file_path)
         +publish_packets(port, stop_event)
@@ -179,8 +176,6 @@ classDiagram
         +bytes secret
         +dict stats
         +decode_radius(packet)
-        +build_accounting_response(envelope)
-        +send_accounting_response(envelope)
         +listen_radius_packets(port)
     }
 
@@ -202,7 +197,7 @@ classDiagram
 | Thư mục / File | Vai Trò & Chức Năng | Cách Thức Chạy |
 |---|---|---|
 | [`run_pipeline.py`](run_pipeline.py) | **Orchestrator chính**: Khởi tạo DatabasePool dùng chung, start HTTP metrics server, và chạy song song $N$ worker instances cho cả 3 Consumer Groups. | `python -m pipeline.run_pipeline [--duration N]` |
-| [`ingestion/`](ingestion/) | **Stage 1 (Ingestion)**: Tiếp nhận dữ liệu CSV hoặc gói tin UDP RADIUS, giải mã binary RFC 2866, đẩy vào Kafka topic `radius.accounting.raw` kèm cơ chế backpressure và deduplication ACK. | Chạy độc lập: `python -m pipeline.ingestion.producer --udp --port 1813` |
+| [`ingestion/`](ingestion/) | **Stage 1 (Ingestion)**: Nhận passive mirror UDP/1813 hoặc CSV, giải mã RFC 2866 và ghi Kafka `radius.accounting.raw` bằng bounded queues/micro-batches. ACK/response/replay thuộc capture server ngoài repo. | Chạy độc lập: `python -m pipeline.ingestion.producer --udp --port 1813` |
 | [`modules/shared/`](modules/shared/) | **Hạ tầng dùng chung**: `BaseKafkaConsumer`, `DatabasePool` (quản lý connection pool + transaction), `ModuleMetrics` (Prometheus exporter), `redis_client`, `events` normalization. | Được import bởi 3 modules con. |
 | [`modules/ip_msisdn/`](modules/ip_msisdn/) | **Module 1 (IP↔MSISDN)**: Quản lý ánh xạ IP nguồn với MSISDN theo phiên mạng, chạy Lua Scripts trên Redis và lưu session state vào Postgres. | Task con của `run_pipeline.py`, group `cg-ip-msisdn`. |
 | [`modules/device_swap/`](modules/device_swap/) | **Module 2 (Device Swap)**: Theo dõi IMEI của từng MSISDN, phát hiện đổi máy, ghi nhận lịch sử và tạo Outbox event. | Task con của `run_pipeline.py`, group `cg-device-swap`. |
@@ -215,17 +210,19 @@ classDiagram
 
 1. **Khởi tạo hạ tầng & Topics**:
    - `run_pipeline.py` sử dụng `AIOKafkaAdminClient` tự động tạo topic `radius.accounting.raw` và `radius.accounting.raw.dlq` với số partition cấu hình (`KAFKA_TOPIC_PARTITIONS=16`).
-   - Mở cổng Prometheus Metrics (`METRICS_PORT=9200`).
-2. **Khởi tạo Shared Database Connection Pool**:
-   - Tạo **1 đối tượng `DatabasePool` duy nhất** (pool size `min=6, max=32`) và truyền vào tất cả các consumer instances trong process, tránh lãng phí connection socket tới PostgreSQL.
-3. **Mô hình Multi-Member Consumer Group**:
-   - Cấu hình `CONSUMERS_PER_GROUP` (mặc định = 4). Hệ thống tạo $3 \times \text{CONSUMERS\_PER\_GROUP} = 12$ consumer tasks chạy song song trong cùng Event Loop.
-   - Mỗi consumer instance là một Kafka Member độc lập, Kafka Broker tự động rebalance phân chia 16 partitions cho các members.
-4. **Xử lý Partition-Sharding trong Consumer**:
-   - Trong mỗi lần `getmany()`, các partitions nhận được gom thành `PROCESSING_PARTITION_CONCURRENCY` shards (mặc định = 3) chạy song song (`asyncio.gather`), trong khi thứ tự offset trong từng partition luôn được bảo toàn nghiêm ngặt.
-5. **Giám sát Supervisor & Graceful Shutdown**:
-   - Lắng nghe tín hiệu `SIGINT`/`SIGTERM` tập trung tại Orchestrator.
-   - Nếu bất kỳ consumer nào gặp sự cố chưa được bắt (Unhandled Exception), Supervisor sẽ kích hoạt fail-fast dừng an toàn toàn bộ pipeline, đóng Database Pool và flush metrics.
+   - Mở cổng Prometheus Metrics (`METRICS_PORT`, ví dụ 9200, 9202, 9203).
+2. **Tách Tiến Trình & Lọc Consumer Group (`PIPELINE_GROUPS`)**:
+   - Để triệt tiêu nút thắt GIL của Python khi chạy cả 3 groups chung 1 event loop, hệ thống tách thành 3 worker containers/services (`pipeline-ip-msisdn`, `pipeline-device-swap`, `pipeline-sim-swap`).
+   - Biến `PIPELINE_GROUPS` (`ip-msisdn`, `device-swap`, `sim-swap`) quyết định group được kích hoạt trong mỗi container.
+3. **Phân Chia Connection Pool Bất Đồng Bộ (`DatabasePool`)**:
+   - Mỗi worker tiến trình sở hữu connection pool riêng biệt với dung lượng tối ưu (IP-MSISDN: max 12, Device Swap: max 8, SIM Swap: max 8) để tránh tranh chấp connection socket.
+4. **Mô hình Multi-Member Consumer Group**:
+   - Cấu hình `CONSUMERS_PER_GROUP` (mặc định = 4). Mỗi worker khởi tạo 4 member instances chạy song song. Kafka Broker tự động rebalance phân chia 16 partitions cho các members.
+5. **Xử lý Partition-Sharding trong Consumer**:
+   - Trong mỗi lần `getmany()`, các partitions nhận được gom thành `PROCESSING_PARTITION_CONCURRENCY` shards (mặc định = 2) chạy song song (`asyncio.gather`), giữ trật tự offset trong từng partition.
+6. **Giám sát Supervisor & Graceful Shutdown**:
+   - Lắng nghe tín hiệu `SIGINT`/`SIGTERM` tập trung.
+   - Khi có sự cố unhandled, Supervisor sẽ kích hoạt fail-fast dừng an toàn, đóng Database Pool và flush metrics.
 
 ---
 
@@ -234,20 +231,22 @@ classDiagram
 Hệ thống ghi log định kỳ mỗi `THROUGHPUT_LOG_INTERVAL_SECONDS` (10s) theo định dạng phân khối trực quan bằng ký tự `|`:
 
 ```
-[PROCESSING][<group-id>][member=<m>/<n>][OK|ERROR] window=10.0s | Throughput: recv=1876.2/s success=1876.2/s (pg=939.1/s, rds=1874.6/s) | Latency: batch_avg=37.8ms stage(state=37.2ms, pg=0.0ms, rds=0.0ms) e2e_lag=42.1ms(max=65.0ms) | Swaps/Events: <events_total>=0(+0) ignored=85944 | Quality/Loss: kafka_lag=0 data_loss=0(+0) (err=0, dlq=0) | Totals: recv=85944, ok=85944, pg=43046, rds=85887, batches=886
+[PROCESSING][<group-id>][member=<m>/<n>][OK|ERROR] window=10.0s | Throughput: recv=1876.2/s success=1876.2/s (pg=939.1/s, rds=1874.6/s) | Latency: batch_avg=37.8ms stage(state=37.2ms[mget=2.1ms, pg_fb=0.0ms, hit=100.0%], pg=12.4ms, rds=3.1ms, pool_acq=0.2ms) e2e_lag=42.1ms(max=65.0ms) | Swaps/Events: <events_total>=0(+0) ignored=85944 | Quality/Loss: kafka_lag=0 data_loss=0(+0) (err=0, dlq=0) | Totals: recv=85944, ok=85944, pg=43046, rds=85887, batches=886
 ```
 
 ### Các trường đo lường chính:
 - **`Throughput`**: Tốc độ nhận message (`recv`), tốc độ xử lý thành công (`success`), tốc độ ghi thực tế xuống PostgreSQL (`pg`) và Redis (`rds`).
 - **`Latency`**: 
   - `batch_avg`: Thời gian xử lý trung bình 1 batch trong consumer (ms).
-  - `stage(state, pg, rds)`: Phân rã độ trễ chi tiết từng chặng nội bộ (đọc cache state, ghi PostgreSQL, cập nhật Redis).
-  - `e2e_lag(max)`: **Độ trễ bản tin toàn trình (End-to-End Packet Processing Lag)** — đo chính xác thời gian từ lúc gói tin UDP đi vào Ingestion (`ingest_timestamp`) đến khi hoàn tất ghi DB/Redis.
-- **`Swaps/Events`**: Số lượng sự kiện nghiệp vụ phát hiện mới trong cửa sổ đo (`+delta`) và tổng tích lũy (`sim_swaps_total`, `device_swaps_total`, `mapping_events_total`), cùng số bản ghi `ignored` (không đổi SIM/máy).
-- **`Quality/Loss`**:
-  - `kafka_lag`: Số bản ghi còn tồn đọng so với High Watermark của partition.
-  - `data_loss`: **Tổng số lượng bản ghi bị thất thoát/lỗi** (`data_loss = errors + dlq`).
-- **`Totals`**: Tổng số lượng bản ghi lũy kế từ lúc tiến trình khởi động.
+  - `stage(...)`: Phân rã độ trễ chi tiết từng chặng nội bộ:
+    - `state`: Thời gian nạp state (bao gồm `mget`: Redis MGET latency, `pg_fb`: Postgres fallback query latency, `hit`: Cache hit ratio %).
+    - `pg`: Thời gian ghi batch xuống PostgreSQL.
+    - `rds`: Thời gian cập nhật cache Redis.
+    - `pool_acq`: Thời gian chờ lấy connection từ `DatabasePool` (`db_pool_acquire_ms`).
+  - `e2e_lag(max)`: **Độ trễ bản tin toàn trình (End-to-End Packet Processing Lag)** — đo chính xác thời gian từ lúc gói tin đi vào Ingestion đến khi hoàn tất ghi DB/Redis.
+- **`Swaps/Events`**: Số lượng sự kiện phát hiện mới trong cửa sổ đo (`+delta`) và tổng tích lũy.
+- **`Quality/Loss`**: `kafka_lag` và `data_loss` (`err`, `dlq`).
+- **`Totals`**: Tổng số lượng bản ghi tích lũy.
 
 > 📖 **Báo cáo Kỹ thuật Chuyên sâu**: Xem chi tiết toàn bộ các giải pháp kỹ thuật và thuật toán triển khai trong từng file tại [`docs/BAO_CAO_KY_THUAT_PIPELINE.md`](../docs/BAO_CAO_KY_THUAT_PIPELINE.md).
 

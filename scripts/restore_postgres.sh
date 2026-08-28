@@ -29,12 +29,12 @@ if [[ ! $REPLY =~ ^[Yy]$ ]]; then
 fi
 
 echo "[INFO] Step 1: Stopping active pipeline, dispatcher, and API services to prevent DB locks..."
-docker compose stop pipeline fastapi radius-ingestion 2>/dev/null || true
+docker compose stop pipeline-ip-msisdn pipeline-device-swap pipeline-sim-swap notification-dispatcher fastapi radius-ingestion 2>/dev/null || true
 
 echo "[INFO] Step 2: Restoring PostgreSQL database from ${BACKUP_FILE}..."
 gunzip -c "${BACKUP_FILE}" | docker exec -i "${CONTAINER_NAME}" psql -U "${DB_USER}" -d postgres
 
 echo "[INFO] Step 3: Restarting application services..."
-docker compose start pipeline fastapi radius-ingestion 2>/dev/null || true
+docker compose start pipeline-ip-msisdn pipeline-device-swap pipeline-sim-swap notification-dispatcher fastapi radius-ingestion 2>/dev/null || true
 
 echo "[INFO] Database restore operation completed successfully!"

@@ -15,15 +15,18 @@ _BATCH_LATENCY = None
 _STAGE_RECORDS = None
 _STAGE_LATENCY = None
 _KAFKA_LAG = None
-
-
 _E2E_LATENCY = None
+_REDIS_MGET_LATENCY = None
+_POSTGRES_FALLBACK_LATENCY = None
+_CACHE_HIT_RATIO = None
+_DB_POOL_ACQUIRE_LATENCY = None
 
 
 def _init_prometheus():
     """Initialize Prometheus metrics if prometheus_client is available."""
     global _prom_initialized, _BATCH_PROCESSED, _EVENTS_DETECTED, _BATCH_ERRORS
     global _BATCH_LATENCY, _STAGE_RECORDS, _STAGE_LATENCY, _KAFKA_LAG, _E2E_LATENCY
+    global _REDIS_MGET_LATENCY, _POSTGRES_FALLBACK_LATENCY, _CACHE_HIT_RATIO, _DB_POOL_ACQUIRE_LATENCY
     if _prom_initialized:
         return
     try:
@@ -68,6 +71,26 @@ def _init_prometheus():
             "Độ trễ từ khi gói tin vào Ingestion đến khi hoàn tất ghi DB/Redis",
             ["group_id"],
         )
+        _REDIS_MGET_LATENCY = Histogram(
+            "pipeline_redis_mget_latency_seconds",
+            "Thời gian thực thi MGET Redis state",
+            ["group_id"],
+        )
+        _POSTGRES_FALLBACK_LATENCY = Histogram(
+            "pipeline_postgres_fallback_latency_seconds",
+            "Thời gian truy vấn fallback PostgreSQL state",
+            ["group_id"],
+        )
+        _CACHE_HIT_RATIO = Gauge(
+            "pipeline_state_cache_hit_ratio",
+            "Tỷ lệ cache hit Redis state lookup",
+            ["group_id"],
+        )
+        _DB_POOL_ACQUIRE_LATENCY = Histogram(
+            "pipeline_db_pool_acquire_latency_seconds",
+            "Thời gian chờ lấy connection từ DatabasePool",
+            ["group_id"],
+        )
         _prom_initialized = True
     except ImportError:
         logger.debug("prometheus_client not installed — Prometheus metrics disabled")
@@ -90,6 +113,8 @@ class ModuleMetrics:
             "batches": 0,
             "postgres_records": 0,
             "redis_records": 0,
+            "cache_hits": 0,
+            "cache_lookups": 0,
         }
         self.processing_seconds = 0.0
         self.stage_seconds: Dict[str, float] = {}
@@ -98,6 +123,7 @@ class ModuleMetrics:
         self.e2e_lag_max_ms = 0.0
         self.e2e_lag_count = 0
         self.kafka_lag = 0
+        self.latest_cache_hit_ratio = 1.0
         # F-08: Initialize Prometheus counters
         _init_prometheus()
         if _STAGE_RECORDS is not None:
@@ -129,6 +155,30 @@ class ModuleMetrics:
         self.stage_calls[stage] = self.stage_calls.get(stage, 0) + 1
         if _STAGE_LATENCY is not None:
             _STAGE_LATENCY.labels(group_id=self.name, stage=stage).observe(seconds)
+
+    def observe_redis_mget(self, seconds: float) -> None:
+        self.observe_stage("redis_mget", seconds)
+        if _REDIS_MGET_LATENCY is not None:
+            _REDIS_MGET_LATENCY.labels(group_id=self.name).observe(seconds)
+
+    def observe_postgres_fallback(self, seconds: float) -> None:
+        self.observe_stage("postgres_fallback", seconds)
+        if _POSTGRES_FALLBACK_LATENCY is not None:
+            _POSTGRES_FALLBACK_LATENCY.labels(group_id=self.name).observe(seconds)
+
+    def observe_db_pool_acquire(self, seconds: float) -> None:
+        self.observe_stage("db_pool_acquire", seconds)
+        if _DB_POOL_ACQUIRE_LATENCY is not None:
+            _DB_POOL_ACQUIRE_LATENCY.labels(group_id=self.name).observe(seconds)
+
+    def set_cache_hit_ratio(self, hits: int, total: int) -> None:
+        if total > 0:
+            ratio = hits / total
+            self.latest_cache_hit_ratio = ratio
+            self.increment("cache_hits", hits)
+            self.increment("cache_lookups", total)
+            if _CACHE_HIT_RATIO is not None:
+                _CACHE_HIT_RATIO.labels(group_id=self.name).set(ratio)
 
     def observe_e2e_lag(self, lags_ms: list[float]) -> None:
         """
@@ -220,6 +270,10 @@ class ModuleMetrics:
             e2e_max_ms = self.e2e_lag_max_ms
             self.e2e_lag_max_ms = 0.0  # Reset max for next window
 
+            hits_delta = current["cache_hits"] - previous["cache_hits"]
+            lookups_delta = current["cache_lookups"] - previous["cache_lookups"]
+            hit_ratio_pct = (hits_delta / lookups_delta * 100.0) if lookups_delta else (self.latest_cache_hit_ratio * 100.0)
+
             status = "ERROR" if errors_delta or dlq_delta else "OK"
             level = logging.ERROR if status == "ERROR" else logging.INFO
             event_name = self._event_name()
@@ -227,7 +281,7 @@ class ModuleMetrics:
                 level,
                 "[PROCESSING][%s][member=%s][%s] window=%.1fs | "
                 "Throughput: recv=%.1f/s success=%.1f/s (pg=%.1f/s, rds=%.1f/s) | "
-                "Latency: batch_avg=%.1fms stage(state=%.1fms, pg=%.1fms, rds=%.1fms) e2e_lag=%.1fms(max=%.1fms) | "
+                "Latency: batch_avg=%.1fms stage(state=%.1fms[mget=%.1fms, pg_fb=%.1fms, hit=%.1f%%], pg=%.1fms, rds=%.1fms, pool_acq=%.1fms) e2e_lag=%.1fms(max=%.1fms) | "
                 "Swaps/Events: %s=%d(+%d) ignored=%d | "
                 "Quality/Loss: kafka_lag=%d data_loss=%d(+%d) (err=%d, dlq=%d) | "
                 "Totals: recv=%d, ok=%d, pg=%d, rds=%d, batches=%d",
@@ -237,8 +291,12 @@ class ModuleMetrics:
                 (current["redis_records"] - previous["redis_records"]) / elapsed,
                 (seconds_delta * 1000 / batch_delta) if batch_delta else 0.0,
                 self._stage_average_ms("state", previous_stage_seconds, previous_stage_calls),
+                self._stage_average_ms("redis_mget", previous_stage_seconds, previous_stage_calls),
+                self._stage_average_ms("postgres_fallback", previous_stage_seconds, previous_stage_calls),
+                hit_ratio_pct,
                 self._stage_average_ms("postgres", previous_stage_seconds, previous_stage_calls),
                 self._stage_average_ms("redis", previous_stage_seconds, previous_stage_calls),
+                self._stage_average_ms("db_pool_acquire", previous_stage_seconds, previous_stage_calls),
                 e2e_avg_ms, e2e_max_ms,
                 event_name, current["events_detected"], events_delta, current["ignored"],
                 self.kafka_lag, loss_total, loss_delta, current["errors"], current["dlq"],

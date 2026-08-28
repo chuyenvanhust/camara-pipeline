@@ -21,10 +21,10 @@ scrape_configs:
   - job_name: 'pipeline'
     metrics_path: '/metrics'
     static_configs:
-      - targets: ['pipeline:9200']
+      - targets: ['pipeline-ip-msisdn:9200', 'pipeline-device-swap:9202', 'pipeline-sim-swap:9203']
 
   # 3. RADIUS Ingestion Receiver — Prometheus metrics server
   - job_name: 'radius-ingestion'
     metrics_path: '/metrics'
     static_configs:
-      - targets: ['radius-ingestion:9201']
+      - targets: ['radius-ingestion:9201', 'host.docker.internal:9201']

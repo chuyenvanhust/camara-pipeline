@@ -18,6 +18,7 @@ KAFKA_REPL="${KAFKA_REPLICATION_FACTOR:-3}"
 KAFKA_CONSUMER_GROUPS="${KAFKA_CONSUMER_GROUPS:-cg-ip-msisdn cg-device-swap cg-sim-swap}"
 POSTGRES_USER="${POSTGRES_LOCAL_USER:-postgres}"
 POSTGRES_DB="${POSTGRES_LOCAL_DB:-camara_db}"
+REDIS_PASSWORD="${REDIS_PASSWORD:-camara_redis_dev_secret}"
 
 echo "=================================================="
 echo ">>> CẢNH BÁO: Sắp reset toàn bộ state pipeline"
@@ -40,7 +41,7 @@ trap 'rm -rf -- "$RESET_TMP_DIR"' EXIT
 # pipeline chạy, Kafka auto-create/client ensure-topic có thể tạo lại topic ngay
 # giữa lúc script đang chờ xóa và gây vòng lặp "Topic already exists".
 echo ">>> Dừng producer/consumer để khóa luồng ghi Kafka..."
-docker compose stop pipeline radius-ingestion notification-dispatcher >/dev/null
+docker compose stop pipeline-ip-msisdn pipeline-device-swap pipeline-sim-swap radius-ingestion notification-dispatcher >/dev/null 2>&1 || true
 echo "[OK] Producer/consumer đã dừng"
 
 if ! docker exec camara-kafka kafka-broker-api-versions \
@@ -120,8 +121,23 @@ echo "[OK] Postgres đã được truncate"
 
 # 4. Flush Redis
 echo ">>> Reset Redis..."
-docker exec camara-redis redis-cli FLUSHALL > /dev/null
-echo "[OK] Redis đã được flush"
+REDIS_FLUSH_RESULT="$(
+    docker exec -e REDISCLI_AUTH="$REDIS_PASSWORD" camara-redis \
+        redis-cli --no-auth-warning --raw FLUSHALL
+)"
+if [ "$REDIS_FLUSH_RESULT" != "OK" ]; then
+    echo "[ERROR] Redis FLUSHALL thất bại: $REDIS_FLUSH_RESULT" >&2
+    exit 1
+fi
+REDIS_DBSIZE="$(
+    docker exec -e REDISCLI_AUTH="$REDIS_PASSWORD" camara-redis \
+        redis-cli --no-auth-warning --raw DBSIZE
+)"
+if [ "$REDIS_DBSIZE" != "0" ]; then
+    echo "[ERROR] Redis vẫn còn $REDIS_DBSIZE key sau FLUSHALL" >&2
+    exit 1
+fi
+echo "[OK] Redis đã được flush và xác nhận dbsize=0"
 
 echo "=================================================="
 echo ">>> Reset hoàn tất. Producer/consumer đang dừng."

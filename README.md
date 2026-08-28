@@ -2,7 +2,7 @@
 
 > **Production-grade Data Pipeline** phục vụ các chuẩn **CAMARA Network API** (SIM Swap · Device Swap · Number Verification) từ luồng dữ liệu **GGSN/PGW RADIUS Accounting** (RFC 2866 + 3GPP TS 29.061 VSA).
 
-Dự án mô phỏng và xử lý luồng dữ liệu mạng viễn thông di động: các gói tin RADIUS Accounting (hoặc file CSV log) được đưa vào hệ thống Ingestion qua UDP/1813, đẩy vào Apache Kafka theo cơ chế phân vùng theo thuê bao (`key=msisdn`), được xử lý song song bởi 3 Consumer Modules độc lập để phát hiện các sự kiện đổi SIM (IMSI), đổi thiết bị (IMEI), ánh xạ IP↔MSISDN, ghi nhận trạng thái vào PostgreSQL/Redis theo các giao dịch nguyên tử (atomic transactions), và phát thông báo webhook (HTTP Callback) tới các đối tác Open Gateway thông qua Transactional Outbox Pattern.
+Dự án xử lý bản mirror RADIUS Accounting do một capture server bền vững bên ngoài chuyển tới UDP/1813 (hoặc dữ liệu CSV nạp trực tiếp). Ingestion ghi dữ liệu vào Apache Kafka theo `key=msisdn`; ba consumer module độc lập xử lý đổi SIM (IMSI), đổi thiết bị (IMEI) và ánh xạ IP↔MSISDN. Repo không sở hữu RADIUS protocol session: không trả `Accounting-Response`, không chờ ACK và không retry datagram.
 
 ---
 
@@ -12,7 +12,7 @@ Dự án mô phỏng và xử lý luồng dữ liệu mạng viễn thông di đ
 flowchart TD
     subgraph SOURCELAYER["Nguồn Dữ Liệu"]
         direction TB
-        GGSN["Thiết Bị Mạng GGSN / PGW / NAS<br/>(RADIUS UDP / RFC 2866)"]
+        GGSN["External RADIUS Capture Server<br/>(Durable Mirror Source)"]
         CSV["File Log Batch<br/>(CSV Radius Accounting)"]
     end
 
@@ -21,35 +21,31 @@ flowchart TD
         SENDER["radius_udp_sender.py<br/>(Traffic Generator / Test Tool)"]
         PKTREADER["PacketReader<br/>(UDP/1813 Listener, Binary Decoder)"]
         PRODUCER["RadiusLogProducer<br/>(Async Buffer + Batch Ingestion)"]
-        ACKCACHE[("ACK Deduplication Cache<br/>LRU RAM")]
     end
 
     subgraph KAFKALAYER["Message Broker: Apache Kafka"]
         direction TB
-        TOPIC["Topic: radius.accounting.raw<br/>(12 Partitions, Key = MSISDN)"]
+        TOPIC["Topic: radius.accounting.raw<br/>(16 Partitions, Key = MSISDN)"]
         DLQ["Topic: radius.accounting.raw.dlq<br/>(Dead Letter Queue)"]
     end
 
-    subgraph CONSUMERLAYER["Stage 2: Processing Pipeline (run_pipeline.py)"]
+    subgraph CONSUMERLAYER["Stage 2: Isolated Processing Services (3 Workers)"]
         direction TB
-        subgraph CG1["Consumer Group: cg-ip-msisdn"]
-            IPM1["Member 1"]
-            IPM2["Member 2"]
+        subgraph SVC1["Service: pipeline-ip-msisdn (cg-ip-msisdn)"]
+            IPM1["Member 1..4 (GIL Loop 1, Pool max 12)"]
         end
-        subgraph CG2["Consumer Group: cg-device-swap"]
-            DEV1["Member 1"]
-            DEV2["Member 2"]
+        subgraph SVC2["Service: pipeline-device-swap (cg-device-swap)"]
+            DEV1["Member 1..4 (GIL Loop 2, Pool max 8)"]
         end
-        subgraph CG3["Consumer Group: cg-sim-swap"]
-            SIM1["Member 1"]
-            SIM2["Member 2"]
+        subgraph SVC3["Service: pipeline-sim-swap (cg-sim-swap)"]
+            SIM1["Member 1..4 (GIL Loop 3, Pool max 8)"]
         end
     end
 
     subgraph STORAGELAYER["Storage & State Layer"]
         direction TB
         REDIS[("Redis / Redis Sentinel<br/>- ip-ggsn:* / ggsn-ips:*<br/>- device:* / sim:* cache")]
-        POSTGRES[("PostgreSQL Database<br/>- msisdn_device / msisdn_sim<br/>- device_swap_history / sim_swap_history<br/>- radius_session_state<br/>- audit_log<br/>- notification_log (Outbox)")]
+        POSTGRES[("PostgreSQL Database (4 CPUs)<br/>- msisdn_device / msisdn_sim<br/>- device_swap_history / sim_swap_history<br/>- radius_session_state<br/>- audit_log<br/>- notification_log (Outbox)")]
     end
 
     subgraph DISPATCHERLAYER["Stage 3: Event Dispatcher"]
@@ -70,21 +66,19 @@ flowchart TD
     SENDER -->|UDP/1813| PKTREADER
 
     PKTREADER --> PRODUCER
-    PRODUCER <--> ACKCACHE
     PRODUCER -->|Produce acks=all| TOPIC
     PRODUCER -.->|Malformed Msg| DLQ
-    PRODUCER -.->|RADIUS Accounting-Response| GGSN
 
-    TOPIC --> CG1
-    TOPIC --> CG2
-    TOPIC --> CG3
+    TOPIC --> SVC1
+    TOPIC --> SVC2
+    TOPIC --> SVC3
 
-    CG1 -->|Atomic Lua Scripts| REDIS
-    CG1 -->|Session Batch Upsert| POSTGRES
-    CG2 -->|Batch MGET/MSET| REDIS
-    CG2 -->|Atomic Batch Tx| POSTGRES
-    CG3 -->|Batch MGET/MSET| REDIS
-    CG3 -->|Atomic Batch Tx| POSTGRES
+    SVC1 -->|Atomic EVALSHA Lua| REDIS
+    SVC1 -->|Session Batch Upsert| POSTGRES
+    SVC2 -->|Batch MGET/MSET| REDIS
+    SVC2 -->|Atomic Batch Tx| POSTGRES
+    SVC3 -->|Batch MGET/MSET| REDIS
+    SVC3 -->|Atomic Batch Tx| POSTGRES
 
     POSTGRES -.->|FOR UPDATE SKIP LOCKED| DISPATCHER
     DISPATCHER -->|HTTP POST Callback| OPENGATEWAY
@@ -100,7 +94,7 @@ flowchart TD
 ```mermaid
 sequenceDiagram
     autonumber
-    participant NAS as GGSN / NAS / Sender
+    participant NAS as Capture Server / Test Sender
     participant ING as RadiusLogProducer
     participant KFK as Kafka Broker
     participant CSM as Consumer Modules
@@ -109,18 +103,11 @@ sequenceDiagram
     participant DSP as NotificationDispatcher
     participant SUB as Open Gateway Subscriber
 
-    Note over NAS,ING: Giai đoạn Ingestion & Xác thực
+    Note over NAS,ING: Passive mirror ingestion
     NAS->>ING: UDP Accounting-Request (Code=4, Authenticator, AVPs)
-    ING->>ING: Decode binary, tính MD5 HMAC, kiểm tra Deduplication Cache
-    alt Đã từng xử lý (Duplicate)
-        ING-->>NAS: Gửi lại Accounting-Response (Code=5) ngay lập tức
-    else Tin mới (New Event)
-        ING->>ING: Đưa vào Bounded RAM Queue
-        ING->>KFK: Batch Produce (key=MSISDN, acks=all)
-        KFK-->>ING: Kafka ACK
-        ING->>ING: Lưu event_id vào ACK Cache
-        ING-->>NAS: Trả Accounting-Response (Code=5)
-    end
+    ING->>ING: Decode, validate và đưa vào bounded RAM queue
+    ING->>KFK: Batch Produce (key=MSISDN, acks=all)
+    KFK-->>ING: Xác nhận ghi nội bộ Kafka
 
     Note over KFK,PGS: Giai đoạn Xử lý sự kiện (Parallel Consumers)
     KFK->>CSM: Poll batch records theo từng Partition
@@ -179,10 +166,10 @@ sequenceDiagram
    - Consumer **không bao giờ gọi HTTP** ra ngoài. Mọi webhook được ghi vào bảng `notification_log` với trạng thái `PENDING`.
    - Tiến trình `NotificationDispatcher` độc lập poll và gửi HTTP callback. Sự cố mạng hoặc đối tác phản hồi chậm không bao giờ làm nghẽn throughput của pipeline xử lý chính.
 
-4. **Kiến trúc Ingestion chịu lỗi & Backpressure**:
-   - Giao thức UDP RADIUS chỉ trả `Accounting-Response` sau khi Kafka đã xác nhận `acks=all`.
-   - Nếu Kafka bị chậm hoặc Queue đầy, Ingestion chủ động giữ ACK để thiết bị NAS kích hoạt cơ chế retry tự nhiên của giao thức UDP.
-   - Cache `_radius_ack_cache` trong RAM ngăn chặn việc đưa các gói tin retry đã xử lý vào Kafka lần thứ hai.
+4. **Passive Mirror Ingestion & Bounded Buffer**:
+   - Capture server ngoài repo chịu trách nhiệm bền vững và RADIUS ACK/response; ingestion chỉ nhận mirror một chiều.
+   - Queue RAM có giới hạn hấp thụ burst ngắn. Queue đầy hoặc Kafka publish lỗi được tính là `data_loss` và phải cảnh báo để replay từ capture server.
+   - Kafka `acks=all` và idempotent producer chỉ bảo vệ chặng nội bộ ingestion → Kafka.
 
 5. **Manual Offset Commit & Dead Letter Queue (DLQ)**:
    - Tắt hoàn toàn `enable_auto_commit`. Offset chỉ được commit sau khi batch đã ghi thành công vào DB.
@@ -206,7 +193,7 @@ sequenceDiagram
 ├── pipeline/                        # Toàn bộ Core Data Pipeline
 │   ├── ingestion/                   # Stage 1: UDP Listener & CSV Producer
 │   │   ├── packet_reader.py         # Binary RADIUS RFC 2866 & 3GPP VSA parser
-│   │   ├── producer.py              # Async Kafka Producer & ACK Manager
+│   │   ├── producer.py              # Passive UDP/CSV → Kafka ingestion
 │   │   ├── csv_reader.py            # Local CSV Reader generator
 │   │   └── radius_udp_sender.py     # UDP Traffic Generator / Load test simulator
 │   ├── modules/                     # Stage 2: Parallel Consumer Modules
@@ -268,9 +255,12 @@ uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
 # Cách A: Đọc trực tiếp từ file CSV đẩy vào Kafka
 python -m pipeline.ingestion.producer --file data/radius_sample.csv
 
-# Cách B: Giả lập thiết bị mạng gửi gói tin UDP thật qua cổng 1813
-python -m pipeline.ingestion.radius_udp_sender --csv data/radius_sample.csv --rate 2000 --require-ack
+# Cách B: Giả lập capture server mirror gói tin UDP qua cổng 1813
+python -m pipeline.ingestion.radius_udp_sender --csv data/radius_sample.csv --rate 15000
 ```
+
+Sender là công cụ fire-and-forget có pacing; `--rate` là trần lưu lượng UDP mới.
+Nó không nhận response, không retry và không dùng để chứng minh độ bền dữ liệu.
 
 ---
 
@@ -281,20 +271,25 @@ python -m pipeline.ingestion.radius_udp_sender --csv data/radius_sample.csv --ra
 | `KAFKA_BOOTSTRAP_SERVERS` | `camara-kafka:9092,camara-kafka-2:9092,camara-kafka-3:9092` | Danh sách địa chỉ Kafka Cluster Brokers |
 | `KAFKA_TOPIC_RAW` | `radius.accounting.raw` | Tên topic Kafka chứa log thô |
 | `KAFKA_TOPIC_PARTITIONS` | `16` | Số partition của topic (tối ưu xử lý song song 15k+ rec/s) |
+| `PIPELINE_GROUPS` | `""` (All) | Chọn consumer group cho tiến trình (`ip-msisdn`, `device-swap`, `sim-swap`) |
 | `CONSUMERS_PER_GROUP` | `4` | Số member/worker chạy song song trong mỗi Consumer Group |
-| `PROCESSING_PARTITION_CONCURRENCY` | `3` | Số shard partition gom xử lý song song trong mỗi consumer |
+| `PROCESSING_PARTITION_CONCURRENCY` | `2` | Số shard partition gom xử lý song song trong mỗi consumer |
 | `BATCH_MAX_RECORDS` | `4000` | Số lượng bản ghi tối đa lấy trong một lần poll Kafka |
-| `BATCH_TIMEOUT_MS` | `20` | Thời gian tối đa chờ gom đủ batch (ms) |
+| `BATCH_TIMEOUT_MS` | `10` | Thời gian tối đa chờ gom đủ batch (ms) |
 | `DATABASE_URL` | `postgresql://postgres:camara@camara-postgres:5432/camara_db` | Connection string PostgreSQL (`synchronous_commit=on` đảm bảo 100% ACID) |
-| `DB_POOL_MIN` / `DB_POOL_MAX` | `6` / `24` | Kích thước Connection Pool `asyncpg` dùng chung (PostgreSQL `max_connections=200`) |
+| `IP_MSISDN_DB_POOL_MAX` / `DEVICE_SWAP...` / `SIM_SWAP...` | `12` / `8` / `8` | Connection Pool `asyncpg` tối đa phân chia theo từng service (PostgreSQL `max_connections=200`) |
+| `POSTGRES_CPUS` | `4` | Số core CPU cấp cho PostgreSQL container |
 | `REDIS_HOST` / `REDIS_PORT` | `camara-redis` / `6379` | Thông tin kết nối Redis Standalone / Cluster |
 | `RADIUS_SHARED_SECRET` | `camara-radius-dev-secret` | Secret key tính Authenticator RFC 2866 |
 | `RADIUS_UDP_RECEIVE_BUFFER_BYTES` | `33554432` (32MB) | Kích thước socket buffer nhận UDP |
-| `RADIUS_UDP_QUEUE_MAX_RECORDS` | `100000` | Dung lượng hàng đợi RAM đệm trước Kafka (khuyên dùng `300000` cho Prod) |
-| `RADIUS_UDP_KAFKA_BATCH_RECORDS` | `250` | Kích thước batch Kafka của UDP Ingestion |
+| `RADIUS_UDP_QUEUE_MAX_RECORDS` | `300000` | Burst buffer RAM trước Kafka; không thay thế durable storage |
+| `RADIUS_UDP_KAFKA_BATCH_RECORDS` | `500` | Kích thước tối đa của micro-batch UDP Ingestion |
 | `RADIUS_UDP_KAFKA_BATCH_WAIT_MS` | `5` | Thời gian gom batch Kafka của Ingestion (ms) |
-| `RADIUS_UDP_KAFKA_MAX_INFLIGHT_BATCHES_PER_WORKER` | `32` | Số lượng batch Kafka produce song song cho mỗi worker |
-| `RADIUS_UDP_KAFKA_TOTAL_MAX_INFLIGHT_BATCHES` | `64` | Giới hạn tổng số batch Kafka produce song song trên toàn bộ process |
+| `RADIUS_UDP_KAFKA_MAX_INFLIGHT_BATCHES_PER_WORKER` | `4` | Số lượng batch Kafka đang ghi song song cho mỗi worker |
+| `RADIUS_UDP_KAFKA_PRESSURE_INFLIGHT_BATCHES_PER_WORKER` | `6` | Trần tạm thời khi queue shard vượt ngưỡng pressure |
+| `RADIUS_UDP_KAFKA_PRESSURE_QUEUE_RATIO` | `0.5` | Tỷ lệ queue kích hoạt concurrency tăng cường |
+| `RADIUS_UDP_KAFKA_PRODUCERS` | `4` | Số Kafka producer độc lập; worker được ánh xạ cố định để giữ thứ tự theo MSISDN |
+| `RADIUS_UDP_KAFKA_TOTAL_MAX_INFLIGHT_BATCHES` | `24` | Trần tuyệt đối batch Kafka đang ghi trên toàn process |
 | `RADIUS_UDP_PUBLISHER_WORKERS` | `4` | Số lượng worker coroutines publish song song (Key-sharded per MSISDN) |
 | `INGESTION_METRICS_PORT` | `9201` | Cổng Exporter Prometheus Ingestion (tự động thử 9201-9210 nếu bận) |
 | `DISPATCHER_BATCH_SIZE` | `50` | Số lượng notification claim mỗi vòng lặp của Dispatcher |
@@ -306,7 +301,7 @@ python -m pipeline.ingestion.radius_udp_sender --csv data/radius_sample.csv --ra
 
 ### 7.1. Giám sát Telemetry & Split Metrics
 Mỗi `THROUGHPUT_LOG_INTERVAL_SECONDS` (mặc định 10 giây), hệ thống ghi log phân khối trực quan (`|`) cho cả hai chặng:
-- **`[INGESTION]`**: Tốc độ nhận UDP (`udp_in`), tốc độ Kafka ACK (`kafka_ack`), dung lượng Queue per-worker (`queue`), chi tiết phản hồi RADIUS (`new_ack`, `dup_ack`, `withheld`), và **metrics rành mạch**: `invalid`, `dlq_published`, `publish_failed`, `queue_rejected_for_retry`.
+- **`[INGESTION]`**: `udp_in`, `kafka_persisted`, throughput `gap`, queue/backlog, batch size, persistence p50/p95/p99, queue residence p95, `worker_slot_wait_p95`, `global_wait_p95` và `data_loss` (`queue_dropped`, `publish_failed`).
 - **`[PROCESSING]`**: Log chi tiết cho từng member: tốc độ nhận/xử lý (`recv`, `success`, `pg`, `rds`), độ trễ xử lý batch (`batch_avg`), độ trễ từng chặng `stage(state, pg, rds)`, **độ trễ bản tin toàn trình `e2e_lag(max)`** (tính qua float epoch `ingest_epoch_s` siêu tốc), và **định vị lỗi `data_loss` (`err`, `dlq`)**.
 
 ### 7.2. Tính năng Bảo mật An ninh Mạng (Production Security)
@@ -332,6 +327,6 @@ Mỗi `THROUGHPUT_LOG_INTERVAL_SECONDS` (mặc định 10 giây), hệ thống g
 
 Dự án đã được tài liệu hóa đầy đủ các giải pháp kiến trúc và thuật toán nâng cao:
 - 🛠️ [**Hướng dẫn Cấu hình & Tối ưu hóa Phần cứng (Hardware Tuning Guide)**](docs/HARDWARE_TUNING_GUIDE.md): Giải thích chi tiết toàn bộ các biến môi trường trong `.env`, quy tắc sizing tài nguyên RAM/CPU, công thức tính toán độ đệm hàng đợi, connection budget PostgreSQL và bảng thông số cấu hình chuẩn cho các môi trường từ Dev/VPS đến Server Production 30k+ pkt/s.
-- 📖 [**Báo cáo Kỹ thuật Chuyên sâu các File Trọng điểm**](docs/BAO_CAO_KY_THUAT_PIPELINE.md): Mô tả chi tiết kỹ thuật giải mã nhị phân RFC 2866, MD5 Authenticator, 3GPP VSA, Kernel `SO_REUSEPORT`, Key-Sharded Publisher Queue, Global Inflight Semaphore, Multi-Socket ACK Receiver (`select.select()`), Partition Sharding, Transaction 4 bảng nguyên tử qua `UNNEST`, Fencing Versioning Tuple, Lua Scripts nguyên tử, Fast Float Epoch E2E Lag, và Transactional Outbox Pattern (`FOR UPDATE SKIP LOCKED`).
+- 📖 [**Báo cáo Kỹ thuật Chuyên sâu các File Trọng điểm**](docs/BAO_CAO_KY_THUAT_PIPELINE.md): Mô tả giải mã RFC 2866/3GPP VSA, passive mirror ingestion, `SO_REUSEPORT`, key-sharded queues, bounded Kafka inflight, partition sharding, transaction batch, fencing tuple, Lua scripts, E2E lag và Transactional Outbox.
+- 🚀 [**Kế hoạch refactor hiệu năng ingestion**](docs/INGESTION_PERFORMANCE_REFACTOR_PLAN.md): Baseline 15k/s, nguyên nhân throughput/E2E/data loss, thay đổi đã triển khai và tiêu chí benchmark nghiệm thu.
 - 📖 [**Disaster Recovery Runbook & HA Operational Guide**](docs/DISASTER_RECOVERY_RUNBOOK.md): Hướng dẫn vận hành sự cố, sao lưu Point-in-Time Recovery (PITR) và quy trình Failover Kafka/PostgreSQL.
-

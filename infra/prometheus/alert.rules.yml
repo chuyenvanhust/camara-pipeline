@@ -37,3 +37,39 @@ groups:
         annotations:
           summary: "High End-to-End Packet Processing Latency in {{ $labels.group_id }}"
           description: "95th percentile E2E packet processing lag for {{ $labels.group_id }} exceeded 1.0 second (current: {{ $value }}s)."
+
+      - alert: IngestionDataLoss
+        expr: rate(radius_ingestion_queue_dropped_total[1m]) + rate(radius_ingestion_publish_failed_total[1m]) > 0
+        for: 15s
+        labels:
+          severity: critical
+        annotations:
+          summary: "RADIUS mirror records are being lost before Kafka"
+          description: "Ingestion is dropping or failing to persist {{ $value }} records/s. Reduce mirror rate, restore capacity, then replay from the durable capture source."
+
+      - alert: IngestionThroughputDeficit
+        expr: rate(radius_ingestion_udp_received_total[2m]) - rate(radius_ingestion_kafka_persisted_total[2m]) > 500
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ingestion input exceeds Kafka persistence throughput"
+          description: "The sustained ingestion throughput deficit is {{ $value }} records/s; RAM queue and E2E lag will grow."
+
+      - alert: IngestionQueuePressure
+        expr: radius_ingestion_queue_depth_records / radius_ingestion_queue_capacity_records > 0.7
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: "RADIUS ingestion queue is above 70%"
+          description: "The bounded RAM queue is {{ $value | humanizePercentage }} full and is approaching data loss."
+
+      - alert: IngestionKafkaPersistLatency
+        expr: histogram_quantile(0.95, sum(rate(radius_ingestion_kafka_batch_persist_seconds_bucket[5m])) by (le)) > 0.2
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka persistence latency is limiting ingestion"
+          description: "Ingestion Kafka persistence p95 exceeded 200ms (current: {{ $value }}s). Check broker CPU, disk and replica health before increasing inflight limits."

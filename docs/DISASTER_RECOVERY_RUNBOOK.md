@@ -42,7 +42,7 @@ Khi xảy ra sự cố mất mát dữ liệu hoặc thảm họa hạ tầng:
 
 ```bash
 # 1. Tạm dừng các dịch vụ ghi dữ liệu (Pipeline Consumers, Ingestion & Notification Dispatcher)
-docker compose stop pipeline radius-ingestion notification-dispatcher
+docker compose stop pipeline-ip-msisdn pipeline-device-swap pipeline-sim-swap radius-ingestion notification-dispatcher
 
 # 2. Đảm bảo container PostgreSQL đang hoạt động
 docker compose up -d postgres
@@ -68,13 +68,43 @@ docker compose up -d
 ### Sự cố 2: Kafka Consumer Lag dồn ứ (Lag High Alert)
 - **Hiện tượng**: Alert `HighKafkaLag` kích hoạt trên Prometheus.
 - **Xử lý**: 
-  1. Kiểm tra tài nguyên CPU/RAM của PostgreSQL & Redis.
+  1. Kiểm tra tài nguyên CPU/RAM của PostgreSQL & Redis: `docker stats pipeline-ip-msisdn pipeline-device-swap pipeline-sim-swap`.
   2. Tăng số lượng Consumer Workers per group: `CONSUMERS_PER_GROUP=8`.
-  3. Khởi chạy thêm replica container:
+  3. Restart service có lag cao nhất (ví dụ `pipeline-ip-msisdn`):
      ```bash
-     docker compose up -d --scale pipeline=2
+     docker compose restart pipeline-ip-msisdn
+     ```
+  4. Nếu lag vẫn tăng, scale hết cả 3 worker services:
+     ```bash
+     docker compose up -d --scale pipeline-ip-msisdn=2 --scale pipeline-device-swap=2 --scale pipeline-sim-swap=2
      ```
 
 ### Sự cố 3: Đăng ký Webhook bị khóa do lỗi SSRF
 - **Hiện tượng**: Log báo `SSRF Blocked: Forbidden private/internal IP address`.
 - **Xử lý**: Yêu cầu phía đối tác cung cấp Webhook URL dùng tên miền public và giao thức HTTPS theo quy chuẩn bảo mật CAMARA.
+
+### Sự cố 4: Một worker pipeline bị crash / exit
+- **Hiện tượng**: Container `pipeline-ip-msisdn`, `pipeline-device-swap` hoặc `pipeline-sim-swap` dừng đột ngột. Kafka lag chỉ tăng cho group tương ứng.
+- **Xử lý**: Các worker khác **không bị ảnh hưởng** (process isolation). Restart dịch vụ bị lỗi:
+  ```bash
+  # Ví dụ restart dịch vụ device-swap
+  docker compose restart pipeline-device-swap
+
+  # Kiểm tra log để xác định nguyên nhân
+  docker compose logs --tail=100 pipeline-device-swap
+  ```
+- **Phòng ngừa**: Đặt `restart: unless-stopped` trong `docker-compose.yml` để Docker tự động khởi động lại.
+
+### Sự cố 5: Mất bản mirror tại ingestion
+- **Hiện tượng**: `radius_ingestion_queue_dropped_total` hoặc
+  `radius_ingestion_publish_failed_total` tăng; `udp_in` cao hơn
+  `kafka_persisted` trong khi nguồn vẫn phát.
+- **Giới hạn trách nhiệm**: Ingestion là receiver một chiều, không gửi
+  `Accounting-Response` và không yêu cầu retry. Queue RAM không phải durable log.
+- **Xử lý**:
+  1. Dừng hoặc giảm tốc độ mirror tại capture server ngoài repo.
+  2. Khắc phục Kafka/CPU/queue pressure và xác nhận hai counter không tăng thêm.
+  3. Replay khoảng thời gian bị ảnh hưởng từ durable capture source vào UDP/1813
+     hoặc qua đường CSV ingest.
+  4. Theo dõi `kafka_persisted`, consumer lag và `data_loss` cho tới khi hệ thống
+     bắt kịp.

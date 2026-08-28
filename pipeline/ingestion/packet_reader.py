@@ -7,24 +7,14 @@ import logging
 import os
 import socket
 import struct
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, AsyncIterator, Dict, Tuple
+from typing import Any, AsyncIterator, Dict
 
 logger = logging.getLogger(__name__)
 
 
 class PacketDecodeError(ValueError):
     pass
-
-
-@dataclass(frozen=True)
-class RadiusEnvelope:
-    record: Dict[str, Any]
-    address: Tuple[str, int]
-    identifier: int
-    request_authenticator: bytes
-    event_id: str
 
 
 class PacketReader:
@@ -45,23 +35,6 @@ class PacketReader:
         self.secret = secret.encode("utf-8")
         self.stats = {"datagrams": 0, "decoded": 0, "rejected": 0}
         self._socket: socket.socket | None = None
-
-    def build_accounting_response(self, envelope: RadiusEnvelope) -> bytes:
-        header = bytes([5, envelope.identifier]) + struct.pack("!H", 20)
-        authenticator = hashlib.md5(
-            header + envelope.request_authenticator + self.secret
-        ).digest()
-        return header + authenticator
-
-    async def send_accounting_response(self, envelope: RadiusEnvelope) -> None:
-        if self._socket is None:
-            raise RuntimeError("RADIUS listener socket is not available")
-        loop = asyncio.get_running_loop()
-        await loop.sock_sendto(
-            self._socket,
-            self.build_accounting_response(envelope),
-            envelope.address,
-        )
 
     @staticmethod
     def _text(value: bytes) -> str:
@@ -139,7 +112,7 @@ class PacketReader:
                 result[self.VENDOR[vendor_type]] = self._text(value[offset + 2:offset + vendor_len])
             offset += vendor_len
 
-    async def listen_radius_packets(self, port: int = DEFAULT_RADIUS_PORT) -> AsyncIterator[RadiusEnvelope]:
+    async def listen_radius_packets(self, port: int = DEFAULT_RADIUS_PORT) -> AsyncIterator[Dict[str, Any]]:
         loop = asyncio.get_running_loop()
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -178,13 +151,7 @@ class PacketReader:
                     request_authenticator = packet[4:20]
                     event_id = f"radius:{request_authenticator.hex()}"
                     decoded["radius_event_id"] = event_id
-                    yield RadiusEnvelope(
-                        record=decoded,
-                        address=(address[0], address[1]),
-                        identifier=packet[1],
-                        request_authenticator=request_authenticator,
-                        event_id=event_id,
-                    )
+                    yield decoded
                 except PacketDecodeError as exc:
                     self.stats["rejected"] += 1
                     rejected = self.stats["rejected"]
@@ -200,6 +167,6 @@ class PacketReader:
 
 if __name__ == "__main__":
     async def _main() -> None:
-        async for envelope in PacketReader().listen_radius_packets():
-            print(envelope.record)
+        async for record in PacketReader().listen_radius_packets():
+            print(record)
     asyncio.run(_main())

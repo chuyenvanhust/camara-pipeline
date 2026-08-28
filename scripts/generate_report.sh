@@ -16,13 +16,13 @@ echo ">>> Đang sinh báo cáo chất lượng dữ liệu tại: $REPORT_NAME"
 # Chạy trong container (tránh lỗi thiếu psycopg2/thư viện trên host)
 # F-PARALLEL: `docker compose exec` định vị theo SERVICE, không cần tên container
 # cố định — vẫn đúng dù pipeline đang scale >1 (tự chọn 1 replica bất kỳ).
-docker compose exec -T pipeline \
+docker compose exec -T pipeline-ip-msisdn \
     python3 /workspace/reporting/quality_report.py \
     --output "$REPORT_NAME_IN_CONTAINER"
 
 # Copy từ container ra host nếu script không tự ghi vào mount
 if ! [ -f "$REPORT_NAME" ]; then
-    CONTAINER_ID="$(docker compose ps -q pipeline | head -1)"
+    CONTAINER_ID="$(docker compose ps -q pipeline-ip-msisdn | head -1)"
     docker cp "${CONTAINER_ID}:${REPORT_NAME_IN_CONTAINER}" "$REPORT_NAME" 2>/dev/null
 fi
 

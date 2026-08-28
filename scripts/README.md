@@ -16,15 +16,15 @@ phải có `.env` — thiếu thì dùng default đã set sẵn trong `docker-co
 bash scripts/run_simulator.sh
 
 # 2. Build & khởi động toàn bộ stack (Kafka, Postgres, Redis, migrate,
-#    fastapi, pipeline, radius-ingestion, notification-dispatcher,
-#    prometheus, grafana), đợi tới khi fastapi + pipeline healthy
+#    fastapi, ba pipeline service, radius-ingestion, notification-dispatcher,
+#    prometheus, grafana), đợi tới khi API + ba pipeline service healthy
 bash scripts/run_pipeline.sh
 
 # 3a. Nạp dữ liệu qua đường CSV (một lần, chạy xong tự thoát)
 bash scripts/run_ingest_csv.sh data/radius_log.csv
 
-# 3b. HOẶC nạp qua đường UDP (giả lập thiết bị NAS/GGSN thật gửi RADIUS
-#     Accounting-Request) — cần 2 lệnh, chạy song song:
+# 3b. HOẶC nạp qua đường UDP (giả lập capture server mirror RADIUS)
+#     — cần 2 lệnh, chạy song song:
 bash scripts/run_ingest_udp.sh                          # bật listener UDP/1813
 bash scripts/simulate_radius_device.sh data/radius_log.csv 15000   # phát 15.000 pkt/s
 
@@ -36,7 +36,7 @@ bash scripts/run_load_test.sh
 ```
 
 Sau bước 2, các service sau đã tự chạy nền, không cần lệnh riêng:
-- `pipeline` — 3 consumer (`cg-ip-msisdn`, `cg-device-swap`, `cg-sim-swap`), Prometheus metrics ở `:9200/metrics`
+- `pipeline-ip-msisdn`, `pipeline-device-swap`, `pipeline-sim-swap` — ba consumer service độc lập, metrics lần lượt ở `:9200`, `:9202`, `:9203`
 - `notification-dispatcher` — gửi callback outbox, poll `notification_log`
 - `fastapi` — API ở `http://localhost:8000` (Swagger: `/docs`)
 - `prometheus` (`http://localhost:9090`), `grafana` (`http://localhost:3000`, mặc định admin/admin)
@@ -45,16 +45,16 @@ Sau bước 2, các service sau đã tự chạy nền, không cần lệnh riê
 
 | Script | Dùng khi nào | Ghi chú |
 |---|---|---|
-| `run.sh {up\|down\|status\|logs\|ingest-csv\|simulate-radius\|reset-db}` | Điều khiển nhanh stack qua 1 lệnh gọn | `up`/`down` chỉ là alias cho `docker compose up -d --build` / `down` (không xóa volume). `logs [service]` mặc định tail `pipeline`. |
-| `run_pipeline.sh` | Khởi động lần đầu, hoặc sau khi đổi code cần build lại | `docker compose up -d --build` rồi poll healthcheck của `fastapi-app` và `camara-pipeline` tối đa 120s; in log 3 service liên quan nếu timeout. |
+| `run.sh {up\|down\|status\|logs\|ingest-csv\|simulate-radius\|reset-db}` | Điều khiển nhanh stack qua 1 lệnh gọn | `up`/`down` không xóa volume. `logs [service]` mặc định tail `pipeline-ip-msisdn`. |
+| `run_pipeline.sh` | Khởi động lần đầu, hoặc sau khi đổi code cần build lại | Khởi động theo tầng, đợi Kafka rồi kiểm tra health của FastAPI và cả ba pipeline service tối đa 120 giây. |
 | `run_simulator.sh` | Cần dữ liệu RADIUS giả lập mới | Chạy trong container `python:3.11-slim` tạm (`docker run --rm`), tự cài `requests/pydantic/altair/pandas/asyncpg`, xuất `data/radius_log.csv` (mặc định 2,000,000 record / 100,000 subscriber / seed=42). Sửa tham số bằng cách sửa trực tiếp lệnh trong script (`--records`, `--subscribers`, `--days`, `--duplicate-rate`, `--late-arrival-rate`, `--invalid-imei-rate`, `--conflict-rate`, `--missing-field-rate`, `--sim-swap-rate`, `--device-swap-rate`). |
-| `run_ingest_csv.sh FILE.csv` | Nạp 1 lần toàn bộ file CSV vào Kafka | `docker compose run --rm --no-deps` container `pipeline` tạm thời, mount file CSV read-only, chạy `pipeline.ingestion.producer --file`. Container tự thoát sau khi ingest xong. |
+| `run_ingest_csv.sh FILE.csv` | Nạp 1 lần toàn bộ file CSV vào Kafka | Dùng image/service `radius-ingestion` tạm thời, mount CSV read-only và override command thành `pipeline.ingestion.producer --file`. |
 | `run_ingest_udp.sh` | Muốn test đường UDP thật (RADIUS Accounting-Request nhị phân) | Chỉ bật service `radius-ingestion` (đã định nghĩa sẵn trong compose, lắng nghe UDP/1813, có `restart: unless-stopped`) — không tự tắt, cần `docker compose stop radius-ingestion` khi xong. |
-| `simulate_radius_device.sh FILE.csv [rate] [--loop]` | Giả lập 1 thiết bị NAS/GGSN gửi gói tin UDP thật tới listener ở trên | Chạy bằng Python trên host. Sender pre-encode song song, cache AVP lặp, pace theo micro-burst và mặc định yêu cầu Accounting-Response/retry. Thêm `--loop` để lặp file. |
-| `generate_report.sh` | Cần xem báo cáo chất lượng dữ liệu dạng HTML | Chạy `reporting/quality_report.py` bên trong container `camara-pipeline` (tránh phải cài `psycopg2`/`jinja2` trên host), copy report ra `reports/quality_report_<timestamp>.html`, tự mở bằng trình duyệt mặc định (Windows/macOS/Linux). Nếu Postgres không kết nối được, report vẫn được tạo nhưng có **banner cảnh báo đỏ** báo đây là dữ liệu mock, không phải số thật. |
+| `simulate_radius_device.sh FILE.csv [rate] [--loop]` | Giả lập capture server mirror gói UDP tới listener | Sender pre-encode, cache AVP và pace theo micro-burst; luôn fire-and-forget, không ACK/retry. Thêm `--loop` để lặp file. |
+| `generate_report.sh` | Cần xem báo cáo chất lượng dữ liệu dạng HTML | Chạy `reporting/quality_report.py` trong một replica `pipeline-ip-msisdn`, copy report ra `reports/quality_report_<timestamp>.html` và mở bằng trình duyệt mặc định. |
 | `run_load_test.sh` | Đo latency/throughput 3 API (sim-swap, device-swap, number-verification) | Chạy `grafana/k6` qua Docker (`docker run --rm`), cần biến `BASE_URL` (mặc định `http://host.docker.internal:8000`) và `API_KEY` (mặc định `dev-secret`, phải khớp `.env`). Kết quả JSON ghi vào `reports/*.json`. |
 | `run_dispatcher.sh {start\|stop\|restart\|status\|logs\|local}` | Cần quản lý riêng notification-dispatcher mà không đụng cả stack | Container `notification-dispatcher` tự chạy khi `docker compose up -d` nhưng **không có `restart:` policy trong compose** — nếu nó crash, sẽ nằm chết cho tới khi chủ động `start`/`restart` lại bằng script này. `local` chạy trực tiếp bằng `python3 -m pipeline.dispatcher.notification_dispatcher` (debug, cần `.env` có `DB_HOST` mà host resolve được, ví dụ `localhost` nếu Postgres đã publish port ra ngoài). |
-| `reset.sh` | Nghi ngờ dữ liệu bị ingest trùng, hoặc cần baseline sạch để đo lại benchmark | **Có xác nhận `y/n`.** Dừng producer/consumer để tránh topic bị tự tạo lại, xóa ba consumer-group offset, xóa + tạo lại Kafka topic theo `KAFKA_TOPIC_PARTITIONS` (mặc định 12), `TRUNCATE` các bảng nghiệp vụ và `FLUSHALL` Redis. Script giữ producer/consumer ở trạng thái dừng; chạy `bash scripts/run_pipeline.sh` để khởi động lại. **Không đụng tới `subscription`** và volume ngoài project. |
+| `reset.sh` | Nghi ngờ dữ liệu bị ingest trùng, hoặc cần baseline sạch để đo lại benchmark | **Có xác nhận `y/n`.** Dừng producer/consumer, xóa consumer-group/topic, `TRUNCATE` state PostgreSQL và gọi Redis `FLUSHALL` có xác thực. Script chỉ báo thành công sau khi `DBSIZE=0`; điều này bắt buộc để state mới hơn không làm fencing bỏ toàn bộ swap khi replay dataset. Sau đó chạy `bash scripts/run_pipeline.sh`. **Không đụng tới `subscription`** và volume ngoài project. |
 | `reset_db.sh` | Cần xóa sạch TOÀN BỘ schema Postgres (kể cả `subscription`, `notification_log`) để chạy lại migration từ đầu | **Có xác nhận `y/n`.** `DROP SCHEMA public CASCADE; CREATE SCHEMA public;` — sau khi chạy, phải `docker compose up -d migrate` (hoặc restart stack) để migration tạo lại toàn bộ bảng trước khi dùng tiếp. |
 
 ## Lưu ý quan trọng
@@ -62,13 +62,9 @@ Sau bước 2, các service sau đã tự chạy nền, không cần lệnh riê
 - **`run.sh up` / `down` không xóa volume** (không có `-v`) — dữ liệu Postgres/Redis giữa các lần `up`/`down` được giữ nguyên. Muốn xóa sạch, dùng `reset.sh` (dữ liệu nghiệp vụ) hoặc `reset_db.sh` (toàn bộ schema).
 - **`reset.sh` và `reset_db.sh` khác nhau về phạm vi**: `reset.sh` giữ lại schema + subscription/notification, chỉ xóa dữ liệu nghiệp vụ để chạy lại benchmark sạch; `reset_db.sh` xóa cả schema, dùng khi migration bị hỏng hoặc cần trạng thái DB hoàn toàn mới.
 - **Thứ tự cho đường UDP**: bật listener bằng `run_ingest_udp.sh` trước rồi mới chạy sender.
-  Sender mặc định chờ Accounting-Response và retry nên listener tạm thời chưa sẵn sàng không
-  làm mất gói ngay; sau khi hết `RADIUS_SENDER_MAX_RETRIES`, `unacked > 0` mới là lỗi cần xử lý.
+  Sender là fire-and-forget; nếu listener chưa sẵn sàng thì datagram test có thể mất.
 - Tuning sender: `RADIUS_SENDER_QUEUE_SIZE` (mặc định `100000`),
   `RADIUS_SENDER_PACING_WINDOW_MS` (`2`), `RADIUS_SENDER_MAX_CATCHUP_MS` (`100`) và
-  `RADIUS_SENDER_MAX_PACKETS` (`0`, gửi hết file). Reliability mặc định:
-  `RADIUS_SENDER_REQUIRE_ACK=true`, `RADIUS_SENDER_ACK_TIMEOUT_MS=10000`,
-  `RADIUS_SENDER_MAX_RETRIES=5`, `RADIUS_SENDER_MAX_PENDING=100000`,
-  `RADIUS_SENDER_ACK_DRAIN_SECONDS=30`. Ví dụ benchmark hữu hạn:
+  `RADIUS_SENDER_MAX_PACKETS` (`0`, gửi hết file). Ví dụ benchmark hữu hạn:
   `RADIUS_SENDER_MAX_PACKETS=150000 bash scripts/simulate_radius_device.sh data/radius_log.csv 15000`.
 - Mọi script `docker exec`/`docker compose exec` giả định container đã chạy qua `run_pipeline.sh` hoặc `run.sh up` trước đó; nếu container chưa tồn tại, script sẽ báo lỗi thay vì tự khởi động stack.

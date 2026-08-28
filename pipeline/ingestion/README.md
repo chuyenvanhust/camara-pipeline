@@ -1,202 +1,90 @@
-# `pipeline/ingestion/` — Ingestion Layer (Stage 1)
+# `pipeline/ingestion/` — passive RADIUS mirror ingestion
 
-Thư mục `pipeline/ingestion/` chịu trách nhiệm tiếp nhận toàn bộ dữ liệu RADIUS Accounting thô từ các thiết bị mạng viễn thông (GGSN, PGW, NAS) qua giao thức UDP hoặc từ các file log batch định dạng CSV, thực hiện chuẩn hoá và đẩy vào Apache Kafka topic `radius.accounting.raw` với độ tin cậy cao (`acks=all`).
+Khối này nhận bản sao RADIUS Accounting từ capture server qua UDP/1813, giải mã,
+chuẩn hóa và ghi vào Kafka topic `radius.accounting.raw`. Capture server nằm ngoài
+phạm vi repo và chịu trách nhiệm thu nhận bền vững cũng như giao thức với thiết bị
+mạng.
 
----
+Ingestion trong repo **không** gửi `Accounting-Response`, không chờ RADIUS ACK,
+không retry datagram và không duy trì ACK/dedup cache. Kafka `acks=all` chỉ là cơ
+chế bền vững nội bộ giữa producer và Kafka, không phải phản hồi RADIUS.
 
-## 1. Kiến trúc Ingestion & Luồng dữ liệu chi tiết
+## Luồng dữ liệu
 
 ```mermaid
-flowchart TD
-    subgraph INPUT["Đầu Vào Dữ Liệu"]
-        UDP_SRC["Thiết Bị NAS / GGSN<br/>(UDP Packet trên Port 1813)"]
-        CSV_SRC["File Log CSV<br/>(Local File System)"]
-    end
-
-    subgraph INGEST_ENGINE["Ingestion Engine (RadiusLogProducer)"]
-        subgraph PKT_READER["PacketReader"]
-            SOCK["Non-blocking UDP Socket<br/>(SO_REUSEPORT, RCVBUF 32MB)"]
-            DECODE["decode_radius()<br/>RFC 2866 + 3GPP TS 29.061"]
-            RESP_BLD["build_accounting_response()<br/>MD5 Response Authenticator"]
-        end
-
-        subgraph DEDUP["Deduplication & Flow Control"]
-            DEDUP_CACHE[("ACK Cache (RAM)<br/>_radius_ack_cache (LRU 500k)")]
-            INFLIGHT["In-flight Set<br/>_radius_inflight"]
-            RAM_QUEUE[("Bounded Buffer Queue<br/>asyncio.Queue (100k items)")]
-        end
-
-        subgraph BATCH_PUB["Batch Publisher Task"]
-            GATHER["_next_kafka_batch()<br/>Gom tối đa 200 items / 5ms"]
-            KAFKA_PROD["AIOKafkaProducer<br/>(acks=all, idempotence=true, lz4)"]
-        end
-    end
-
-    subgraph BROKER["Message Broker"]
-        KAFKA_TOPIC["Kafka Topic: radius.accounting.raw<br/>(Partition Key = MSISDN)"]
-        KAFKA_DLQ["Kafka Topic: radius.accounting.raw.dlq"]
-    end
-
-    %% Flow lines
-    UDP_SRC -->|Datagram| SOCK
-    SOCK --> DECODE
-    DECODE -->|Check Dup| DEDUP_CACHE
-    DEDUP_CACHE -->|Đã ACK trước đó| RESP_BLD
-    RESP_BLD -->|Accounting-Response| UDP_SRC
-
-    DECODE -->|Chưa có trong Cache| INFLIGHT
-    INFLIGHT -->|Enqueued| RAM_QUEUE
-    CSV_SRC -->|LocalCSVReader| RAM_QUEUE
-
-    RAM_QUEUE --> GATHER
-    GATHER --> KAFKA_PROD
-    KAFKA_PROD -->|Produce Batch| KAFKA_TOPIC
-    KAFKA_PROD -.->|Invalid Record| KAFKA_DLQ
-
-    KAFKA_TOPIC -->|Kafka ACK| BATCH_PUB
-    BATCH_PUB -->|Lưu event_id| DEDUP_CACHE
-    BATCH_PUB -->|Xoá inflight| INFLIGHT
-    BATCH_PUB --> RESP_BLD
+flowchart LR
+    CAPTURE["External RADIUS capture server<br/>durable source"] -->|"mirrored UDP/1813"| SOCKET["PacketReader<br/>decode + authenticate"]
+    SOCKET --> NORMALIZE["normalize + validate record"]
+    NORMALIZE --> QUEUE[("bounded sharded queues")]
+    QUEUE --> BATCH["async micro-batch publishers<br/>fixed producer pool"]
+    BATCH -->|"key = MSISDN, acks=all"| RAW["Kafka<br/>radius.accounting.raw"]
+    SOCKET -.->|"invalid RADIUS: reject + metric"| REJECT["discard"]
+    NORMALIZE -.->|"invalid normalized record"| DLQ["radius.accounting.raw.dlq"]
 ```
 
----
+Khi RAM queue đầy hoặc Kafka publish thất bại, bản mirror tương ứng được tính vào
+`data_loss`. Repo không thể yêu cầu nguồn gửi lại; hệ thống vận hành phải cảnh báo
+và replay từ capture server bền vững nếu cần.
 
-## 2. Chi tiết các thành phần trong `ingestion/`
+## Thành phần
 
-| File | Vai Trò & Chức Năng |
+| File | Trách nhiệm |
 |---|---|
-| [`packet_reader.py`](packet_reader.py) | **Bộ giải mã nhị phân RADIUS RFC 2866**: Mở UDP Socket (hỗ trợ `SO_REUSEPORT`), giải mã các thuộc tính chuẩn và thuộc tính 3GPP Vendor-Specific (IMSI, IMEI, RAT Type, MCC/MNC), xác thực MD5 Request Authenticator, và tạo gói tin `Accounting-Response` (Code=5). |
-| [`producer.py`](producer.py) | **`RadiusLogProducer`**: Quản lý hàng đợi đệm bất đồng bộ (`asyncio.Queue`), gom micro-batching đẩy vào Kafka với `acks=all`, duy trì bộ nhớ cache deduplication để chỉ trả lời ACK RADIUS sau khi Kafka đã xác nhận ghi an toàn. |
-| [`csv_reader.py`](csv_reader.py) | **`LocalCSVReader`**: Đọc stream từng dòng từ file CSV bằng generator, loại bỏ khoảng trắng thừa, tối ưu hoá việc sử dụng RAM khi nạp file log dung lượng lớn. |
-| [`radius_udp_sender.py`](radius_udp_sender.py) | **RADIUS Traffic Generator (Test Tool)**: Giả lập lưu lượng từ thiết bị NAS/GGSN thật, đóng gói bản ghi CSV thành gói tin nhị phân RADIUS, gửi qua UDP kèm cơ chế pacing rate, theo dõi ACK và tự động retry khi timeout. |
+| `packet_reader.py` | Mở UDP socket, kiểm tra Accounting-Request, xác thực Request Authenticator, giải mã AVP chuẩn và 3GPP VSA. |
+| `producer.py` | Chuẩn hóa record, phân shard theo MSISDN, ánh xạ worker vào Kafka producer pool, gom batch bất đồng bộ và ghi Kafka/DLQ. |
+| `csv_reader.py` | Đọc CSV dạng streaming cho đường ingest trực tiếp. |
+| `radius_udp_sender.py` | Công cụ load-test fire-and-forget: mã hóa CSV thành RADIUS và phát UDP theo rate; không mô phỏng ACK/retry. |
 
----
+## Chạy
 
-## 3. Cấu trúc Gói tin RADIUS & Bảng mã thuộc tính (RFC 2866 & 3GPP VSA)
-
-Hệ thống hỗ trợ giải mã đầy đủ các trường dữ liệu di động viễn thông theo chuẩn 3GPP:
-
-```
- 0                   1                   2                   3
- 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|     Code      |  Identifier   |            Length             |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                                                               |
-|                     Request Authenticator                     |
-|                           (16 bytes)                          |
-|                                                               |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|  Attributes ... (Standard AVPs & 3GPP Vendor-Specific AVPs)
-```
-
-### Bảng thuộc tính chuẩn & 3GPP VSA (Vendor ID = 10415 / 0x28AF):
-
-| Thuộc tính (AVP) | Type Hex (Dec) | Kiểu Dữ Liệu | Ý Nghĩa / Ánh Xạ Nghiệp Vụ |
-|---|---|---|---|
-| `Acct-Status-Type` | `0x28` (40) | Integer (4 bytes) | 1=Start, 2=Stop, 3=Interim-Update, 7=Accounting-On, 8=Accounting-Off |
-| `Calling-Station-Id` | `0x1f` (31) | String | Số thuê bao di động (`msisdn`, chuẩn hoá E.164) |
-| `Framed-IP-Address` | `0x08` (8) | IPv4 (4 bytes) | Địa chỉ IP cấp cho thiết bị di động (`framed_ip`) |
-| `Acct-Session-Id` | `0x2c` (44) | String | Mã định danh phiên mạng của GGSN (`acct_session_id`) |
-| `Acct-Session-Time` | `0x2d` (45) | Integer | Thời lượng phiên tính bằng giây (`acct_session_time`) |
-| `Event-Timestamp` | `0x37` (55) | Date/Epoch | Thời điểm sự kiện diễn ra tại thiết bị trạm |
-| `NAS-IP-Address` | `0x04` (4) | IPv4 | Địa chỉ IP của thiết bị NAS/GGSN |
-| `NAS-Identifier` | `0x20` (32) | String | Tên định danh trạm NAS/GGSN (`nas_identifier`) |
-| **Vendor-Specific** | `0x1a` (26) | VSA | 3GPP Specific Attributes: |
-| ↳ `3GPP-IMSI` | Subtype `0x01` | String | Mã nhận dạng thuê bao di động quốc tế (`imsi`) |
-| ↳ `3GPP-IMEISV` | Subtype `0x14` (20) | String | Mã định danh thiết bị phần cứng di động (`imei`) |
-| ↳ `3GPP-RAT-Type` | Subtype `0x15` (21) | String | Loại sóng mạng: 1=UTRAN, 2=GERAN, 6=EUTRAN (LTE) |
-| ↳ `3GPP-SGSN-MCC-MNC` | Subtype `0x08` (8) | String | Mã mạng quốc gia và nhà mạng viễn thông |
-
----
-
-## 4. Cơ chế Backpressure & Xử lý trùng lặp (Deduplication)
-
-1. **Nguyên lý Xác thực Response**:
-   - `PacketReader` **chỉ** gửi `Accounting-Response` (Code=5) sau khi gói tin đã được ghi nhận an toàn vào Kafka Broker (`acks=all`).
-   - Nếu Kafka bị nghẽn hoặc Bounded RAM Queue đầy (`100,000` records), gói tin mới sẽ bị tạm giữ (withheld ACK) hoặc drop tạm thời (`queue_rejected_for_retry`), kích hoạt cơ chế retry tự nhiên của thiết bị NAS qua UDP.
-
-2. **Deduplication Cache**:
-   - Khi NAS gửi retry cho một gói tin mà Kafka đã xử lý xong trước đó, `_is_radius_duplicate()` kiểm tra trong `_radius_ack_cache` (bộ nhớ LRU 500.000 phần tử, TTL 120s).
-   - Nếu phát hiện trùng lặp, hệ thống **trả ngay Accounting-Response** mà không đẩy lại vào Kafka, ngăn ngừa duplicate message gây lãng phí tài nguyên của các consumer phía sau.
-
----
-
-## 5. Hướng dẫn sử dụng & Tham số cấu hình
-
-### 5.1. Khởi chạy UDP Receiver (Lắng nghe cổng 1813)
 ```bash
+# Listener passive mirror
 python -m pipeline.ingestion.producer --udp --port 1813
-```
 
-### 5.2. Nạp trực tiếp từ file CSV
-```bash
-python -m pipeline.ingestion.producer --file data/radius_sample.csv
-```
+# Ingest CSV trực tiếp vào Kafka
+python -m pipeline.ingestion.producer --file data/radius_log.csv
 
-### 5.3. Chạy Traffic Generator giả lập lưu lượng
-```bash
-# Bắn 5.000 gói/giây từ CSV, lặp lại vô hạn, bật kiểm tra ACK
+# Load-test đường UDP, không chờ response
 python -m pipeline.ingestion.radius_udp_sender \
-    --csv data/radius_sample.csv \
-    --host 127.0.0.1 \
-    --port 1813 \
-    --rate 5000 \
-    --require-ack \
-    --loop
+  --csv data/radius_log.csv --host 127.0.0.1 --port 1813 --rate 15000
 ```
 
-### 5.4. Các biến môi trường tùy chỉnh
-| Biến Môi Trường | Mặc Định | Mô Tả |
-|---|---|---|
-| `RADIUS_SHARED_SECRET` | `camara-radius-dev-secret` | Shared secret dùng để tính MD5 Authenticator |
-| `RADIUS_UDP_RECEIVE_BUFFER_BYTES` | `33554432` (32MB) | Kích thước socket receive buffer của OS |
-| `RADIUS_UDP_QUEUE_MAX_RECORDS` | `100000` | Dung lượng hàng đợi RAM đệm trước Kafka (khuyên dùng `300000` cho Prod) |
-| `RADIUS_UDP_KAFKA_BATCH_RECORDS` | `250` | Số lượng bản ghi gom cho mỗi batch Kafka |
-| `RADIUS_UDP_KAFKA_BATCH_WAIT_MS` | `5` | Thời gian chờ tối đa gom batch (ms) |
-| `RADIUS_UDP_KAFKA_MAX_INFLIGHT_BATCHES_PER_WORKER` | `32` | Số lượng batch Kafka produce song song cho mỗi worker |
-| `RADIUS_UDP_KAFKA_TOTAL_MAX_INFLIGHT_BATCHES` | `64` | Giới hạn tổng số batch Kafka produce song song trên toàn bộ process |
-| `RADIUS_UDP_PUBLISHER_WORKERS` | `4` | Số lượng worker coroutines publish song song (Key-sharded per MSISDN) |
-| `RADIUS_ACK_CACHE_MAX_RECORDS` | `500000` | Số lượng event ID lưu trong cache deduplication |
-| `RADIUS_ACK_CACHE_TTL_SECONDS` | `120` | Thời gian sống (TTL) của cache deduplication |
-| `INGESTION_METRICS_PORT` | `9201` | Cổng HTTP Exporter cho Prometheus Ingestion Metrics (tự động thử 9201-9210 nếu bận) |
-| `INGESTION_COMPRESSION_TYPE` | `lz4` | Chuẩn nén dữ liệu đẩy vào Kafka (`lz4`, `gzip`, `snappy`) |
+## Cấu hình chính
 
-### 5.5. Tính Toán Dung Lượng & Cấu Hình NAS Retry Sizing
-- **Tổng dung lượng Inflight Kafka**:
-  $$\text{Total Inflight Capacity} = \text{Total Batches (64)} \times \text{Batch Size (250)} = \mathbf{16.000 \text{ records}}$$
-- **Thời gian Hấp thụ Tràn Hàng Đợi RAM (Burst Absorption Window)**:
-  $$\text{Hold Time (100k queue)} = \frac{100.000 \text{ records}}{15.000 \text{ pkt/s}} \approx \mathbf{6,7 \text{ giây}}$$
-  *(Trên Production khuyên dùng `RADIUS_UDP_QUEUE_MAX_RECORDS=300000` để hấp thụ burst 20 giây khi Kafka failover).*
-- **Quy chuẩn Cấu hình Retry phía Thiết bị Mạng (GGSN / NAS)**:
-  Cấu hình thiết bị GGSN/NAS với `timeout=2s, retries=5` ($\text{tổng cửa sổ retry} = 10 \text{ giây}$) để khớp với thời gian rebalance/failover của Kafka Cluster.
+| Biến | Mặc định | Ý nghĩa |
+|---|---:|---|
+| `RADIUS_SHARED_SECRET` | bắt buộc | Xác thực Request Authenticator của gói mirror. |
+| `RADIUS_UDP_RECEIVE_BUFFER_BYTES` | `33554432` | Socket receive buffer yêu cầu từ OS. |
+| `RADIUS_UDP_QUEUE_MAX_RECORDS` | `300000` | Tổng burst buffer RAM; không phải durable queue. |
+| `RADIUS_UDP_PUBLISHER_WORKERS` | `4` | Số queue/publisher shard theo MSISDN. |
+| `RADIUS_UDP_KAFKA_PRODUCERS` | `4` | Số producer độc lập; một worker luôn dùng cùng producer. |
+| `RADIUS_UDP_KAFKA_BATCH_RECORDS` | `500` | Số record tối đa mỗi micro-batch. |
+| `RADIUS_UDP_KAFKA_BATCH_WAIT_MS` | `5` | Thời gian gom batch tối đa. |
+| `RADIUS_UDP_KAFKA_MAX_INFLIGHT_BATCHES_PER_WORKER` | `4` | Giới hạn batch đang ghi cho mỗi worker. |
+| `RADIUS_UDP_KAFKA_PRESSURE_INFLIGHT_BATCHES_PER_WORKER` | `6` | Giới hạn mỗi worker khi queue shard đạt 50%. |
+| `RADIUS_UDP_KAFKA_PRESSURE_QUEUE_RATIO` | `0.5` | Ngưỡng kích hoạt pressure concurrency. |
+| `RADIUS_UDP_KAFKA_TOTAL_MAX_INFLIGHT_BATCHES` | `24` | Trần tuyệt đối toàn process. |
+| `INGESTION_BATCH_SIZE_BYTES` | `524288` | Batch buffer tối đa của Kafka producer. |
+| `INGESTION_KAFKA_PERSIST_WARN_MS` | `500` | Ngưỡng cảnh báo p95 thời gian ghi Kafka. |
+| `INGESTION_QUEUE_WARN_MS` | `1000` | Ngưỡng cảnh báo p95 thời gian nằm trong queue. |
 
-### 5.6. Load-Test Đa Socket Qua Kernel `SO_REUSEPORT` & Multiplex ACK Receiver
-- **Đa Source Port**: Khi load-test với nhiều container `radius-ingestion` trên Linux, Kernel phân bổ gói tin dựa trên hash 4-tuple (`source_ip, source_port, dest_ip, dest_port`). Dùng cờ `--num-sockets 8` trên `radius-udp-sender` để phát từ 8 client source ports khác nhau, đảm bảo lưu lượng được chia đều 100% qua các container Ingestion.
-- **Multiplex ACK Receiver**: Thread `receive_responses()` trong `radius_udp_sender.py` sử dụng `select.select(sockets, [], [], 0.02)` để lắng nghe đồng thời response trên tất cả $N$ sockets, khớp chính xác socket nguồn gốc khi retry mà không bị nghẽn timeout giả.
+## Telemetry
 
----
-
-## 6. Log Telemetry & Giám sát Metrics Chuyên Biệt (Split Metrics Semantics)
-
-Log định kỳ mỗi 10 giây in định dạng cấu trúc chi tiết:
-
-```
-[INGESTION][OK] window=10.0s | Throughput: udp_in=9835.0/s kafka_ack=9189.6/s | Queue/Inflight: queue=0/100000(0.0%) inflight_radius=0 | RADIUS Responses: total=155970 (new_ack=110520, dup_ack=45450, withheld=0, failed=0) | Kafka Batch: 250rec/27.9ms (1075.0/s) | Quality/Loss: data_loss=0(+0) (rejected=0, dlq=0, pub_failed=0, queue_drop=0) | Totals: received=155970, kafka_acked=110520
+```text
+[INGESTION][OK] window=10.0s | Throughput: udp_in=15000.0/s kafka_persisted=15100.0/s gap=-100.0/s | Queue: depth=0/300000(0.0%) backlog=0.00s | Kafka: batch_avg=420.0rec last=500rec/24.0ms persist(p50=18.0ms p95=35.0ms p99=48.0ms) queue_p95=12.0ms worker_slot_wait_p95=0.0ms global_wait_p95=0.0ms | Quality/Loss: data_loss=0(+0) (queue_dropped=0, pub_failed=0, dlq=0, invalid=0) | Totals: received=150000, kafka_persisted=150000
 ```
 
-### Metrics Prometheus Exporter (`http://<host>:9201/metrics`)
+| Metric | Ý nghĩa |
+|---|---|
+| `radius_ingestion_udp_received_total` | Datagram đã nhận ở application socket. |
+| `radius_ingestion_kafka_persisted_total` | Record đã được Kafka xác nhận theo cấu hình producer. |
+| `radius_ingestion_queue_capacity_records` | Tổng dung lượng queue cấu hình, dùng tính pressure ratio. |
+| `radius_ingestion_queue_dropped_total` | Record mirror bị bỏ vì queue đầy. |
+| `radius_ingestion_publish_failed_total` | Record không ghi được Kafka. |
+| `radius_ingestion_kafka_batch_persist_seconds` | Phân bố latency ghi batch Kafka. |
+| `radius_ingestion_queue_residence_seconds` | Thời gian record chờ trong RAM queue. |
+| `radius_ingestion_worker_slot_wait_seconds{worker}` | Thời gian publisher chờ slot inflight của chính worker. |
 
-| Prometheus Metric Name | Type | Description |
-|---|---|---|
-| `radius_ingestion_udp_received_total` | Counter | Tổng số gói UDP nhận từ mạng |
-| `radius_ingestion_kafka_acked_total` | Counter | Tổng số bản ghi Kafka đã xác nhận an toàn (`acks=all`) |
-| `radius_ingestion_duplicate_acked_total` | Counter | Số bản ghi trùng lặp được trả ACK ngay từ RAM Cache |
-| `radius_ingestion_queue_depth_records` | Gauge | Tổng số bản ghi đang chờ trong RAM queues |
-| `radius_ingestion_worker_queue_depth_records{worker="N"}` | Gauge | Số bản ghi đang chờ trong queue của worker shard `N` |
-| `radius_ingestion_invalid_total` | Counter | Số bản ghi sai cấu trúc dữ liệu bị đẩy vào DLQ |
-| `radius_ingestion_dlq_published_total` | Counter | Số bản ghi DLQ đã ghi thành công vào Kafka `.dlq` topic |
-| `radius_ingestion_publish_failed_total` | Counter | Lỗi tạm thời khi produce Kafka (NAS chưa nhận ACK và sẽ retry) |
-| `radius_ingestion_queue_rejected_for_retry_total` | Counter | Số bản ghi bị từ chối do RAM Queue đầy (NAS không nhận ACK và sẽ retry) |
-
-> 📖 **Báo cáo Kỹ thuật Chuyên sâu**: Đọc phân tích chi tiết kỹ thuật RFC 2866, MD5 Authenticator, `SO_REUSEPORT`, Key-sharded Publisher và E2E Epoch Lag tại [`docs/BAO_CAO_KY_THUAT_PIPELINE.md`](../../docs/BAO_CAO_KY_THUAT_PIPELINE.md).
+Điều kiện vận hành bình thường là `udp_in` xấp xỉ `kafka_persisted`, queue không
+tăng liên tục và `data_loss=0`. Queue chỉ hấp thụ burst ngắn; nó không thay thế
+durable buffering tại capture server hoặc Kafka.

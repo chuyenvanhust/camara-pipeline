@@ -33,8 +33,8 @@ def test_sender_parameter_validation():
         send_csv_as_radius(csv_path="fake.csv", queue_size=0)
 
 
-def test_send_csv_as_radius_multi_socket_ack():
-    """Verify that send_csv_as_radius with require_ack=True and num_sockets=4 executes without socket errors."""
+def test_send_csv_as_radius_multi_socket():
+    """Verify that the fire-and-forget sender can use multiple UDP sockets."""
     with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".csv") as tmp:
         tmp.write("msisdn,acct_status_type,framed_ip\n")
         tmp.write("+84901234567,start,10.0.0.1\n")
@@ -47,11 +47,7 @@ def test_send_csv_as_radius_multi_socket_ack():
             port=18134,
             rate=100.0,
             num_sockets=4,
-            require_ack=True,
-            ack_timeout_ms=100.0,
-            max_retries=1,
             max_packets=2,
-            ack_drain_seconds=0.1,
         )
     finally:
         if os.path.exists(tmp_path):
