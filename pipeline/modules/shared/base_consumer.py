@@ -163,11 +163,20 @@ class BaseKafkaConsumer(ABC):
                             await asyncio.sleep(min(2 ** attempt, 10))
                     batch_duration = time.monotonic() - batch_started
                     self.metrics.observe_batch(batch_duration)
-                    now_utc = datetime.now(timezone.utc)
+                    now_epoch = time.time()
+                    now_utc = datetime.fromtimestamp(now_epoch, timezone.utc)
                     e2e_lags_ms = []
                     for record in records:
                         val = getattr(record, "value", None)
                         if isinstance(val, dict):
+                            ingest_epoch = val.get("ingest_epoch_s")
+                            if ingest_epoch is not None:
+                                try:
+                                    lag_ms = max(0.0, (now_epoch - float(ingest_epoch)) * 1000.0)
+                                    e2e_lags_ms.append(lag_ms)
+                                    continue
+                                except (ValueError, TypeError):
+                                    pass
                             ingest_ts = val.get("ingest_timestamp")
                             if ingest_ts:
                                 try:
@@ -177,11 +186,7 @@ class BaseKafkaConsumer(ABC):
                                 except Exception:
                                     pass
                     if e2e_lags_ms:
-                        self.metrics.observe_e2e_lag(
-                            avg_ms=sum(e2e_lags_ms) / len(e2e_lags_ms),
-                            max_ms=max(e2e_lags_ms),
-                            count=len(e2e_lags_ms),
-                        )
+                        self.metrics.observe_e2e_lag(e2e_lags_ms)
 
                 # Kafka key cố định partition, nên cùng một thuê bao không bị tách
                 # qua hai shard. Mỗi partition vẫn được duyệt theo offset; chỉ thứ tự

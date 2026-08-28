@@ -278,7 +278,7 @@ python -m pipeline.ingestion.radius_udp_sender --csv data/radius_sample.csv --ra
 
 | Tên Biến Môi Trường | Giá Trị Mặc Định | Ý Nghĩa / Mục Đích |
 |---|---|---|
-| `KAFKA_BOOTSTRAP_SERVERS` | `camara-kafka:9092` | Danh sách địa chỉ Kafka Brokers |
+| `KAFKA_BOOTSTRAP_SERVERS` | `camara-kafka:9092,camara-kafka-2:9092,camara-kafka-3:9092` | Danh sách địa chỉ Kafka Cluster Brokers |
 | `KAFKA_TOPIC_RAW` | `radius.accounting.raw` | Tên topic Kafka chứa log thô |
 | `KAFKA_TOPIC_PARTITIONS` | `16` | Số partition của topic (tối ưu xử lý song song 15k+ rec/s) |
 | `CONSUMERS_PER_GROUP` | `4` | Số member/worker chạy song song trong mỗi Consumer Group |
@@ -286,23 +286,52 @@ python -m pipeline.ingestion.radius_udp_sender --csv data/radius_sample.csv --ra
 | `BATCH_MAX_RECORDS` | `4000` | Số lượng bản ghi tối đa lấy trong một lần poll Kafka |
 | `BATCH_TIMEOUT_MS` | `20` | Thời gian tối đa chờ gom đủ batch (ms) |
 | `DATABASE_URL` | `postgresql://postgres:camara@camara-postgres:5432/camara_db` | Connection string PostgreSQL (`synchronous_commit=on` đảm bảo 100% ACID) |
-| `DB_POOL_MIN` / `DB_POOL_MAX` | `6` / `32` | Kích thước Connection Pool `asyncpg` dùng chung |
-| `REDIS_HOST` / `REDIS_PORT` | `camara-redis` / `6379` | Thông tin kết nối Redis Standalone |
-| `REDIS_SENTINELS` | `""` | Danh sách Sentinel nodes (Production HA Mode) |
+| `DB_POOL_MIN` / `DB_POOL_MAX` | `6` / `24` | Kích thước Connection Pool `asyncpg` dùng chung (PostgreSQL `max_connections=200`) |
+| `REDIS_HOST` / `REDIS_PORT` | `camara-redis` / `6379` | Thông tin kết nối Redis Standalone / Cluster |
 | `RADIUS_SHARED_SECRET` | `camara-radius-dev-secret` | Secret key tính Authenticator RFC 2866 |
 | `RADIUS_UDP_RECEIVE_BUFFER_BYTES` | `33554432` (32MB) | Kích thước socket buffer nhận UDP |
+| `RADIUS_UDP_QUEUE_MAX_RECORDS` | `100000` | Dung lượng hàng đợi RAM đệm trước Kafka (khuyên dùng `300000` cho Prod) |
 | `RADIUS_UDP_KAFKA_BATCH_RECORDS` | `250` | Kích thước batch Kafka của UDP Ingestion |
 | `RADIUS_UDP_KAFKA_BATCH_WAIT_MS` | `5` | Thời gian gom batch Kafka của Ingestion (ms) |
-| `RADIUS_UDP_KAFKA_MAX_INFLIGHT_BATCHES` | `32` | Số lượng batch Kafka produce song song |
+| `RADIUS_UDP_KAFKA_MAX_INFLIGHT_BATCHES_PER_WORKER` | `32` | Số lượng batch Kafka produce song song cho mỗi worker |
+| `RADIUS_UDP_KAFKA_TOTAL_MAX_INFLIGHT_BATCHES` | `64` | Giới hạn tổng số batch Kafka produce song song trên toàn bộ process |
+| `RADIUS_UDP_PUBLISHER_WORKERS` | `4` | Số lượng worker coroutines publish song song (Key-sharded per MSISDN) |
+| `INGESTION_METRICS_PORT` | `9201` | Cổng Exporter Prometheus Ingestion (tự động thử 9201-9210 nếu bận) |
 | `DISPATCHER_BATCH_SIZE` | `50` | Số lượng notification claim mỗi vòng lặp của Dispatcher |
 | `METRICS_PORT` | `9200` | Port expose `/metrics` cho Prometheus scraper |
 
 ---
 
-## 7. Giám sát & Báo cáo Thông lượng (Monitoring)
+## 7. Giám sát Telemetry, Bảo Mật & Phục hồi Thảm họa (Security & Disaster Recovery)
 
-Mỗi `THROUGHPUT_LOG_INTERVAL_SECONDS` (mặc định 10 giây), hệ thống ghi log chuẩn hoá:
-- **`[INGESTION]`**: Tốc độ nhận UDP/giây, tốc độ Kafka ACK/giây, dung lượng Queue đệm, số lượng duplicate được loại bỏ, kích thước batch Kafka.
-- **`[PROCESSING]`**: Log chi tiết cho từng member của từng group: tốc độ nhận Kafka/giây, tốc độ xử lý thành công/giây, số lượng ghi DB/giây, latency chi tiết từng chặng `latency_ms(state, postgres, redis)`, và `kafka_lag`.
+### 7.1. Giám sát Telemetry & Split Metrics
+Mỗi `THROUGHPUT_LOG_INTERVAL_SECONDS` (mặc định 10 giây), hệ thống ghi log phân khối trực quan (`|`) cho cả hai chặng:
+- **`[INGESTION]`**: Tốc độ nhận UDP (`udp_in`), tốc độ Kafka ACK (`kafka_ack`), dung lượng Queue per-worker (`queue`), chi tiết phản hồi RADIUS (`new_ack`, `dup_ack`, `withheld`), và **metrics rành mạch**: `invalid`, `dlq_published`, `publish_failed`, `queue_rejected_for_retry`.
+- **`[PROCESSING]`**: Log chi tiết cho từng member: tốc độ nhận/xử lý (`recv`, `success`, `pg`, `rds`), độ trễ xử lý batch (`batch_avg`), độ trễ từng chặng `stage(state, pg, rds)`, **độ trễ bản tin toàn trình `e2e_lag(max)`** (tính qua float epoch `ingest_epoch_s` siêu tốc), và **định vị lỗi `data_loss` (`err`, `dlq`)**.
 
-Dashboard Grafana được tích hợp sẵn tại `http://localhost:3000` (kết nối Prometheus `http://localhost:9090`).
+### 7.2. Tính năng Bảo mật An ninh Mạng (Production Security)
+- **CAMARA OAuth2 OIDC Verification**: Xác thực JWT Bearer Token chuẩn (`exp`, `iss`, `aud`) kết hợp API Key fallback.
+- **SSRF & DNS Rebinding Protection**: Kiểm tra URL webhook chặt chẽ (`ssrf_protection.py`), ngăn chặn các cuộc tấn công quét mạng nội bộ và DNS Rebinding.
+- **HMAC SHA-256 Signature**: Đính kèm chữ ký `X-Signature-SHA256` trên mọi request webhook callback.
+- **Container Hardening**: Toàn bộ Docker images (`pipeline/Dockerfile`, `api/Dockerfile`) thực thi dưới quyền user không có root (`USER appuser`).
+
+### 7.3. Phục hồi Thảm họa (Disaster Recovery Runbook)
+- **Kịch bản DR & Failover**: Xem quy trình xử lý sự cố chi tiết tại [`docs/DISASTER_RECOVERY_RUNBOOK.md`](docs/DISASTER_RECOVERY_RUNBOOK.md).
+- **Sao lưu & Phục hồi PostgreSQL**:
+  ```bash
+  # Thực hiện sao lưu dữ liệu PostgreSQL
+  bash scripts/backup_postgres.sh
+
+  # Phục hồi dữ liệu từ bản sao lưu
+  bash scripts/restore_postgres.sh storage/backups/camara_db_backup_latest.sql.gz
+  ```
+
+---
+
+## 8. Tài liệu Báo cáo Kỹ thuật & Hướng dẫn Vận hành
+
+Dự án đã được tài liệu hóa đầy đủ các giải pháp kiến trúc và thuật toán nâng cao:
+- 🛠️ [**Hướng dẫn Cấu hình & Tối ưu hóa Phần cứng (Hardware Tuning Guide)**](docs/HARDWARE_TUNING_GUIDE.md): Giải thích chi tiết toàn bộ các biến môi trường trong `.env`, quy tắc sizing tài nguyên RAM/CPU, công thức tính toán độ đệm hàng đợi, connection budget PostgreSQL và bảng thông số cấu hình chuẩn cho các môi trường từ Dev/VPS đến Server Production 30k+ pkt/s.
+- 📖 [**Báo cáo Kỹ thuật Chuyên sâu các File Trọng điểm**](docs/BAO_CAO_KY_THUAT_PIPELINE.md): Mô tả chi tiết kỹ thuật giải mã nhị phân RFC 2866, MD5 Authenticator, 3GPP VSA, Kernel `SO_REUSEPORT`, Key-Sharded Publisher Queue, Global Inflight Semaphore, Multi-Socket ACK Receiver (`select.select()`), Partition Sharding, Transaction 4 bảng nguyên tử qua `UNNEST`, Fencing Versioning Tuple, Lua Scripts nguyên tử, Fast Float Epoch E2E Lag, và Transactional Outbox Pattern (`FOR UPDATE SKIP LOCKED`).
+- 📖 [**Disaster Recovery Runbook & HA Operational Guide**](docs/DISASTER_RECOVERY_RUNBOOK.md): Hướng dẫn vận hành sự cố, sao lưu Point-in-Time Recovery (PITR) và quy trình Failover Kafka/PostgreSQL.
+

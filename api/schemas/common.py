@@ -1,7 +1,6 @@
 #common.py
 import re
 from typing import Any, Generator
-from altair import value
 from pydantic import BaseModel, Field
 from pydantic_core import core_schema
 

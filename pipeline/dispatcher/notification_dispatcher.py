@@ -7,7 +7,15 @@ import signal
 
 import httpx
 
+import json
+
 from pipeline.modules.shared.db import DatabasePool
+
+from pipeline.dispatcher.ssrf_protection import (
+    SSRFValidationError,
+    sign_webhook_payload,
+    validate_webhook_url,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,15 +38,30 @@ class NotificationDispatcher:
 
     async def dispatch_one(self, row) -> None:
         error = "callback failed"
+        callback_url = str(row["callback_url"])
         try:
+            # P1 Security: SSRF & DNS Rebinding validation prior to HTTP POST dispatch
+            validated_url, _resolved_ip = validate_webhook_url(callback_url)
+            payload_bytes = json.dumps(row["payload"]).encode("utf-8")
+            signature = sign_webhook_payload(payload_bytes)
+            headers = {
+                "Content-Type": "application/json",
+                "Idempotency-Key": str(row["event_id"]),
+                "X-Signature-SHA256": signature,
+                "User-Agent": "CAMARA-NotificationDispatcher/1.0",
+            }
             response = await self.client.post(
-                row["callback_url"], json=row["payload"],
-                headers={"Idempotency-Key": row["event_id"]},
+                validated_url,
+                content=payload_bytes,
+                headers=headers,
             )
             if response.status_code in {200, 201, 202, 204}:
                 await self.db.mark_notification_sent(row["id"])
                 return
             error = f"callback returned HTTP {response.status_code}"
+        except SSRFValidationError as exc:
+            error = f"SSRF Blocked: {exc}"
+            logger.warning("SSRF security policy blocked webhook dispatch notification=%s url=%s: %s", row["id"], callback_url, exc)
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
             error = f"{type(exc).__name__}: {exc}"
         except Exception as exc:

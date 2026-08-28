@@ -19,7 +19,7 @@ services:
     image: redis:7-alpine
     restart: unless-stopped
     networks: [camara-network]
-    command: ["redis-server", "--replicaof", "camara-redis", "6379", "--appendonly", "yes", "--maxmemory", "512mb", "--maxmemory-policy", "noeviction"]
+    command: ["redis-server", "--replicaof", "camara-redis", "6379", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:-camara_redis_dev_secret}", "--masterauth", "${REDIS_PASSWORD:-camara_redis_dev_secret}", "--maxmemory", "${REDIS_MAXMEMORY:-512mb}", "--maxmemory-policy", "noeviction"]
     depends_on:
       redis:
         condition: service_healthy
@@ -65,11 +65,13 @@ services:
     networks: !reset []
     ports: !reset []   # network_mode: host không dùng ports mapping
     environment:
+      ENVIRONMENT: production
       RADIUS_UDP_SO_REUSEPORT: "true"
       # F-PARALLEL-FIX: network_mode: host gỡ container khỏi bridge network
       # camara-network -> tên DNS nội bộ (camara-kafka...) không resolve được
       # nữa, phải trỏ qua các port đã publish ra host (29092-29094).
       KAFKA_BOOTSTRAP_SERVERS: "localhost:29092,localhost:29093,localhost:29094"
+      RADIUS_SHARED_SECRET: ${RADIUS_SHARED_SECRET:?RADIUS_SHARED_SECRET is required in production}
     # Nhiều container cùng bind UDP/1813 nhờ SO_REUSEPORT (packet_reader.py) ->
     # kernel Linux tự load-balance datagram giữa các container -> parallel thật,
     # mỗi container là 1 process riêng, không còn bị GIL của asyncio chia sẻ.
@@ -82,8 +84,11 @@ services:
     cpus: ${PIPELINE_CPUS_PROD:-4}
     mem_limit: ${PIPELINE_MEM_LIMIT_PROD:-4g}
     environment:
+      ENVIRONMENT: production
       REDIS_SENTINELS: redis-sentinel-1:26379,redis-sentinel-2:26379,redis-sentinel-3:26379
       REDIS_MASTER_NAME: camara-master
+      WEBHOOK_SIGNING_SECRET: ${WEBHOOK_SIGNING_SECRET:?WEBHOOK_SIGNING_SECRET is required in production}
+      ALLOW_HTTP_WEBHOOKS: "false"
     depends_on:
       redis-sentinel-1:
         condition: service_healthy
@@ -94,6 +99,8 @@ services:
 
   fastapi:
     environment:
+      ENVIRONMENT: production
+      API_KEY: ${API_KEY:?API_KEY is required in production}
       REDIS_SENTINELS: redis-sentinel-1:26379,redis-sentinel-2:26379,redis-sentinel-3:26379
       REDIS_MASTER_NAME: camara-master
     depends_on:

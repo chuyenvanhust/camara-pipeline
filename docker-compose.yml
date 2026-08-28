@@ -8,15 +8,21 @@ volumes:
   postgres_data:
   redis_data:
   grafana_data:
+  zookeeper_data:
+  zookeeper_log:
+  kafka_1_data:
+  kafka_2_data:
+  kafka_3_data:
 
 x-pipeline-environment: &pipeline-environment
   KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-camara-kafka:9092,camara-kafka-2:9092,camara-kafka-3:9092}
-  KAFKA_TOPIC_RAW: radius.accounting.raw
-  REDIS_HOST: camara-redis
-  REDIS_PORT: "6379"
-  DATABASE_URL: postgresql://${POSTGRES_LOCAL_USER:-postgres}:${POSTGRES_LOCAL_PASSWORD:-camara}@camara-postgres:5432/${POSTGRES_LOCAL_DB:-camara_db}
-  DB_POOL_MIN: "2"
-  DB_POOL_MAX: "12"
+  KAFKA_TOPIC_RAW: ${KAFKA_TOPIC_RAW:-radius.accounting.raw}
+  REDIS_HOST: ${REDIS_HOST:-camara-redis}
+  REDIS_PORT: ${REDIS_PORT:-6379}
+  REDIS_PASSWORD: ${REDIS_PASSWORD:-camara_redis_dev_secret}
+  DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_LOCAL_USER:-postgres}:${POSTGRES_LOCAL_PASSWORD:-camara}@camara-postgres:5432/${POSTGRES_LOCAL_DB:-camara_db}}
+  DB_POOL_MIN: ${PIPELINE_DB_POOL_MIN:-6}
+  DB_POOL_MAX: ${PIPELINE_DB_POOL_MAX:-24}
 
 services:
   zookeeper:
@@ -27,6 +33,9 @@ services:
     environment:
       ZOOKEEPER_CLIENT_PORT: "2181"
       ZOOKEEPER_TICK_TIME: "2000"
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_log:/var/lib/zookeeper/log
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 2181"]
       interval: 5s
@@ -75,6 +84,8 @@ services:
       KAFKA_SOCKET_SEND_BUFFER_BYTES: 1048576
       KAFKA_SOCKET_RECEIVE_BUFFER_BYTES: 1048576
       KAFKA_SOCKET_REQUEST_MAX_BYTES: 104857600
+    volumes:
+      - kafka_1_data:/var/lib/kafka/data
     healthcheck:
       test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list"]
       interval: 5s
@@ -93,6 +104,8 @@ services:
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29093
     ports:
       - "127.0.0.1:29093:29093"
+    volumes:
+      - kafka_2_data:/var/lib/kafka/data
     container_name: camara-kafka-2
 
   kafka-3:
@@ -104,13 +117,15 @@ services:
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29094
     ports:
       - "127.0.0.1:29094:29094"
+    volumes:
+      - kafka_3_data:/var/lib/kafka/data
     container_name: camara-kafka-3
 
   postgres:
     image: postgres:15-alpine
     container_name: camara-postgres
     restart: unless-stopped
-    command: ["postgres", "-c", "synchronous_commit=on", "-c", "max_connections=150", "-c", "shared_buffers=1GB", "-c", "effective_cache_size=3GB", "-c", "work_mem=16MB", "-c", "max_wal_size=4GB", "-c", "checkpoint_timeout=15min"]
+    command: ["postgres", "-c", "synchronous_commit=on", "-c", "max_connections=${POSTGRES_MAX_CONNECTIONS:-200}", "-c", "shared_buffers=${POSTGRES_SHARED_BUFFERS:-512MB}", "-c", "effective_cache_size=${POSTGRES_EFFECTIVE_CACHE_SIZE:-1GB}", "-c", "work_mem=${POSTGRES_WORK_MEM:-8MB}", "-c", "max_wal_size=${POSTGRES_MAX_WAL_SIZE:-2GB}", "-c", "checkpoint_timeout=15min"]
     networks: [camara-network]
     environment:
       POSTGRES_USER: ${POSTGRES_LOCAL_USER:-postgres}
@@ -123,19 +138,19 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
-    mem_limit: ${POSTGRES_MEM_LIMIT:-2g}
+    mem_limit: ${POSTGRES_MEM_LIMIT:-3g}
     cpus: ${POSTGRES_CPUS:-2}
 
   redis:
     image: redis:7-alpine
     container_name: camara-redis
     restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "512mb", "--maxmemory-policy", "noeviction"]
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:-camara_redis_dev_secret}", "--maxmemory", "${REDIS_MAXMEMORY:-512mb}", "--maxmemory-policy", "noeviction"]
     networks: [camara-network]
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-camara_redis_dev_secret}", "ping"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -166,7 +181,7 @@ services:
     ports:
       - "8000:8000"
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_LOCAL_USER:-postgres}:${POSTGRES_LOCAL_PASSWORD:-camara}@camara-postgres:5432/${POSTGRES_LOCAL_DB:-camara_db}
+      <<: *pipeline-environment
       DB_POOL_SIZE: "10"
       ENVIRONMENT: ${ENVIRONMENT:-development}
       API_KEY: ${API_KEY:-dev-secret}
@@ -197,19 +212,16 @@ services:
     networks: [camara-network]
     environment:
       <<: *pipeline-environment
-      METRICS_PORT: "9200"
+      METRICS_PORT: ${METRICS_PORT:-9200}
       KAFKA_TOPIC_PARTITIONS: ${KAFKA_TOPIC_PARTITIONS:-16}
       KAFKA_REPLICATION_FACTOR: ${KAFKA_REPLICATION_FACTOR:-3}
-      # F-PARALLEL: số instance CHẠY SONG SONG THẬT (asyncio task riêng, mỗi task
-      # là 1 member Kafka riêng trong group -> partition được rebalance chia thật
-      # ra nhiều task, không còn 1 task ôm hết partition). Xem run_pipeline.py.
       CONSUMERS_PER_GROUP: ${CONSUMERS_PER_GROUP:-4}
       BATCH_MAX_RECORDS: ${BATCH_MAX_RECORDS:-4000}
       BATCH_TIMEOUT_MS: ${BATCH_TIMEOUT_MS:-20}
       PROCESSING_PARTITION_CONCURRENCY: ${PROCESSING_PARTITION_CONCURRENCY:-3}
       THROUGHPUT_LOG_INTERVAL_SECONDS: ${THROUGHPUT_LOG_INTERVAL_SECONDS:-10}
       DB_POOL_MIN: ${PIPELINE_DB_POOL_MIN:-6}
-      DB_POOL_MAX: ${PIPELINE_DB_POOL_MAX:-32}
+      DB_POOL_MAX: ${PIPELINE_DB_POOL_MAX:-24}
     command: ["python", "-m", "pipeline.run_pipeline"]
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:9200/metrics >/dev/null"]
@@ -243,7 +255,10 @@ services:
       RADIUS_UDP_QUEUE_MAX_RECORDS: ${RADIUS_UDP_QUEUE_MAX_RECORDS:-100000}
       RADIUS_UDP_KAFKA_BATCH_RECORDS: ${RADIUS_UDP_KAFKA_BATCH_RECORDS:-250}
       RADIUS_UDP_KAFKA_BATCH_WAIT_MS: ${RADIUS_UDP_KAFKA_BATCH_WAIT_MS:-5}
-      RADIUS_UDP_KAFKA_MAX_INFLIGHT_BATCHES: ${RADIUS_UDP_KAFKA_MAX_INFLIGHT_BATCHES:-32}
+      RADIUS_UDP_KAFKA_MAX_INFLIGHT_BATCHES_PER_WORKER: ${RADIUS_UDP_KAFKA_MAX_INFLIGHT_BATCHES_PER_WORKER:-32}
+      RADIUS_UDP_KAFKA_TOTAL_MAX_INFLIGHT_BATCHES: ${RADIUS_UDP_KAFKA_TOTAL_MAX_INFLIGHT_BATCHES:-64}
+      RADIUS_UDP_PUBLISHER_WORKERS: ${RADIUS_UDP_PUBLISHER_WORKERS:-4}
+      INGESTION_METRICS_PORT: ${INGESTION_METRICS_PORT:-9201}
       RADIUS_ACK_CACHE_MAX_RECORDS: ${RADIUS_ACK_CACHE_MAX_RECORDS:-500000}
       RADIUS_ACK_CACHE_TTL_SECONDS: ${RADIUS_ACK_CACHE_TTL_SECONDS:-120}
     command: ["python", "-m", "pipeline.ingestion.producer", "--udp", "--port", "1813"]
@@ -263,9 +278,10 @@ services:
     networks: [camara-network]
     environment:
       <<: *pipeline-environment
-      DISPATCHER_BATCH_SIZE: "50"
-      DISPATCHER_POLL_INTERVAL: "2"
-      DISPATCHER_MAX_ATTEMPTS: "5"
+      DISPATCHER_BATCH_SIZE: ${DISPATCHER_BATCH_SIZE:-50}
+      DISPATCHER_POLL_INTERVAL: ${DISPATCHER_POLL_INTERVAL:-2.0}
+      DISPATCHER_MAX_ATTEMPTS: ${DISPATCHER_MAX_ATTEMPTS:-5}
+      WEBHOOK_SIGNING_SECRET: ${WEBHOOK_SIGNING_SECRET:-camara_webhook_hmac_secret_key}
     command: ["python", "-m", "pipeline.dispatcher.notification_dispatcher"]
     mem_limit: ${DISPATCHER_MEM_LIMIT:-256m}
 
@@ -279,6 +295,7 @@ services:
       - "127.0.0.1:9090:9090"
     volumes:
       - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infra/prometheus/alert.rules.yml:/etc/prometheus/alert.rules.yml:ro
     mem_limit: ${PROMETHEUS_MEM_LIMIT:-256m}
 
   grafana:

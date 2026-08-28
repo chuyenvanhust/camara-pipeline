@@ -109,34 +109,40 @@ class DatabasePool:
         new_column: str,
         records: Sequence[HistoryRecord],
     ) -> None:
-        if records:
-            await connection.executemany(
-                f"""
-                INSERT INTO {table}(
-                    event_id, source_topic, source_partition, source_offset,
-                    msisdn, {old_column}, {new_column}, changed_at
-                ) VALUES($1,$2,$3,$4,$5,$6,$7,$8)
-                ON CONFLICT(event_id) DO NOTHING
-                """,
-                records,
+        if not records:
+            return
+        columns = list(zip(*records))
+        query = f"""
+            INSERT INTO {table}(
+                event_id, source_topic, source_partition, source_offset,
+                msisdn, {old_column}, {new_column}, changed_at
             )
+            SELECT event_id, topic, partition, offset_val, msisdn, old_val, new_val, changed_at
+            FROM UNNEST(
+                $1::text[], $2::text[], $3::int[], $4::bigint[],
+                $5::text[], $6::text[], $7::text[], $8::timestamptz[]
+            ) incoming(event_id, topic, partition, offset_val, msisdn, old_val, new_val, changed_at)
+            ON CONFLICT(event_id) DO NOTHING
+        """
+        await connection.execute(query, *(list(c) for c in columns))
 
     @staticmethod
     async def _insert_audit(
         connection: asyncpg.Connection, records: Sequence[AuditRecord]
     ) -> None:
-        if records:
-            await connection.executemany(
-                """
-                INSERT INTO audit_log(event_id,event_type,msisdn,details,event_time)
-                VALUES(
-                    $1::text,$2::varchar(32),$3::varchar(16),
-                    $4::jsonb,$5::timestamptz
-                )
-                ON CONFLICT(event_id,event_type) DO NOTHING
-                """,
-                records,
-            )
+        if not records:
+            return
+        columns = list(zip(*records))
+        query = """
+            INSERT INTO audit_log(event_id, event_type, msisdn, details, event_time)
+            SELECT event_id, event_type, msisdn, details::jsonb, event_time
+            FROM UNNEST(
+                $1::text[], $2::varchar(32)[], $3::varchar(16)[],
+                $4::text[], $5::timestamptz[]
+            ) incoming(event_id, event_type, msisdn, details, event_time)
+            ON CONFLICT(event_id, event_type) DO NOTHING
+        """
+        await connection.execute(query, *(list(c) for c in columns))
 
     @staticmethod
     async def _insert_outbox(
@@ -144,22 +150,25 @@ class DatabasePool:
     ) -> None:
         if not events:
             return
-        await connection.executemany(
-            """
+        columns = list(zip(*events))
+        query = """
             INSERT INTO notification_log(
                 event_id, subscription_id, event_type, payload, status,
                 attempts, next_retry_at
             )
-            SELECT $1::text, subscription_id, $2::varchar(32),
-                   $4::jsonb, 'PENDING', 0, NOW()
-            FROM subscription
-            WHERE (msisdn=$3::varchar(16) OR msisdn IS NULL)
-              AND event_type=$2::varchar(32) AND status='ACTIVE'
-              AND (expires_at IS NULL OR expires_at > NOW())
+            SELECT incoming.event_id, sub.subscription_id, incoming.event_type,
+                   incoming.payload::jsonb, 'PENDING', 0, NOW()
+            FROM UNNEST(
+                $1::text[], $2::varchar(32)[], $3::varchar(16)[], $4::text[]
+            ) incoming(event_id, event_type, msisdn, payload)
+            JOIN subscription sub
+              ON (sub.msisdn = incoming.msisdn OR sub.msisdn IS NULL)
+             AND sub.event_type = incoming.event_type
+             AND sub.status = 'ACTIVE'
+             AND (sub.expires_at IS NULL OR sub.expires_at > NOW())
             ON CONFLICT(event_id, subscription_id) DO NOTHING
-            """,
-            events,
-        )
+        """
+        await connection.execute(query, *(list(c) for c in columns))
 
     async def _persist_swap_batch(
         self,

@@ -1,6 +1,7 @@
 # pipeline/modules/shared/metrics.py
 import asyncio
 import logging
+import random
 from typing import Dict
 
 logger = logging.getLogger(__name__)
@@ -129,13 +130,27 @@ class ModuleMetrics:
         if _STAGE_LATENCY is not None:
             _STAGE_LATENCY.labels(group_id=self.name, stage=stage).observe(seconds)
 
-    def observe_e2e_lag(self, avg_ms: float, max_ms: float, count: int = 1) -> None:
-        """Đo độ trễ bản tin từ lúc vào pipeline (ingest_timestamp) đến khi ghi DB/Redis."""
-        self.e2e_lag_sum_ms += avg_ms * count
+    def observe_e2e_lag(self, lags_ms: list[float]) -> None:
+        """
+        Đo độ trễ bản tin từng gói tin từ lúc vào pipeline (ingest_timestamp) đến khi ghi DB/Redis.
+        Tích lũy 100% sum/count/max cho log nội bộ, đồng thời sample 10% cho Prometheus Histogram
+        để triệt tiêu CPU overhead tại tải cao (45.000 records/s).
+        """
+        if not lags_ms:
+            return
+        sum_ms = sum(lags_ms)
+        count = len(lags_ms)
+        max_ms = max(lags_ms)
+        self.e2e_lag_sum_ms += sum_ms
         self.e2e_lag_count += count
         self.e2e_lag_max_ms = max(self.e2e_lag_max_ms, max_ms)
         if _E2E_LATENCY is not None:
-            _E2E_LATENCY.labels(group_id=self.name).observe(avg_ms / 1000.0)
+            lbl = _E2E_LATENCY.labels(group_id=self.name)
+            # Random sampling 10% of records to prevent position-in-batch bias
+            sample_size = max(1, count // 10)
+            sampled = random.sample(lags_ms, min(count, sample_size))
+            for lag in sampled:
+                lbl.observe(lag / 1000.0)
 
     def set_kafka_lag(self, records: int) -> None:
         self.kafka_lag = max(0, records)

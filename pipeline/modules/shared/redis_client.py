@@ -19,6 +19,7 @@ def _sentinel_nodes(raw: str) -> list[tuple[str, int]]:
 
 def create_redis_client(**overrides: Any) -> aioredis.Redis:
     """Create a direct Redis client or a Sentinel-discovered master client."""
+    password = os.getenv("REDIS_PASSWORD", "").strip() or None
     options: dict[str, Any] = {
         "db": int(os.getenv("REDIS_DB", "0")),
         "decode_responses": True,
@@ -26,6 +27,8 @@ def create_redis_client(**overrides: Any) -> aioredis.Redis:
         "socket_timeout": 5,
         "health_check_interval": 15,
     }
+    if password is not None:
+        options["password"] = password
     options.update(overrides)
     sentinels = os.getenv("REDIS_SENTINELS", "").strip()
     if sentinels:
@@ -33,6 +36,7 @@ def create_redis_client(**overrides: Any) -> aioredis.Redis:
             _sentinel_nodes(sentinels),
             socket_connect_timeout=options["socket_connect_timeout"],
             socket_timeout=options["socket_timeout"],
+            password=password,
         )
         return sentinel.master_for(
             os.getenv("REDIS_MASTER_NAME", "camara-master"),

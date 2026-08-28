@@ -1,0 +1,39 @@
+# infra/prometheus/alert.rules.yml
+groups:
+  - name: camara_pipeline_alerts
+    rules:
+      - alert: HighKafkaLag
+        expr: pipeline_kafka_lag_records > 1000
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka Consumer Lag high for group {{ $labels.group_id }}"
+          description: "Kafka Consumer group {{ $labels.group_id }} member {{ $labels.member }} has accumulated {{ $value }} unconsumed records."
+
+      - alert: CriticalKafkaLag
+        expr: pipeline_kafka_lag_records > 10000
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "CRITICAL Kafka Consumer Lag for group {{ $labels.group_id }}"
+          description: "Kafka Consumer group {{ $labels.group_id }} is severely falling behind with {{ $value }} unconsumed records."
+
+      - alert: HighDataLoss
+        expr: rate(pipeline_batch_errors_total[2m]) > 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Data loss / errors detected in pipeline {{ $labels.group_id }}"
+          description: "Pipeline group {{ $labels.group_id }} experienced {{ $value }} processing errors per second."
+
+      - alert: HighEndToEndLatency
+        expr: histogram_quantile(0.95, sum(rate(pipeline_e2e_message_lag_seconds_bucket[5m])) by (le, group_id)) > 1.0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High End-to-End Packet Processing Latency in {{ $labels.group_id }}"
+          description: "95th percentile E2E packet processing lag for {{ $labels.group_id }} exceeded 1.0 second (current: {{ $value }}s)."

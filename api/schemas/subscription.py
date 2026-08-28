@@ -4,9 +4,10 @@ from datetime import datetime
 from enum import Enum
 from uuid import UUID
 
-from pydantic import AnyHttpUrl, BaseModel, Field, model_validator
+from pydantic import AnyHttpUrl, BaseModel, Field, field_validator, model_validator
 
 from api.schemas.common import PhoneNumber
+from pipeline.dispatcher.ssrf_protection import SSRFValidationError, validate_webhook_url
 
 
 class SubscriptionEventType(str, Enum):
@@ -29,6 +30,16 @@ class SubscriptionCreate(BaseModel):
     callbackUrl: AnyHttpUrl
     expiresAt: datetime | None = None
 
+    @field_validator("callbackUrl")
+    @classmethod
+    def validate_ssrf(cls, value: AnyHttpUrl) -> AnyHttpUrl:
+        url_str = str(value)
+        try:
+            validate_webhook_url(url_str)
+        except SSRFValidationError as exc:
+            raise ValueError(f"SSRF validation failed: {exc}") from exc
+        return value
+
     @model_validator(mode="after")
     def require_timezone(self) -> "SubscriptionCreate":
         if self.expiresAt is not None and self.expiresAt.tzinfo is None:
@@ -40,6 +51,18 @@ class SubscriptionUpdate(BaseModel):
     callbackUrl: AnyHttpUrl | None = None
     status: SubscriptionStatus | None = None
     expiresAt: datetime | None = None
+
+    @field_validator("callbackUrl")
+    @classmethod
+    def validate_ssrf(cls, value: AnyHttpUrl | None) -> AnyHttpUrl | None:
+        if value is None:
+            return value
+        url_str = str(value)
+        try:
+            validate_webhook_url(url_str)
+        except SSRFValidationError as exc:
+            raise ValueError(f"SSRF validation failed: {exc}") from exc
+        return value
 
     @model_validator(mode="after")
     def require_change(self) -> "SubscriptionUpdate":
