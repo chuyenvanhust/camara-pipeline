@@ -8,8 +8,23 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
+cd "$ROOT_DIR"
 
-set -a; [ -f "$ROOT_DIR/.env" ] && source "$ROOT_DIR/.env"; set +a
+PROFILE_ENV="${1:-${CAMARA_ENV_PROFILE:-}}"
+COMPOSE_ENV_ARGS=(--env-file .env)
+if [ -n "$PROFILE_ENV" ]; then
+    if [ ! -f "$PROFILE_ENV" ]; then
+        echo "[ERROR] Hardware profile not found: $PROFILE_ENV" >&2
+        exit 2
+    fi
+    COMPOSE_ENV_ARGS+=(--env-file "$PROFILE_ENV")
+fi
+dc() { docker compose "${COMPOSE_ENV_ARGS[@]}" "$@"; }
+
+# Profile được source sau .env để các giá trị partition/resource override có
+# cùng thứ tự ưu tiên với scripts/run_pipeline.sh và Docker Compose.
+set -a; [ -f .env ] && source .env; set +a
+set -a; [ -n "$PROFILE_ENV" ] && source "$PROFILE_ENV"; set +a
 
 # F-PARALLEL: đồng bộ đúng tên biến với docker-compose.yml/.env.example
 KAFKA_TOPIC_RAW="${KAFKA_TOPIC_RAW:-radius.accounting.raw}"
@@ -22,6 +37,7 @@ REDIS_PASSWORD="${REDIS_PASSWORD:-camara_redis_dev_secret}"
 
 echo "=================================================="
 echo ">>> CẢNH BÁO: Sắp reset toàn bộ state pipeline"
+echo "    - Profile     : ${PROFILE_ENV:-.env (default)}"
 echo "    - Kafka topic : $KAFKA_TOPIC_RAW (xóa + tạo lại $KAFKA_PARTITIONS partitions)"
 echo "    - Postgres    : truncate sim_swap_history, device_swap_history,"
 echo "                    msisdn_sim, msisdn_device, audit_log"
@@ -41,7 +57,7 @@ trap 'rm -rf -- "$RESET_TMP_DIR"' EXIT
 # pipeline chạy, Kafka auto-create/client ensure-topic có thể tạo lại topic ngay
 # giữa lúc script đang chờ xóa và gây vòng lặp "Topic already exists".
 echo ">>> Dừng producer/consumer để khóa luồng ghi Kafka..."
-docker compose stop pipeline-ip-msisdn pipeline-device-swap pipeline-sim-swap radius-ingestion notification-dispatcher >/dev/null 2>&1 || true
+dc stop pipeline-ip-msisdn pipeline-device-swap pipeline-sim-swap radius-ingestion notification-dispatcher >/dev/null 2>&1 || true
 echo "[OK] Producer/consumer đã dừng"
 
 if ! docker exec camara-kafka kafka-broker-api-versions \
@@ -141,5 +157,9 @@ echo "[OK] Redis đã được flush và xác nhận dbsize=0"
 
 echo "=================================================="
 echo ">>> Reset hoàn tất. Producer/consumer đang dừng."
-echo ">>> Khởi động lại bằng: bash scripts/run_pipeline.sh"
+if [ -n "$PROFILE_ENV" ]; then
+    echo ">>> Khởi động lại bằng: bash scripts/run_pipeline.sh $PROFILE_ENV"
+else
+    echo ">>> Khởi động lại bằng: bash scripts/run_pipeline.sh"
+fi
 echo "=================================================="

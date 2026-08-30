@@ -66,7 +66,7 @@ flowchart TD
     SENDER -->|UDP/1813| PKTREADER
 
     PKTREADER --> PRODUCER
-    PRODUCER -->|Produce acks=all| TOPIC
+    PRODUCER -->|Produce acks=1; capture durable| TOPIC
     PRODUCER -.->|Malformed Msg| DLQ
 
     TOPIC --> SVC1
@@ -106,7 +106,7 @@ sequenceDiagram
     Note over NAS,ING: Passive mirror ingestion
     NAS->>ING: UDP Accounting-Request (Code=4, Authenticator, AVPs)
     ING->>ING: Decode, validate và đưa vào bounded RAM queue
-    ING->>KFK: Batch Produce (key=MSISDN, acks=all)
+    ING->>KFK: Batch Produce (key=MSISDN, acks=1)
     KFK-->>ING: Xác nhận ghi nội bộ Kafka
 
     Note over KFK,PGS: Giai đoạn Xử lý sự kiện (Parallel Consumers)
@@ -169,7 +169,7 @@ sequenceDiagram
 4. **Passive Mirror Ingestion & Bounded Buffer**:
    - Capture server ngoài repo chịu trách nhiệm bền vững và RADIUS ACK/response; ingestion chỉ nhận mirror một chiều.
    - Queue RAM có giới hạn hấp thụ burst ngắn. Queue đầy hoặc Kafka publish lỗi được tính là `data_loss` và phải cảnh báo để replay từ capture server.
-   - Kafka `acks=all` và idempotent producer chỉ bảo vệ chặng nội bộ ingestion → Kafka.
+   - Profile mặc định dùng Kafka `acks=1`, không idempotence, vì capture ngoài repo chịu durability/replay. Có thể đổi sang `acks=all` + idempotence nếu hợp đồng nguồn thay đổi, nhưng phải hạ admission limit và đo lại p95.
 
 5. **Manual Offset Commit & Dead Letter Queue (DLQ)**:
    - Tắt hoàn toàn `enable_auto_commit`. Offset chỉ được commit sau khi batch đã ghi thành công vào DB.
@@ -270,30 +270,51 @@ Nó không nhận response, không retry và không dùng để chứng minh đ�
 |---|---|---|
 | `KAFKA_BOOTSTRAP_SERVERS` | `camara-kafka:9092,camara-kafka-2:9092,camara-kafka-3:9092` | Danh sách địa chỉ Kafka Cluster Brokers |
 | `KAFKA_TOPIC_RAW` | `radius.accounting.raw` | Tên topic Kafka chứa log thô |
-| `KAFKA_TOPIC_PARTITIONS` | `16` | Số partition của topic (tối ưu xử lý song song 15k+ rec/s) |
+| `KAFKA_TOPIC_PARTITIONS` | `9` | Số partition của profile 12 vCPU/8 GiB; phải chia hết hợp lý cho số consumer |
 | `PIPELINE_GROUPS` | `""` (All) | Chọn consumer group cho tiến trình (`ip-msisdn`, `device-swap`, `sim-swap`) |
-| `CONSUMERS_PER_GROUP` | `4` | Số member/worker chạy song song trong mỗi Consumer Group |
-| `PROCESSING_PARTITION_CONCURRENCY` | `2` | Số shard partition gom xử lý song song trong mỗi consumer |
-| `BATCH_MAX_RECORDS` | `4000` | Số lượng bản ghi tối đa lấy trong một lần poll Kafka |
-| `BATCH_TIMEOUT_MS` | `10` | Thời gian tối đa chờ gom đủ batch (ms) |
+| `*_CONSUMERS_PER_GROUP` | `3` | Số member của từng group; cấu hình riêng cho IP, device-swap và sim-swap |
+| `*_PARTITION_CONCURRENCY` | `3` | Ba partition/member chạy đồng thời; cùng MSISDN vẫn giữ FIFO trong một partition |
+| `*_PARTITION_QUEUE_RECORDS` | IP=`64`, Swap=`96` | Queue cục bộ tối đa bốn batch; Kafka giữ durable backlog |
+| `*_BATCH_MAX_RECORDS` | IP=`16`, Swap=`24` | Micro-batch latency-first giữ transaction trong ngân sách p95 |
+| `*_BATCH_TIMEOUT_MS` | `1` | Thời gian gom batch tối đa |
+| `PROCESSING_PARTITION_QUEUE_*` | `75%/25%`, `7ms/3ms` | Backpressure theo cả depth và tuổi record |
+| `PROCESSING_COMMIT_INTERVAL_MS` / `MAX_RECORDS` | `5` / `256` | Coalesce commit offset ngoài critical path |
 | `DATABASE_URL` | `postgresql://postgres:camara@camara-postgres:5432/camara_db` | Connection string PostgreSQL (`synchronous_commit=on` đảm bảo 100% ACID) |
 | `IP_MSISDN_DB_POOL_MAX` / `DEVICE_SWAP...` / `SIM_SWAP...` | `12` / `8` / `8` | Connection Pool `asyncpg` tối đa phân chia theo từng service (PostgreSQL `max_connections=200`) |
-| `POSTGRES_CPUS` | `4` | Số core CPU cấp cho PostgreSQL container |
+| `POSTGRES_CPUS` | `1.5` | CPU PostgreSQL trong profile 12 vCPU/8 GiB |
 | `REDIS_HOST` / `REDIS_PORT` | `camara-redis` / `6379` | Thông tin kết nối Redis Standalone / Cluster |
 | `RADIUS_SHARED_SECRET` | `camara-radius-dev-secret` | Secret key tính Authenticator RFC 2866 |
 | `RADIUS_UDP_RECEIVE_BUFFER_BYTES` | `33554432` (32MB) | Kích thước socket buffer nhận UDP |
-| `RADIUS_UDP_QUEUE_MAX_RECORDS` | `300000` | Burst buffer RAM trước Kafka; không thay thế durable storage |
-| `RADIUS_UDP_KAFKA_BATCH_RECORDS` | `500` | Kích thước tối đa của micro-batch UDP Ingestion |
-| `RADIUS_UDP_KAFKA_BATCH_WAIT_MS` | `5` | Thời gian gom batch Kafka của Ingestion (ms) |
-| `RADIUS_UDP_KAFKA_MAX_INFLIGHT_BATCHES_PER_WORKER` | `4` | Số lượng batch Kafka đang ghi song song cho mỗi worker |
+| `RADIUS_UDP_QUEUE_MAX_RECORDS` | `20000` | Burst buffer profile 8 GiB; capture mới là nguồn bền vững |
+| `RADIUS_UDP_KAFKA_BATCH_RECORDS` | `64` | Kích thước tối đa của micro-batch UDP Ingestion |
+| `RADIUS_UDP_KAFKA_BATCH_WAIT_MS` | `1` | Thời gian gom batch Kafka của Ingestion (ms) |
+| `RADIUS_UDP_KAFKA_MAX_INFLIGHT_BATCHES_PER_WORKER` | `4` | Số lượng batch Kafka baseline cho mỗi worker |
 | `RADIUS_UDP_KAFKA_PRESSURE_INFLIGHT_BATCHES_PER_WORKER` | `6` | Trần tạm thời khi queue shard vượt ngưỡng pressure |
-| `RADIUS_UDP_KAFKA_PRESSURE_QUEUE_RATIO` | `0.5` | Tỷ lệ queue kích hoạt concurrency tăng cường |
+| `RADIUS_UDP_KAFKA_PRESSURE_QUEUE_RATIO` | `0.25` | Tỷ lệ queue kích hoạt concurrency tăng cường |
 | `RADIUS_UDP_KAFKA_PRODUCERS` | `4` | Số Kafka producer độc lập; worker được ánh xạ cố định để giữ thứ tự theo MSISDN |
 | `RADIUS_UDP_KAFKA_TOTAL_MAX_INFLIGHT_BATCHES` | `24` | Trần tuyệt đối batch Kafka đang ghi trên toàn process |
+| `INGESTION_KAFKA_ACKS` / `INGESTION_ENABLE_IDEMPOTENCE` | `1` / `false` | Latency-first vì capture ngoài repo chịu durability/replay |
+| `PIPELINE_RECOMMENDED_SUSTAINED_PPS` | `2900` | Admission ceiling profile 8 GiB để bảo vệ E2E p95 |
 | `RADIUS_UDP_PUBLISHER_WORKERS` | `4` | Số lượng worker coroutines publish song song (Key-sharded per MSISDN) |
 | `INGESTION_METRICS_PORT` | `9201` | Cổng Exporter Prometheus Ingestion (tự động thử 9201-9210 nếu bận) |
 | `DISPATCHER_BATCH_SIZE` | `50` | Số lượng notification claim mỗi vòng lặp của Dispatcher |
 | `METRICS_PORT` | `9200` | Port expose `/metrics` cho Prometheus scraper |
+
+---
+
+### Chọn profile phần cứng
+
+`.env` và `.env.example` là profile 12 vCPU/8 GiB. Các profile lớn hơn chỉ
+override tài nguyên và tham số song song, không chứa secret:
+
+```bash
+bash scripts/run_pipeline.sh config/env/16gb.env
+bash scripts/run_pipeline.sh config/env/32gb.env
+bash scripts/run_pipeline.sh config/env/64gb.env
+```
+
+Xem giả định CPU, ngân sách và lưu ý đổi partition tại
+[`config/env/README.md`](config/env/README.md).
 
 ---
 
@@ -302,7 +323,7 @@ Nó không nhận response, không retry và không dùng để chứng minh đ�
 ### 7.1. Giám sát Telemetry & Split Metrics
 Mỗi `THROUGHPUT_LOG_INTERVAL_SECONDS` (mặc định 10 giây), hệ thống ghi log phân khối trực quan (`|`) cho cả hai chặng:
 - **`[INGESTION]`**: `udp_in`, `kafka_persisted`, throughput `gap`, queue/backlog, batch size, persistence p50/p95/p99, queue residence p95, `worker_slot_wait_p95`, `global_wait_p95` và `data_loss` (`queue_dropped`, `publish_failed`).
-- **`[PROCESSING]`**: Log chi tiết cho từng member: tốc độ nhận/xử lý (`recv`, `success`, `pg`, `rds`), độ trễ xử lý batch (`batch_avg`), độ trễ từng chặng `stage(state, pg, rds)`, **độ trễ bản tin toàn trình `e2e_lag(max)`** (tính qua float epoch `ingest_epoch_s` siêu tốc), và **định vị lỗi `data_loss` (`err`, `dlq`)**.
+- **`[PROCESSING]`**: Log chi tiết cho từng member: throughput, độ trễ batch/chặng, **E2E `avg/p95/max`**, trạng thái `SLO_BREACH` khi p95 >=100 ms, swap/event và data loss.
 
 ### 7.2. Tính năng Bảo mật An ninh Mạng (Production Security)
 - **CAMARA OAuth2 OIDC Verification**: Xác thực JWT Bearer Token chuẩn (`exp`, `iss`, `aud`) kết hợp API Key fallback.
@@ -327,6 +348,6 @@ Mỗi `THROUGHPUT_LOG_INTERVAL_SECONDS` (mặc định 10 giây), hệ thống g
 
 Dự án đã được tài liệu hóa đầy đủ các giải pháp kiến trúc và thuật toán nâng cao:
 - 🛠️ [**Hướng dẫn Cấu hình & Tối ưu hóa Phần cứng (Hardware Tuning Guide)**](docs/HARDWARE_TUNING_GUIDE.md): Giải thích chi tiết toàn bộ các biến môi trường trong `.env`, quy tắc sizing tài nguyên RAM/CPU, công thức tính toán độ đệm hàng đợi, connection budget PostgreSQL và bảng thông số cấu hình chuẩn cho các môi trường từ Dev/VPS đến Server Production 30k+ pkt/s.
-- 📖 [**Báo cáo Kỹ thuật Chuyên sâu các File Trọng điểm**](docs/BAO_CAO_KY_THUAT_PIPELINE.md): Mô tả giải mã RFC 2866/3GPP VSA, passive mirror ingestion, `SO_REUSEPORT`, key-sharded queues, bounded Kafka inflight, partition sharding, transaction batch, fencing tuple, Lua scripts, E2E lag và Transactional Outbox.
+- 📖 [**Báo cáo Kỹ thuật Chuyên sâu các File Trọng điểm**](docs/BAO_CAO_KY_THUAT_PIPELINE.md): Mô tả giải mã RFC 2866/3GPP VSA, passive mirror ingestion, `SO_REUSEPORT`, key-sharded queues, bounded Kafka inflight, per-partition temporal pipeline, transaction batch, fencing tuple, Lua scripts, E2E lag và Transactional Outbox.
 - 🚀 [**Kế hoạch refactor hiệu năng ingestion**](docs/INGESTION_PERFORMANCE_REFACTOR_PLAN.md): Baseline 15k/s, nguyên nhân throughput/E2E/data loss, thay đổi đã triển khai và tiêu chí benchmark nghiệm thu.
 - 📖 [**Disaster Recovery Runbook & HA Operational Guide**](docs/DISASTER_RECOVERY_RUNBOOK.md): Hướng dẫn vận hành sự cố, sao lưu Point-in-Time Recovery (PITR) và quy trình Failover Kafka/PostgreSQL.

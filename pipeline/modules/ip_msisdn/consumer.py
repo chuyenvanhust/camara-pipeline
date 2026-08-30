@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import logging
 import os
@@ -68,47 +69,72 @@ class IPMsisdnConsumer(BaseKafkaConsumer):
             except InvalidMessageError as exc:
                 await self.send_to_dlq(record, exc)
 
-        stage_started = time.monotonic()
-        await self.db.persist_session_batch(list(session_by_id.values()))
-        self.metrics.observe_stage("postgres", time.monotonic() - stage_started)
-        self.metrics.increment("postgres_records", len(session_by_id))
-        redis_batch = []
+        async def persist_postgres() -> int:
+            """Preserve PostgreSQL ordering while running independently of Redis."""
+            stage_started = time.monotonic()
+            written = len(session_by_id)
+            await self.db.persist_session_batch(list(session_by_id.values()))
+            for _record, status, occurred_at, nas, _framed_ip, _msisdn in operations:
+                if status == "accounting-off":
+                    await self.db.mark_nas_sessions_inactive(nas, occurred_at)
+                    written += 1
+            self.metrics.observe_stage("postgres", time.monotonic() - stage_started)
+            return written
 
-        async def flush_redis_batch() -> None:
-            nonlocal redis_batch
-            if redis_batch:
-                stage_started = time.monotonic()
-                changed = await self.store.apply_batch(redis_batch)
-                self.metrics.observe_stage("redis", time.monotonic() - stage_started)
-                self.metrics.increment("redis_records", changed)
-                redis_batch = []
+        async def persist_redis() -> int:
+            """Preserve Kafka offset order inside Redis while batching round trips."""
+            stage_started = time.monotonic()
+            changed = 0
+            redis_batch: List[Dict[str, Any]] = []
 
-        for record, status, occurred_at, nas, framed_ip, msisdn in operations:
-            if status in {"start", "interim-update"}:
-                redis_batch.append({
-                    "kind": "upsert", "framed_ip": framed_ip, "msisdn": msisdn,
-                    "event_time": occurred_at, "event_id": event_id(record),
-                    "partition": record.partition, "offset": record.offset,
-                    "nas_identifier": nas,
-                })
-            elif status == "stop":
-                redis_batch.append({
-                    "kind": "delete", "framed_ip": framed_ip, "msisdn": msisdn,
-                    "event_time": occurred_at, "partition": record.partition,
-                    "offset": record.offset,
-                })
-            elif status == "accounting-off":
-                await flush_redis_batch()
-                stage_started = time.monotonic()
-                await self.db.mark_nas_sessions_inactive(nas, occurred_at)
-                self.metrics.observe_stage("postgres", time.monotonic() - stage_started)
-                self.metrics.increment("postgres_records")
-                stage_started = time.monotonic()
-                removed = await self.store.accounting_off(nas, occurred_at)
-                self.metrics.observe_stage("redis", time.monotonic() - stage_started)
-                self.metrics.increment("redis_records", removed)
-            self.metrics.increment("events_detected")
-        await flush_redis_batch()
+            async def flush() -> None:
+                nonlocal changed, redis_batch
+                if redis_batch:
+                    changed += await self.store.apply_batch(redis_batch)
+                    redis_batch = []
+
+            for record, status, occurred_at, nas, framed_ip, msisdn in operations:
+                if status in {"start", "interim-update"}:
+                    redis_batch.append({
+                        "kind": "upsert", "framed_ip": framed_ip, "msisdn": msisdn,
+                        "event_time": occurred_at, "event_id": event_id(record),
+                        "partition": record.partition, "offset": record.offset,
+                        "nas_identifier": nas,
+                    })
+                elif status == "stop":
+                    redis_batch.append({
+                        "kind": "delete", "framed_ip": framed_ip, "msisdn": msisdn,
+                        "event_time": occurred_at, "partition": record.partition,
+                        "offset": record.offset,
+                    })
+                elif status == "accounting-off":
+                    await flush()
+                    changed += await self.store.accounting_off(nas, occurred_at)
+            await flush()
+            self.metrics.observe_stage("redis", time.monotonic() - stage_started)
+            return changed
+
+        # PostgreSQL and Redis are independently version-fenced/idempotent. Run both
+        # branches concurrently, but wait for both even when one fails. This prevents
+        # an orphaned write from overlapping the retry. BaseKafkaConsumer commits the
+        # Kafka offsets only after this method has completed successfully.
+        persistence_started = time.monotonic()
+        postgres_result, redis_result = await asyncio.gather(
+            persist_postgres(), persist_redis(), return_exceptions=True
+        )
+        self.metrics.observe_stage("persistence", time.monotonic() - persistence_started)
+        failures = [
+            result for result in (postgres_result, redis_result)
+            if isinstance(result, BaseException)
+        ]
+        if failures:
+            raise failures[0]
+
+        assert isinstance(postgres_result, int)
+        assert isinstance(redis_result, int)
+        self.metrics.increment("postgres_records", postgres_result)
+        self.metrics.increment("redis_records", redis_result)
+        self.metrics.increment("events_detected", len(operations))
         self.metrics.increment("success", len(operations))
 
 

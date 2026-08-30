@@ -69,7 +69,7 @@ docker compose up -d
 - **Hiện tượng**: Alert `HighKafkaLag` kích hoạt trên Prometheus.
 - **Xử lý**: 
   1. Kiểm tra tài nguyên CPU/RAM của PostgreSQL & Redis: `docker stats pipeline-ip-msisdn pipeline-device-swap pipeline-sim-swap`.
-  2. Tăng số lượng Consumer Workers per group: `CONSUMERS_PER_GROUP=8`.
+  2. Tăng số consumer của workload đang lag, ví dụ `IP_MSISDN_CONSUMERS_PER_GROUP=8`; không tăng đồng loạt ba group nếu bottleneck chỉ nằm ở IP-MSISDN.
   3. Restart service có lag cao nhất (ví dụ `pipeline-ip-msisdn`):
      ```bash
      docker compose restart pipeline-ip-msisdn

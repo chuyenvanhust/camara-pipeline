@@ -95,8 +95,10 @@ classDiagram
 ### 2.1. `BaseKafkaConsumer` (`base_consumer.py`)
 Lớp cơ sở trừu tượng cho tất cả các consumer trong hệ thống:
 - **Vòng lặp tiêu thụ (`run()`)**: Sử dụng `AIOKafkaConsumer.getmany()` gom tối đa `BATCH_MAX_RECORDS` hoặc chờ `BATCH_TIMEOUT_MS`.
-- **Partition Concurrency & Sharding**: Phân chia các partitions nhận được thành `PROCESSING_PARTITION_CONCURRENCY` shards chạy song song (`asyncio.gather`), đảm bảo thứ tự offset trong từng partition luôn tuần tự.
-- **Manual Offset Commit**: Chỉ commit offset sau khi xử lý thành công batch hoặc sau khi đẩy dữ liệu lỗi vào DLQ (`enable_auto_commit=False`).
+- **Per-partition temporal pipeline**: `getmany()` đưa record vào FIFO riêng; mỗi partition có một mutating worker, còn các partition độc lập chạy song song tới `PROCESSING_PARTITION_CONCURRENCY`.
+- **Batch coalescing**: Worker ghép fragment cùng partition tới `BATCH_MAX_RECORDS`; mặc định IP=16 và Swap=24 để giữ ngân sách p95.
+- **Age-aware backpressure**: `pause()` khi FIFO đạt 75% hoặc record cũ nhất chờ 7ms; `resume()` tại 25% và 3ms. Partition nhanh không bị partition chậm chặn.
+- **Coalesced Manual Offset Commit**: Sau batch thành công (`enable_auto_commit=False`), worker công bố offset cho coordinator. Coordinator commit nhiều partition mỗi 5ms/256 record, tách Kafka RTT khỏi critical path. Khi rebalance/crash, cửa sổ chưa commit được phát lại và store xử lý idempotent/version-fenced.
 - **Dead Letter Queue (DLQ)**: Khi một record hoặc batch bị lỗi cấu trúc dữ liệu nghiêm trọng vượt quá `MAX_BATCH_RETRIES` (mặc định 3 lần), toàn bộ thông tin nguồn (topic, partition, offset, error_type, payload) được đẩy vào `<topic>.dlq`.
 
 ### 2.2. `DatabasePool` (`db.py`)
@@ -108,7 +110,7 @@ Lớp bọc `asyncpg.Pool` tối ưu hoá hiệu năng cho PostgreSQL:
   2. `_insert_history`: Ghi nhật ký lịch sử đổi SIM/thiết bị (`sim_swap_history`, `device_swap_history`).
   3. `_insert_audit`: Ghi vết kiểm toán hệ thống (`audit_log`).
   4. `_insert_outbox`: Ghi thông báo chờ gửi (`notification_log`) cho các subscription đang hoạt động.
-- **Session State Tracking (`persist_session_batch`)**: Cập nhật trạng thái phiên RADIUS Accounting vào bảng `radius_session_state` với cơ chế chống ghi đè phiên bản cũ.
+- **Session State Tracking (`persist_session_batch`)**: Cập nhật `radius_session_state` với version fence; shared/exclusive row lock trên `radius_nas_off_watermark` ngăn Start cũ chạy khác partition hồi sinh state sau Accounting-Off mà không tuần tự hóa các Start thông thường.
 
 ### 2.3. `ModuleMetrics` (`metrics.py`)
 Hệ thống thu thập và xuất dữ liệu đo lường (Telemetry):
@@ -116,13 +118,15 @@ Hệ thống thu thập và xuất dữ liệu đo lường (Telemetry):
   - `pipeline_batch_processed_total` (Counter)
   - `pipeline_events_detected_total` (Counter)
   - `pipeline_batch_errors_total` (Counter)
+  - `pipeline_partition_queue_records`, `pipeline_partition_queue_oldest_seconds`, `pipeline_partition_workers`, `pipeline_partitions_paused` (Gauge)
+  - `pipeline_offset_commit_latency_seconds`, `pipeline_offset_commit_pending_records`, `pipeline_offset_commit_records_total`, `pipeline_offset_commit_errors_total`
   - `pipeline_batch_latency_seconds` (Histogram)
   - `pipeline_stage_latency_seconds` (Histogram theo stage: state, postgres, redis)
   - `pipeline_kafka_lag_records` (Gauge theo từng member)
   - `pipeline_e2e_message_lag_seconds` (Histogram đo độ trễ từ lúc gói tin vào Ingestion đến khi hoàn tất ghi DB/Redis)
 - **Sliding-Window Structured Logger**: Định kỳ in ra log phân khối trực quan (`|`), theo dõi riêng biệt:
   - Throughput (`recv`, `success`, `pg`, `rds`)
-  - Latency (`batch_avg`, `stage(state, pg, rds)`, `e2e_lag(max)`)
+  - Latency (`batch_avg`, `stage(state, pg, rds, persist_parallel)`, `e2e_avg/p95/max`)
   - Sự kiện Swap (`events_detected(+delta)`, `ignored`)
   - **Giám sát thất thoát (`data_loss = errors + dlq`)**
   - Số liệu tích lũy (`Totals`).

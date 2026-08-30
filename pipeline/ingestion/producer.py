@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import os
 import signal
 import time
@@ -23,9 +24,9 @@ KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "camara-kafka:909
 KAFKA_TOPIC_RAW = os.getenv("KAFKA_TOPIC_RAW", "radius.accounting.raw")
 FLUSH_EVERY_N_RECORDS = int(os.getenv("INGESTION_FLUSH_EVERY_N_RECORDS", "1000"))
 THROUGHPUT_LOG_INTERVAL_SECONDS = float(os.getenv("THROUGHPUT_LOG_INTERVAL_SECONDS", "10"))
-UDP_QUEUE_MAX_RECORDS = int(os.getenv("RADIUS_UDP_QUEUE_MAX_RECORDS", "300000"))
-UDP_KAFKA_BATCH_RECORDS = int(os.getenv("RADIUS_UDP_KAFKA_BATCH_RECORDS", "500"))
-UDP_KAFKA_BATCH_WAIT_MS = int(os.getenv("RADIUS_UDP_KAFKA_BATCH_WAIT_MS", "5"))
+UDP_QUEUE_MAX_RECORDS = int(os.getenv("RADIUS_UDP_QUEUE_MAX_RECORDS", "20000"))
+UDP_KAFKA_BATCH_RECORDS = int(os.getenv("RADIUS_UDP_KAFKA_BATCH_RECORDS", "64"))
+UDP_KAFKA_BATCH_WAIT_MS = int(os.getenv("RADIUS_UDP_KAFKA_BATCH_WAIT_MS", "1"))
 UDP_KAFKA_MAX_INFLIGHT_BATCHES_PER_WORKER = int(
     os.getenv("RADIUS_UDP_KAFKA_MAX_INFLIGHT_BATCHES_PER_WORKER",
               os.getenv("RADIUS_UDP_KAFKA_MAX_INFLIGHT_BATCHES", "4"))
@@ -34,12 +35,27 @@ UDP_KAFKA_PRESSURE_INFLIGHT_BATCHES_PER_WORKER = int(
     os.getenv("RADIUS_UDP_KAFKA_PRESSURE_INFLIGHT_BATCHES_PER_WORKER", "6")
 )
 UDP_KAFKA_PRESSURE_QUEUE_RATIO = float(
-    os.getenv("RADIUS_UDP_KAFKA_PRESSURE_QUEUE_RATIO", "0.5")
+    os.getenv("RADIUS_UDP_KAFKA_PRESSURE_QUEUE_RATIO", "0.25")
 )
 UDP_KAFKA_PRODUCERS = int(os.getenv("RADIUS_UDP_KAFKA_PRODUCERS", "4"))
 INGESTION_METRICS_PORT = int(os.getenv("INGESTION_METRICS_PORT", "9201"))
-INGESTION_KAFKA_PERSIST_WARN_MS = float(os.getenv("INGESTION_KAFKA_PERSIST_WARN_MS", "500"))
-INGESTION_QUEUE_WARN_MS = float(os.getenv("INGESTION_QUEUE_WARN_MS", "1000"))
+INGESTION_KAFKA_PERSIST_WARN_MS = float(os.getenv("INGESTION_KAFKA_PERSIST_WARN_MS", "20"))
+INGESTION_QUEUE_WARN_MS = float(os.getenv("INGESTION_QUEUE_WARN_MS", "20"))
+INGESTION_KAFKA_ACKS_RAW = os.getenv("INGESTION_KAFKA_ACKS", "1").strip().lower()
+INGESTION_ENABLE_IDEMPOTENCE = os.getenv(
+    "INGESTION_ENABLE_IDEMPOTENCE", "true" if INGESTION_KAFKA_ACKS_RAW in {"all", "-1"} else "false"
+).strip().lower() in {"1", "true", "yes", "on"}
+SLA_E2E_P95_MS = float(os.getenv("PIPELINE_SLA_E2E_P95_MS", "100"))
+RECOMMENDED_SUSTAINED_PPS = int(os.getenv("PIPELINE_RECOMMENDED_SUSTAINED_PPS", "0"))
+RECOMMENDED_BURST_PPS = int(os.getenv("PIPELINE_RECOMMENDED_BURST_PPS", "0"))
+
+
+def _kafka_acks() -> str | int:
+    if INGESTION_KAFKA_ACKS_RAW in {"all", "-1"}:
+        return "all"
+    if INGESTION_KAFKA_ACKS_RAW == "1":
+        return 1
+    raise ValueError("INGESTION_KAFKA_ACKS must be 'all' or '1'")
 
 
 _PROM_INGESTION_INIT = False
@@ -140,6 +156,9 @@ class RadiusLogProducer:
             < UDP_KAFKA_MAX_INFLIGHT_BATCHES_PER_WORKER
         ):
             raise ValueError("pressure inflight limit must be >= the normal per-worker limit")
+        kafka_acks = _kafka_acks()
+        if INGESTION_ENABLE_IDEMPOTENCE and kafka_acks != "all":
+            raise ValueError("Kafka idempotence requires INGESTION_KAFKA_ACKS=all")
         self.bootstrap_servers = bootstrap_servers or KAFKA_BOOTSTRAP_SERVERS
         self.topic = topic or KAFKA_TOPIC_RAW
         self._producer: AIOKafkaProducer | None = None
@@ -169,7 +188,8 @@ class RadiusLogProducer:
         ordered = sorted(values)
         if not ordered:
             return 0.0
-        return ordered[min(int(len(ordered) * quantile), len(ordered) - 1)]
+        index = min(len(ordered) - 1, max(0, math.ceil(len(ordered) * quantile) - 1))
+        return ordered[index]
 
     def _build_kafka_producer(self) -> AIOKafkaProducer:
         compression = os.getenv("INGESTION_COMPRESSION_TYPE", "lz4").strip().lower()
@@ -178,10 +198,12 @@ class RadiusLogProducer:
             value_serializer=lambda value: json.dumps(value, default=str).encode("utf-8"),
             key_serializer=lambda value: value.encode("utf-8") if value else None,
             max_batch_size=int(os.getenv("INGESTION_BATCH_SIZE_BYTES", str(256 * 1024))),
-            linger_ms=int(os.getenv("INGESTION_LINGER_MS", "5")),
+            linger_ms=int(os.getenv("INGESTION_LINGER_MS", "1")),
             compression_type=None if compression in {"", "none", "null"} else compression,
             max_request_size=int(os.getenv("INGESTION_MAX_REQUEST_SIZE", str(1024 * 1024))),
-            acks="all", enable_idempotence=True, retry_backoff_ms=500,
+            acks=_kafka_acks(),
+            enable_idempotence=INGESTION_ENABLE_IDEMPOTENCE,
+            retry_backoff_ms=int(os.getenv("INGESTION_RETRY_BACKOFF_MS", "100")),
         )
 
     async def start(self, producer_count: int = 1) -> None:
@@ -205,8 +227,8 @@ class RadiusLogProducer:
         self._producer = started[0]
         self._telemetry_task = asyncio.create_task(self._log_throughput(), name="producer-telemetry")
         logger.info(
-            "Kafka producer pool ready producers=%d acks=all idempotence=true",
-            len(self._producers),
+            "Kafka producer pool ready producers=%d acks=%s idempotence=%s",
+            len(self._producers), INGESTION_KAFKA_ACKS_RAW, INGESTION_ENABLE_IDEMPOTENCE,
         )
 
     async def stop(self) -> None:
@@ -262,6 +284,12 @@ class RadiusLogProducer:
                 or queue_p95 > INGESTION_QUEUE_WARN_MS
             ):
                 status = "DEGRADED"
+            if (
+                status == "OK"
+                and RECOMMENDED_SUSTAINED_PPS > 0
+                and input_rate > RECOMMENDED_SUSTAINED_PPS
+            ):
+                status = "ADMISSION_EXCEEDED"
             level = logging.WARNING if status != "OK" else logging.INFO
             if _PROM_QUEUE_DEPTH is not None:
                 _PROM_QUEUE_DEPTH.set(queue_depth)
@@ -272,6 +300,7 @@ class RadiusLogProducer:
                 level,
                 "[INGESTION][%s] window=%.1fs | "
                 "Throughput: udp_in=%.1f/s kafka_persisted=%.1f/s gap=%+.1f/s | "
+                "Admission: sustained<=%d/s burst<=%d/s | "
                 "Queue: depth=%d/%d(%.1f%%) backlog=%.2fs | "
                 "Kafka: batch_avg=%.1frec last=%drec/%.1fms persist(p50=%.1fms p95=%.1fms p99=%.1fms) "
                 "queue_p95=%.1fms worker_slot_wait_p95=%.1fms global_wait_p95=%.1fms | "
@@ -279,6 +308,7 @@ class RadiusLogProducer:
                 "Totals: received=%d, kafka_persisted=%d",
                 status, elapsed,
                 input_rate, kafka_rate, throughput_gap,
+                RECOMMENDED_SUSTAINED_PPS, RECOMMENDED_BURST_PPS,
                 queue_depth, UDP_QUEUE_MAX_RECORDS, queue_percent, backlog_seconds,
                 batch_avg, current["last_batch_records"], current["last_batch_ms"],
                 kafka_p50, kafka_p95, kafka_p99, queue_p95, worker_slot_p95, inflight_p95,
@@ -523,6 +553,11 @@ class RadiusLogProducer:
         _start_ingestion_metrics_server()
         publisher_workers = max(1, int(os.getenv("RADIUS_UDP_PUBLISHER_WORKERS", "4")))
         producer_count = min(UDP_KAFKA_PRODUCERS, publisher_workers)
+        if UDP_KAFKA_PRESSURE_INFLIGHT_BATCHES_PER_WORKER < UDP_KAFKA_MAX_INFLIGHT_BATCHES_PER_WORKER:
+            raise ValueError(
+                "RADIUS_UDP_KAFKA_PRESSURE_INFLIGHT_BATCHES_PER_WORKER must be "
+                ">= RADIUS_UDP_KAFKA_MAX_INFLIGHT_BATCHES_PER_WORKER"
+            )
         if self._producer is None:
             await self.start(producer_count=producer_count)
         if len(self._producers) != producer_count:
@@ -539,6 +574,11 @@ class RadiusLogProducer:
             os.getenv("RADIUS_UDP_KAFKA_TOTAL_MAX_INFLIGHT_BATCHES",
                       str(publisher_workers * UDP_KAFKA_PRESSURE_INFLIGHT_BATCHES_PER_WORKER))
         )
+        if total_inflight_limit < publisher_workers:
+            raise ValueError(
+                "RADIUS_UDP_KAFKA_TOTAL_MAX_INFLIGHT_BATCHES must provide at least "
+                "one slot per publisher worker"
+            )
         self._global_inflight_semaphore = asyncio.Semaphore(total_inflight_limit)
 
         self._packet_reader = PacketReader()
@@ -553,18 +593,29 @@ class RadiusLogProducer:
             for i in range(publisher_workers)
         ]
         shutdown = asyncio.create_task(stop_event.wait(), name="ingestion-shutdown") if stop_event else None
-        total_inflight_capacity = total_inflight_limit * UDP_KAFKA_BATCH_RECORDS
+        baseline_inflight_batches = min(
+            total_inflight_limit,
+            publisher_workers * UDP_KAFKA_MAX_INFLIGHT_BATCHES_PER_WORKER,
+        )
+        pressure_inflight_batches = min(
+            total_inflight_limit,
+            publisher_workers * UDP_KAFKA_PRESSURE_INFLIGHT_BATCHES_PER_WORKER,
+        )
+        baseline_inflight_capacity = baseline_inflight_batches * UDP_KAFKA_BATCH_RECORDS
+        pressure_inflight_capacity = pressure_inflight_batches * UDP_KAFKA_BATCH_RECORDS
         logger.info(
             "UDP ingestion pipeline ready queue_capacity=%d kafka_batch_records=%d "
             "kafka_batch_wait_ms=%d kafka_inflight_per_worker=%d pressure_inflight_per_worker=%d "
             "pressure_queue_ratio=%.2f publisher_workers=%d "
             "kafka_producers=%d total_inflight_limit=%d "
-            "total_inflight_capacity=%d mode=passive-mirror",
+            "inflight_capacity_records=%d pressure_capacity_records=%d mode=passive-mirror "
+            "sla_e2e_p95_ms=%.0f recommended_sustained_pps=%d recommended_burst_pps=%d",
             UDP_QUEUE_MAX_RECORDS, UDP_KAFKA_BATCH_RECORDS, UDP_KAFKA_BATCH_WAIT_MS,
             UDP_KAFKA_MAX_INFLIGHT_BATCHES_PER_WORKER,
             UDP_KAFKA_PRESSURE_INFLIGHT_BATCHES_PER_WORKER,
             UDP_KAFKA_PRESSURE_QUEUE_RATIO, publisher_workers, producer_count,
-            total_inflight_limit, total_inflight_capacity,
+            total_inflight_limit, baseline_inflight_capacity, pressure_inflight_capacity,
+            SLA_E2E_P95_MS, RECOMMENDED_SUSTAINED_PPS, RECOMMENDED_BURST_PPS,
         )
         try:
             watched = (receiver, *publishers, shutdown) if shutdown else (receiver, *publishers)

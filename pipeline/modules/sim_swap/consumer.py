@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -65,15 +66,17 @@ class SimSwapConsumer(BaseKafkaConsumer):
         states_by_msisdn: Dict[str, tuple] = {}
         history, audit, outbox = [], [], []
         cache_updates: Dict[str, str] = {}
+        ignored_count = 0
+        events_count = 0
         for record, msisdn, imsi_new, occurred_at in parsed:
             eid = event_id(record)
             previous = state.get(msisdn)
             version = (occurred_at, record.partition, record.offset)
             if previous and previous.get("last_event_id") == eid:
-                self.metrics.increment("ignored")
+                ignored_count += 1
                 continue
             if previous and version <= (previous["last_event_at"], previous["last_source_partition"], previous["last_source_offset"]):
-                self.metrics.increment("ignored")
+                ignored_count += 1
                 continue
             imsi_old = previous.get("value", previous.get("imsi_current")) if previous else None
             states_by_msisdn[msisdn] = (msisdn, imsi_new, occurred_at, eid, record.partition, record.offset)
@@ -82,24 +85,45 @@ class SimSwapConsumer(BaseKafkaConsumer):
             state[msisdn] = current
             cache_updates[self._cache_key(msisdn)] = json.dumps({**current, "last_event_at": occurred_at.isoformat()})
             if imsi_old is None or imsi_old == imsi_new:
-                self.metrics.increment("ignored")
+                ignored_count += 1
                 continue
             details = json.dumps({"imsi_old": imsi_old, "imsi_new": imsi_new, "last_time_sim_change": occurred_at.isoformat()})
             history.append((eid, record.topic, record.partition, record.offset, msisdn, imsi_old, imsi_new, occurred_at))
             audit.append((eid, "SIM_SWAP", msisdn, details, occurred_at))
             outbox.append((eid, "SIM_SWAP", msisdn, details))
-            self.metrics.increment("events_detected")
+            events_count += 1
 
-        stage_started = time.monotonic()
-        await self.db.persist_sim_batch(list(states_by_msisdn.values()), history, audit, outbox)
-        self.metrics.observe_stage("postgres", time.monotonic() - stage_started)
-        self.metrics.increment("postgres_records", len(states_by_msisdn))
-        if cache_updates:
+        async def persist_postgres() -> None:
+            stage_started = time.monotonic()
+            await self.db.persist_sim_batch(
+                list(states_by_msisdn.values()), history, audit, outbox
+            )
+            self.metrics.observe_stage("postgres", time.monotonic() - stage_started)
+
+        async def persist_redis() -> None:
+            if not cache_updates:
+                return
             assert self.redis is not None
             stage_started = time.monotonic()
             await self.redis.mset(cache_updates)
             self.metrics.observe_stage("redis", time.monotonic() - stage_started)
+
+        persistence_started = time.monotonic()
+        postgres_result, redis_result = await asyncio.gather(
+            persist_postgres(), persist_redis(), return_exceptions=True
+        )
+        self.metrics.observe_stage("persistence", time.monotonic() - persistence_started)
+        failures = [
+            result for result in (postgres_result, redis_result)
+            if isinstance(result, BaseException)
+        ]
+        if failures:
+            raise failures[0]
+        if cache_updates:
             self.metrics.increment("redis_records", len(cache_updates))
+        self.metrics.increment("postgres_records", len(states_by_msisdn))
+        self.metrics.increment("ignored", ignored_count)
+        self.metrics.increment("events_detected", events_count)
         self.metrics.increment("success", len(parsed))
 
 

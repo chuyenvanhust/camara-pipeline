@@ -312,8 +312,15 @@ def send_csv_as_radius(
     for _ in range(num_sockets):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
-        s.connect((host, port))
+        # KHÔNG connect() socket: đây là traffic fire-and-forget thuần UDP.
+        # Nếu connect(), kernel Linux sẽ ánh xạ ICMP Port Unreachable (khi
+        # bên nhận tạm thời không lắng nghe, ví dụ đang restart/rebuild)
+        # thành ConnectionRefusedError trên lần send() KẾ TIẾP — làm crash
+        # cả tool dù chỉ là gián đoạn tạm thời phía nhận. Dùng sendto() với
+        # socket chưa connect() tránh hoàn toàn lớp lỗi này, đúng ngữ nghĩa
+        # UDP "gửi thì gửi, không quan tâm ai đang nghe".
         sockets.append(s)
+    dest_addr = (host, port)
     _sock_idx = 0
     per_socket_identifiers = [0] * num_sockets
     secret_bytes = _secret_bytes(secret)
@@ -423,10 +430,21 @@ def send_csv_as_radius(
                 per_socket_identifiers[socket_idx] = (identifier + 1) & 0xFF
                 packet = _patch_packet_identifier(raw_packet, identifier, secret_bytes)
                 try:
-                    sockets[socket_idx].send(packet)
-                except OSError:
+                    sockets[socket_idx].sendto(packet, dest_addr)
+                except OSError as exc:
+                    # Không connect()/raise chết cả tool chỉ vì bên nhận tạm
+                    # thời chưa sẵn sàng (ICMP Port Unreachable trên socket
+                    # đã connect() khi radius-ingestion đang restart/rebuild).
+                    # Đây là fire-and-forget mirror traffic — mất vài gói lúc
+                    # bên nhận chưa lên là chấp nhận được, sập cả tool thì không.
                     counters["send_failed"] += 1
-                    raise
+                    failed = counters["send_failed"]
+                    if failed <= 5 or failed % 1000 == 0:
+                        logger.warning(
+                            "Gửi gói thất bại (bên nhận có thể đang restart): %s send_failed_total=%d",
+                            exc, failed,
+                        )
+                    continue
                 total_sent += 1
 
             now = time.perf_counter()

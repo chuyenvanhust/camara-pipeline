@@ -12,7 +12,7 @@ flowchart TD
         UDP["UDP Listener (Port 1813)<br/>PacketReader"]
         CSVPROD["CSV File Reader<br/>LocalCSVReader"]
         QUEUE[("Bounded Ingestion Queue<br/>asyncio.Queue (RAM)")]
-        KPROD["Kafka Async Producer<br/>(Batching + acks=all)"]
+        KPROD["Kafka Async Producer<br/>(micro-batch + acks=1)"]
         
         UDP -->|Decode RFC 2866| QUEUE
         CSVPROD -->|Read records| QUEUE
@@ -217,9 +217,14 @@ classDiagram
 3. **Phân Chia Connection Pool Bất Đồng Bộ (`DatabasePool`)**:
    - Mỗi worker tiến trình sở hữu connection pool riêng biệt với dung lượng tối ưu (IP-MSISDN: max 12, Device Swap: max 8, SIM Swap: max 8) để tránh tranh chấp connection socket.
 4. **Mô hình Multi-Member Consumer Group**:
-   - Cấu hình `CONSUMERS_PER_GROUP` (mặc định = 4). Mỗi worker khởi tạo 4 member instances chạy song song. Kafka Broker tự động rebalance phân chia 16 partitions cho các members.
-5. **Xử lý Partition-Sharding trong Consumer**:
-   - Trong mỗi lần `getmany()`, các partitions nhận được gom thành `PROCESSING_PARTITION_CONCURRENCY` shards (mặc định = 2) chạy song song (`asyncio.gather`), giữ trật tự offset trong từng partition.
+   - Mỗi container nhận `CONSUMERS_PER_GROUP` riêng từ Compose. Profile 8 GiB dùng 3 member; Kafka rebalance 9 partition thành 3 partition/member.
+5. **Temporal pipeline theo Kafka partition**:
+   - `getmany()` chỉ làm nhiệm vụ fetch và phân phối record vào FIFO riêng của từng partition; không còn gom nhiều partition thành một shard hay chờ `gather()` toàn member.
+   - Mỗi partition có đúng một mutating worker nên offset trong partition luôn tuần tự. Các partition độc lập chạy song song tới giới hạn `PROCESSING_PARTITION_CONCURRENCY`.
+   - Worker coalesce các fragment fetch liền kề tới `BATCH_MAX_RECORDS` trước khi ghi, tránh biến từng fragment nhỏ thành một transaction/commit riêng.
+   - Concurrency là ngân sách downstream: profile 8 GiB dùng mức 3 vì mỗi member sở hữu ba partition độc lập. FIFO vẫn được giữ trong từng partition, nên cùng MSISDN không bị đảo thứ tự.
+   - Sau PostgreSQL/Redis, worker công bố offset cho commit coordinator. Coordinator gom offset của nhiều partition mỗi 5ms/256 records và commit ngoài critical path; partition nhanh không phải chờ một Kafka round-trip cho từng batch.
+   - Khi FIFO đạt 75% hoặc record cũ nhất chờ 7ms, consumer `pause()` riêng partition đó; chỉ `resume()` khi xuống 25% và tuổi hàng đợi dưới 3ms. Rebalance phát lại phần chưa commit cho owner mới.
 6. **Giám sát Supervisor & Graceful Shutdown**:
    - Lắng nghe tín hiệu `SIGINT`/`SIGTERM` tập trung.
    - Khi có sự cố unhandled, Supervisor sẽ kích hoạt fail-fast dừng an toàn, đóng Database Pool và flush metrics.
@@ -231,20 +236,22 @@ classDiagram
 Hệ thống ghi log định kỳ mỗi `THROUGHPUT_LOG_INTERVAL_SECONDS` (10s) theo định dạng phân khối trực quan bằng ký tự `|`:
 
 ```
-[PROCESSING][<group-id>][member=<m>/<n>][OK|ERROR] window=10.0s | Throughput: recv=1876.2/s success=1876.2/s (pg=939.1/s, rds=1874.6/s) | Latency: batch_avg=37.8ms stage(state=37.2ms[mget=2.1ms, pg_fb=0.0ms, hit=100.0%], pg=12.4ms, rds=3.1ms, pool_acq=0.2ms) e2e_lag=42.1ms(max=65.0ms) | Swaps/Events: <events_total>=0(+0) ignored=85944 | Quality/Loss: kafka_lag=0 data_loss=0(+0) (err=0, dlq=0) | Totals: recv=85944, ok=85944, pg=43046, rds=85887, batches=886
+[PROCESSING][<group-id>][member=<m>/<n>][OK|SLO_BREACH|ERROR] ... | Latency: batch_avg=16.0rec/... e2e_avg=... p95=... | Flow: kafka_lag=0 partition_queue=0 oldest=0.0ms workers=3 concurrency_limit=3 paused=0 | OffsetCommit: pending=0 records=.../s requests=.../s p95=...ms errors=0(+0) | Quality/Loss: ...
 ```
 
 ### Các trường đo lường chính:
 - **`Throughput`**: Tốc độ nhận message (`recv`), tốc độ xử lý thành công (`success`), tốc độ ghi thực tế xuống PostgreSQL (`pg`) và Redis (`rds`).
 - **`Latency`**: 
-  - `batch_avg`: Thời gian xử lý trung bình 1 batch trong consumer (ms).
+  - `batch_avg`: Số record/thời gian trung bình của một batch; dùng để phát hiện batch fragmentation.
   - `stage(...)`: Phân rã độ trễ chi tiết từng chặng nội bộ:
     - `state`: Thời gian nạp state (bao gồm `mget`: Redis MGET latency, `pg_fb`: Postgres fallback query latency, `hit`: Cache hit ratio %).
     - `pg`: Thời gian ghi batch xuống PostgreSQL.
     - `rds`: Thời gian cập nhật cache Redis.
     - `pool_acq`: Thời gian chờ lấy connection từ `DatabasePool` (`db_pool_acquire_ms`).
-  - `e2e_lag(max)`: **Độ trễ bản tin toàn trình (End-to-End Packet Processing Lag)** — đo chính xác thời gian từ lúc gói tin đi vào Ingestion đến khi hoàn tất ghi DB/Redis.
+  - `e2e_avg/p95/max`: độ trễ từ khi gói vào ingestion tới khi cả PostgreSQL và Redis hoàn tất. `p95` là chỉ số quyết định SLO; log phát `SLO_BREACH` khi vượt `PIPELINE_SLA_E2E_P95_MS`.
 - **`Swaps/Events`**: Số lượng sự kiện phát hiện mới trong cửa sổ đo (`+delta`) và tổng tích lũy.
+- **`Flow`**: Kafka lag, số record/tuổi record cũ nhất trong FIFO partition, worker và partition bị pause.
+- **`OffsetCommit`**: record đã xử lý đang chờ commit, tốc độ record/request commit, commit p95 và lỗi. Đây không nằm trên critical path ghi nghiệp vụ.
 - **`Quality/Loss`**: `kafka_lag` và `data_loss` (`err`, `dlq`).
 - **`Totals`**: Tổng số lượng bản ghi tích lũy.
 

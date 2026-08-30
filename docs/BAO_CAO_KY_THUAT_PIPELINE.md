@@ -29,11 +29,11 @@
 flowchart TD
     GGSN["External RADIUS Capture Server<br/>(Durable Mirror Source)"] -->|Mirrored UDP/1813| PR["PacketReader (SO_REUSEPORT)"]
     PR -->|asyncio.Queue| PROD["RadiusLogProducer (4 Publisher Workers)"]
-    PROD -->|Produce acks=all| KAFKA["Apache Kafka (16 Partitions)"]
+    PROD -->|Produce acks=1| KAFKA["Apache Kafka (9-48 Partitions theo profile)"]
 
-    KAFKA --> CG_IP["IP-MSISDN Consumer (4 Members)"]
-    KAFKA --> CG_DEV["Device Swap Consumer (4 Members)"]
-    KAFKA --> CG_SIM["SIM Swap Consumer (4 Members)"]
+    KAFKA --> CG_IP["IP-MSISDN Consumer Group"]
+    KAFKA --> CG_DEV["Device Swap Consumer Group"]
+    KAFKA --> CG_SIM["SIM Swap Consumer Group"]
 
     CG_IP -->|Lua Scripts| REDIS[("Redis / Redis Sentinel")]
     CG_IP -->|Session Upsert| PG[("PostgreSQL")]
@@ -88,8 +88,8 @@ flowchart TD
 - Các bản ghi DLQ hoặc bản ghi không có key được phân bổ đều theo `event_id` hoặc Round-Robin `_rr_counter`, ngăn ngừa hiện tượng dồn ép bộ nhớ vào worker 0.
 
 #### Kỹ thuật 2: Khống Chế Inflight Toàn Cục Trực Tiếp qua Semaphore (`RADIUS_UDP_KAFKA_TOTAL_MAX_INFLIGHT_BATCHES`)
-- Sử dụng `asyncio.Semaphore(total_inflight_limit)` để khống chế trần tổng số Kafka produce futures đồng thời trên toàn bộ workers (mặc định 24 batches = 12.000 records với batch tối đa 500).
-- Mỗi worker giữ baseline 4 batch để bảo vệ latency và tự nâng lên 6 khi queue shard đạt 50%; concurrency giảm lại khi pressure kết thúc.
+- Sử dụng `asyncio.Semaphore(total_inflight_limit)` để khống chế trần tổng số Kafka produce futures đồng thời trên toàn bộ workers (profile 8 GiB tối đa 24 batch × 64 record).
+- Mỗi worker giữ baseline 4 batch và tự nâng lên 6 khi queue shard đạt 25%; bốn worker tương ứng 16 batch baseline và 24 batch khi pressure. Mức này được sizing từ bandwidth-delay product và ngân sách p95.
 - Các worker được ánh xạ cố định lên một pool Kafka producer độc lập (mặc định 4).
   Một MSISDN luôn thuộc cùng worker và producer, nên loại bỏ contention của một
   producer duy nhất trong khi vẫn giữ thứ tự record theo thuê bao/Kafka key.
@@ -113,14 +113,14 @@ flowchart TD
 
 ### 3.1. `pipeline/modules/shared/base_consumer.py` — Lớp Cơ Sở Xử Lý Song Song & Đo Lag Bản Tin E2E
 
-#### Kỹ thuật 1: Phân mảnh Phân vùng Song song (Partition-Concurrency Sharding)
-- Khi nhận một tập hợp các partition từ `getmany()`, Consumer gom các partition thành $K$ shards (`PROCESSING_PARTITION_CONCURRENCY = 2`).
-- Thực thi $K$ shards song song qua `asyncio.gather()`:
-  - Các partition khác nhau được xử lý đồng thời.
-  - Các bản ghi trong cùng một partition luôn được duyệt tuần tự theo thứ tự tăng dần của `offset`, đảm bảo tính đúng đắn về mặt thời gian cho từng thuê bao di động.
+#### Kỹ thuật 1: Temporal Pipeline theo Partition
+- `getmany()` phân phối record vào FIFO riêng của từng Kafka partition thay vì gom nhiều partition vào một shard.
+- Mỗi partition có đúng một mutating worker; tối đa $K$ worker chạy đồng thời theo `PROCESSING_PARTITION_CONCURRENCY`.
+- Worker của partition nhanh tiếp tục batch kế tiếp và công bố offset cho commit coordinator, không còn chờ `asyncio.gather()` hoặc Kafka commit round-trip theo từng batch.
+- FIFO đạt high-watermark sẽ `pause()` đúng partition và `resume()` tại low-watermark, không chặn các partition còn lại.
 
 #### Kỹ thuật 2: Cam kết Offset Thủ Công (Manual Offset Commit) & Dead Letter Queue (DLQ)
-- Tắt hoàn toàn `enable_auto_commit`. Offset chỉ được commit lên Kafka broker sau khi toàn bộ shard đã commit thành công vào cơ sở dữ liệu.
+- Tắt hoàn toàn `enable_auto_commit`. Offset của từng partition chỉ được commit sau khi batch của chính partition đó ghi PostgreSQL/Redis thành công.
 - Cơ chế Exponential Backoff Retry (thử lại tối đa 3 lần). Nếu một bản ghi hoặc shard bị lỗi cấu trúc dữ liệu không thể xử lý, nó được chuyển hướng tự động sang topic `<topic>.dlq` kèm toàn bộ payload và stack trace lỗi mà không làm dừng pipeline.
 
 #### Kỹ thuật 3: Đo lường Độ trễ Bản tin Toàn trình Siêu Tốc (Fast Float Epoch E2E Lag)

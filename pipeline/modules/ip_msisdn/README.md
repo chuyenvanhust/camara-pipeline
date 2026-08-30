@@ -13,13 +13,13 @@ flowchart TD
     PARSE --> TYPE_BRANCH{acct_status_type?}
 
     %% Start / Interim
-    TYPE_BRANCH -->|Start / Interim-Update| UPSERT_FLOW["1. Upsert Session State (PostgreSQL)<br/>radius_session_state<br/>2. Chạy UPSERT_LUA (Redis)<br/>- SET ip-ggsn:IP (TTL 24h)<br/>- ZADD ggsn-ips:NAS IP"]
+    TYPE_BRANCH -->|Start / Interim-Update| UPSERT_FLOW["1. Kiểm tra NAS-Off watermark<br/>2. Upsert Session State (PostgreSQL)<br/>3. Chạy UPSERT_LUA (Redis)<br/>- SET ip-ggsn:IP (TTL 24h)<br/>- ZADD ggsn-ips:NAS IP"]
     
     %% Stop
     TYPE_BRANCH -->|Stop| STOP_FLOW["1. Update Session Inactive (PostgreSQL)<br/>2. Chạy DELETE_LUA (Redis)<br/>- Kiểm tra đúng MSISDN sở hữu<br/>- DEL ip-ggsn:IP<br/>- ZREM ggsn-ips:NAS IP"]
 
     %% Accounting-Off
-    TYPE_BRANCH -->|Accounting-Off| ACCT_OFF_FLOW["Trạm GGSN/NAS Khởi Động Lại / Mất Điện:<br/>1. UPDATE radius_session_state SET active=FALSE<br/>2. Quét ZRANGEBYSCORE ggsn-ips:NAS<br/>3. Chạy ACCOUNTING_OFF_LUA xoá hàng loạt IP của NAS"]
+    TYPE_BRANCH -->|Accounting-Off| ACCT_OFF_FLOW["Trạm GGSN/NAS Khởi Động Lại / Mất Điện:<br/>1. Ghi watermark bền vững theo NAS<br/>2. UPDATE radius_session_state SET active=FALSE<br/>3. Quét ZRANGEBYSCORE ggsn-ips:NAS<br/>4. Chạy ACCOUNTING_OFF_LUA xoá hàng loạt IP của NAS"]
 
     %% Accounting-On
     TYPE_BRANCH -->|Accounting-On| IGNORE["Bỏ qua (Trạm NAS sẵn sàng)"]
@@ -55,6 +55,8 @@ Module quản lý trạng thái phiên trên cả hai hệ thống lưu trữ:
    - Member: `framed_ip`
    - Score: `event_epoch`
    - Mục đích: Đóng vai trò Reverse Index giúp thu hồi và xoá hàng loạt tất cả địa chỉ IP của một trạm NAS khi xảy ra sự kiện `Accounting-Off`.
+3. **`nas-off-watermark:<nas_identifier>`**:
+   - Lưu timestamp `Accounting-Off` lớn nhất. Lua từ chối `Start/Interim` cũ hơn hoặc bằng watermark, kể cả khi chúng đến từ Kafka partition khác.
 
 ### 2.2. PostgreSQL (Persistent Session History & Audit)
 Bảng `radius_session_state` lưu trữ trạng thái phiên bền vững:
@@ -71,6 +73,8 @@ CREATE TABLE radius_session_state (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 ```
+
+Bảng `radius_nas_off_watermark` giữ fence bền vững theo NAS. Upsert session dùng một CTE duy nhất để lấy row lock `FOR SHARE`, lọc watermark và UPSERT trong cùng round-trip; Accounting-Off cập nhật row bằng lock độc quyền. Một Start cũ không thể lọt race, trong khi các batch session thường vẫn song song.
 
 ---
 
@@ -90,6 +94,7 @@ CREATE TABLE radius_session_state (
 
 ### 3.3. `ACCOUNTING_OFF_LUA`
 - Đọc danh sách IP từ Sorted Set của NAS, xóa các key `ip-ggsn:<ip>` có thời gian sự kiện nhỏ hơn hoặc bằng thời điểm xảy ra `Accounting-Off`.
+- Watermark được cập nhật nguyên tử trước khi quét. Upsert xảy ra trước sẽ bị vòng quét xóa; upsert xảy ra sau sẽ bị watermark từ chối.
 
 ---
 
@@ -97,7 +102,12 @@ CREATE TABLE radius_session_state (
 
 1. **Khử trùng lặp nội bộ Batch (Deduplication per Batch)**:
    - Nếu cùng một `acct_session_id` xuất hiện nhiều lần trong 1 batch (ví dụ `Start` rồi `Interim-Update`), chỉ bản ghi có offset mới nhất được đưa vào danh sách Upsert PostgreSQL nhằm tránh lỗi `CardinalityViolationError` trong câu lệnh SQL.
-2. **PostgreSQL Batch Upsert**:
-   - Sử dụng `db.persist_session_batch()` ghi toàn bộ session trong batch chỉ qua **1 round-trip duy nhất**.
-3. **Redis Pipeline Execution**:
-   - `store.apply_batch()` đưa tất cả các lệnh Lua vào 1 Redis Pipeline (`transaction=False`), giảm thiểu network round-trip overhead xuống Redis.
+2. **Hai nhánh persistence song song**:
+   - Nhánh PostgreSQL dùng `db.persist_session_batch()` ghi toàn bộ session trong một round-trip và xử lý `Accounting-Off` theo thứ tự.
+   - Nhánh Redis dùng `store.apply_batch()` đưa các lệnh Lua vào pipeline `transaction=False`; các đoạn được ngắt tại `Accounting-Off` để giữ đúng thứ tự offset.
+   - `asyncio.gather(..., return_exceptions=True)` luôn đợi cả hai nhánh kết thúc. Kafka chỉ commit offset khi cả PostgreSQL và Redis đều thành công; retry an toàn nhờ version fence/idempotency ở cả hai store.
+3. **Mục tiêu latency**:
+   - Critical path đổi từ gần `postgres + redis` thành gần `max(postgres, redis)`.
+   - Telemetry `persist_parallel` đo trực tiếp thời gian chờ chung của hai nhánh để phân biệt với latency riêng `pg` và `rds`.
+
+Ngoài song song PostgreSQL/Redis, lớp consumer dùng một FIFO và một mutating worker cho mỗi Kafka partition. Các partition chạy song song, nhưng một partition không bao giờ có hai batch thay đổi state cùng lúc. Batch thành công công bố offset cho coordinator; coordinator coalesce commit theo thời gian/số record ngoài critical path, loại bỏ barrier và Kafka RTT trên từng micro-batch.

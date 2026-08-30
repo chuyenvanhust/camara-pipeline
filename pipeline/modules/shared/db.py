@@ -28,6 +28,7 @@ class DatabasePool:
         self.dsn = dsn
         self.pool: Optional[asyncpg.Pool] = None
         self.metrics: Optional[Any] = None
+        self._known_nas_watermarks: set[str] = set()
 
     def set_metrics(self, metrics: Any) -> None:
         self.metrics = metrics
@@ -228,33 +229,70 @@ class DatabasePool:
         assert self.pool is not None
         columns = list(zip(*records))
         async with self.acquire(timeout=3) as connection:
+            # Ensure each NAS fence once per process. The steady-state statement
+            # below then combines row locking, watermark filtering and UPSERT in a
+            # single network round trip. SHARE locks are compatible across normal
+            # sessions; Accounting-Off alone uses an exclusive lock.
+            nas_identifiers = sorted({record[2] for record in records if record[2]})
+            unknown_nas = [
+                nas for nas in nas_identifiers if nas not in self._known_nas_watermarks
+            ]
+            if unknown_nas:
+                await connection.execute(
+                    """
+                    INSERT INTO radius_nas_off_watermark(
+                        nas_identifier,watermark_at,updated_at
+                    )
+                    SELECT value,'-infinity'::timestamptz,NOW()
+                    FROM UNNEST($1::text[]) value
+                    ON CONFLICT(nas_identifier) DO NOTHING
+                    """,
+                    unknown_nas,
+                )
+                self._known_nas_watermarks.update(unknown_nas)
             await connection.execute(
                 """
-                INSERT INTO radius_session_state(
-                    acct_session_id,msisdn,nas_identifier,active,last_event_at,
-                    last_event_id,source_partition,source_offset,updated_at
-                )
-                SELECT session_id,msisdn,nas,active,event_time,event_id,
-                       partition,offset_value,NOW()
-                FROM UNNEST(
-                    $1::text[],$2::text[],$3::text[],$4::boolean[],
-                    $5::timestamptz[],$6::text[],$7::int[],$8::bigint[]
-                ) incoming(session_id,msisdn,nas,active,event_time,event_id,
-                           partition,offset_value)
-                ON CONFLICT(acct_session_id) DO UPDATE SET
-                    msisdn=EXCLUDED.msisdn,nas_identifier=EXCLUDED.nas_identifier,
-                    active=EXCLUDED.active,last_event_at=EXCLUDED.last_event_at,
-                    last_event_id=EXCLUDED.last_event_id,
-                    source_partition=EXCLUDED.source_partition,
-                    source_offset=EXCLUDED.source_offset,updated_at=NOW()
-                WHERE (EXCLUDED.last_event_at,EXCLUDED.source_partition,
-                       EXCLUDED.source_offset)
-                    > (radius_session_state.last_event_at,
-                       radius_session_state.source_partition,
-                       radius_session_state.source_offset)
-                  AND EXCLUDED.last_event_id IS DISTINCT FROM radius_session_state.last_event_id
+                    WITH fences AS MATERIALIZED (
+                        SELECT nas_identifier,watermark_at
+                        FROM radius_nas_off_watermark
+                        WHERE nas_identifier = ANY($9::text[])
+                        ORDER BY nas_identifier
+                        FOR SHARE
+                    ), incoming AS MATERIALIZED (
+                        SELECT session_id,msisdn,nas,active,event_time,event_id,
+                               partition,offset_value
+                        FROM UNNEST(
+                            $1::text[],$2::text[],$3::text[],$4::boolean[],
+                            $5::timestamptz[],$6::text[],$7::int[],$8::bigint[]
+                        ) value(session_id,msisdn,nas,active,event_time,event_id,
+                                partition,offset_value)
+                    )
+                    INSERT INTO radius_session_state(
+                        acct_session_id,msisdn,nas_identifier,active,last_event_at,
+                        last_event_id,source_partition,source_offset,updated_at
+                    )
+                    SELECT incoming.session_id,incoming.msisdn,incoming.nas,
+                           incoming.active,incoming.event_time,incoming.event_id,
+                           incoming.partition,incoming.offset_value,NOW()
+                    FROM incoming
+                    LEFT JOIN fences ON fences.nas_identifier=incoming.nas
+                    WHERE incoming.nas IS NULL
+                       OR incoming.event_time > fences.watermark_at
+                    ON CONFLICT(acct_session_id) DO UPDATE SET
+                        msisdn=EXCLUDED.msisdn,nas_identifier=EXCLUDED.nas_identifier,
+                        active=EXCLUDED.active,last_event_at=EXCLUDED.last_event_at,
+                        last_event_id=EXCLUDED.last_event_id,
+                        source_partition=EXCLUDED.source_partition,
+                        source_offset=EXCLUDED.source_offset,updated_at=NOW()
+                    WHERE (EXCLUDED.last_event_at,EXCLUDED.source_partition,
+                           EXCLUDED.source_offset)
+                        > (radius_session_state.last_event_at,
+                           radius_session_state.source_partition,
+                           radius_session_state.source_offset)
+                      AND EXCLUDED.last_event_id IS DISTINCT FROM radius_session_state.last_event_id
                 """,
                 *(list(column) for column in columns),
+                nas_identifiers,
             )
 
     async def mark_nas_sessions_inactive(
@@ -262,15 +300,36 @@ class DatabasePool:
     ) -> None:
         assert self.pool is not None
         async with self.acquire(timeout=3) as connection:
-            await connection.execute(
-                """
-                UPDATE radius_session_state
-                SET active=FALSE,last_event_at=$2,updated_at=NOW()
-                WHERE nas_identifier=$1 AND active AND last_event_at <= $2
-                """,
-                nas_identifier,
-                event_time,
-            )
+            async with connection.transaction():
+                await connection.execute(
+                    """
+                    INSERT INTO radius_nas_off_watermark(
+                        nas_identifier,watermark_at,updated_at
+                    ) VALUES($1,'-infinity'::timestamptz,NOW())
+                    ON CONFLICT(nas_identifier) DO NOTHING
+                    """,
+                    nas_identifier,
+                )
+                self._known_nas_watermarks.add(nas_identifier)
+                watermark_at = await connection.fetchval(
+                    """
+                    UPDATE radius_nas_off_watermark
+                    SET watermark_at=GREATEST(watermark_at,$2),updated_at=NOW()
+                    WHERE nas_identifier=$1
+                    RETURNING watermark_at
+                    """,
+                    nas_identifier,
+                    event_time,
+                )
+                await connection.execute(
+                    """
+                    UPDATE radius_session_state
+                    SET active=FALSE,last_event_at=$2,updated_at=NOW()
+                    WHERE nas_identifier=$1 AND active AND last_event_at <= $2
+                    """,
+                    nas_identifier,
+                    watermark_at,
+                )
 
     async def recover_stale_notifications(self) -> None:
         assert self.pool is not None

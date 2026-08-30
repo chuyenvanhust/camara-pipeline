@@ -1,5 +1,10 @@
 # Kế hoạch khắc phục throughput, E2E lag và mất bản mirror
 
+> **Trạng thái: tài liệu lịch sử/superseded.** Baseline 15k dưới đây giải thích sự cố cũ.
+> Cấu hình vận hành hiện hành nằm trong `config/env/*.env`: ingestion batch 64/1ms,
+> Kafka `acks=1`, queue theo profile và admission limit 2.9k/3.9k/7.8k/15.5k để bảo vệ
+> E2E p95 <100ms. Không áp các con số batch/queue trong phần lịch sử này.
+
 ## 1. Kết luận từ baseline 15.000 pkt/s
 
 | Chặng | Quan sát | Kết luận |
@@ -20,7 +25,7 @@ vào, queue tăng liên tục, record nằm chờ nhiều giây rồi queue đ�
 2. Tăng Kafka producer batch buffer từ 256 KiB lên 512 KiB.
 3. Áp dụng concurrency thích ứng:
    - bình thường: 4 inflight batch/worker;
-   - queue shard đạt 50%: tối đa 6 inflight batch/worker;
+   - queue shard đạt 25%: tối đa 10 inflight batch/worker;
    - trần toàn process: 24 batch.
 4. Tách một producer dùng chung thành producer pool (mặc định 4). Mỗi worker
    được ánh xạ cố định tới producer và mỗi MSISDN luôn vào cùng worker, vì vậy

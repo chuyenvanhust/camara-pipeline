@@ -11,6 +11,10 @@ logger = logging.getLogger(__name__)
 SESSION_TTL_SECONDS = 86400
 
 UPSERT_LUA = """
+local watermark = redis.call('GET', KEYS[2])
+if watermark and tonumber(ARGV[3]) <= tonumber(watermark) then
+  return 0
+end
 local old = redis.call('GET', KEYS[1])
 if old then
   local decoded = cjson.decode(old)
@@ -62,6 +66,15 @@ redis.call('ZREM', 'ggsn-ips:' .. ARGV[2], ARGV[1])
 return 1
 """
 
+ACCOUNTING_OFF_WATERMARK_LUA = """
+local old = redis.call('GET', KEYS[1])
+if not old or tonumber(ARGV[1]) > tonumber(old) then
+  redis.call('SET', KEYS[1], ARGV[1])
+  return ARGV[1]
+end
+return old
+"""
+
 
 class IPMappingStore:
     def __init__(self, redis_client: aioredis.Redis):
@@ -69,6 +82,7 @@ class IPMappingStore:
         self._upsert_script = self.redis.register_script(UPSERT_LUA)
         self._delete_script = self.redis.register_script(DELETE_LUA)
         self._acct_off_script = self.redis.register_script(ACCOUNTING_OFF_LUA)
+        self._acct_off_watermark_script = self.redis.register_script(ACCOUNTING_OFF_WATERMARK_LUA)
 
     @staticmethod
     def _ip_key(framed_ip: str) -> str:
@@ -77,6 +91,10 @@ class IPMappingStore:
     @staticmethod
     def _ggsn_key(nas_identifier: str) -> str:
         return f"ggsn-ips:{nas_identifier}"
+
+    @staticmethod
+    def _nas_off_watermark_key(nas_identifier: str) -> str:
+        return f"nas-off-watermark:{nas_identifier}"
 
     async def upsert_mapping(self, framed_ip: str, msisdn: str, event_time: datetime,
                              event_id: str, partition: int, offset: int,
@@ -89,7 +107,7 @@ class IPMappingStore:
                               "event_id": event_id, "source_partition": partition,
                               "source_offset": offset})
         result = await self._upsert_script(
-            keys=[self._ip_key(framed_ip)],
+            keys=[self._ip_key(framed_ip), self._nas_off_watermark_key(nas)],
             args=[framed_ip, nas, epoch, partition, offset, payload, ttl]
         )
         return bool(result)
@@ -126,13 +144,13 @@ class IPMappingStore:
                         "source_partition": operation["partition"],
                         "source_offset": operation["offset"],
                     })
-                    self._upsert_script(
-                        keys=[self._ip_key(framed_ip)],
+                    await self._upsert_script(
+                        keys=[self._ip_key(framed_ip), self._nas_off_watermark_key(nas)],
                         args=[framed_ip, nas, epoch, operation["partition"], operation["offset"], payload, ttl],
                         client=pipe
                     )
                 else:
-                    self._delete_script(
+                    await self._delete_script(
                         keys=[self._ip_key(framed_ip)],
                         args=[framed_ip, operation["msisdn"], event_time.timestamp(), operation["partition"], operation["offset"]],
                         client=pipe
@@ -144,7 +162,10 @@ class IPMappingStore:
                              chunk_size: int = 500) -> int:
         reverse_key = self._ggsn_key(nas_identifier)
         removed = 0
-        cutoff = event_time.timestamp()
+        cutoff = float(await self._acct_off_watermark_script(
+            keys=[self._nas_off_watermark_key(nas_identifier)],
+            args=[event_time.timestamp()],
+        ))
         while True:
             addresses = await self.redis.zrangebyscore(reverse_key, "-inf", cutoff, start=0, num=chunk_size)
             if not addresses:
