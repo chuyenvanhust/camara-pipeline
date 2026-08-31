@@ -277,21 +277,21 @@ Nó không nhận response, không retry và không dùng để chứng minh đ�
 | `*_PARTITION_QUEUE_RECORDS` | IP=`64`, Swap=`96` | Queue cục bộ tối đa bốn batch; Kafka giữ durable backlog |
 | `*_BATCH_MAX_RECORDS` | IP=`16`, Swap=`24` | Micro-batch latency-first giữ transaction trong ngân sách p95 |
 | `*_BATCH_TIMEOUT_MS` | `1` | Thời gian gom batch tối đa |
-| `PROCESSING_PARTITION_QUEUE_*` | `75%/25%`, `7ms/3ms` | Backpressure theo cả depth và tuổi record |
-| `PROCESSING_COMMIT_INTERVAL_MS` / `MAX_RECORDS` | `5` / `256` | Coalesce commit offset ngoài critical path |
+| `PROCESSING_PARTITION_QUEUE_*` | `75%/25%`, `12ms/4ms` | Backpressure theo cả depth và tuổi record; tránh pause/resume quá nhạy với jitter ngắn |
+| `PROCESSING_COMMIT_INTERVAL_MS` / `MAX_RECORDS` | `25` / `512` | Coalesce commit offset ở coordinator nền, giảm request tới Kafka; không nằm trên critical path nghiệp vụ |
 | `DATABASE_URL` | `postgresql://postgres:camara@camara-postgres:5432/camara_db` | Connection string PostgreSQL (`synchronous_commit=on` đảm bảo 100% ACID) |
 | `IP_MSISDN_DB_POOL_MAX` / `DEVICE_SWAP...` / `SIM_SWAP...` | `12` / `8` / `8` | Connection Pool `asyncpg` tối đa phân chia theo từng service (PostgreSQL `max_connections=200`) |
-| `POSTGRES_CPUS` | `1.5` | CPU PostgreSQL trong profile 12 vCPU/8 GiB |
+| `POSTGRES_CPUS` | `2.5` | CPU PostgreSQL trong profile 12 vCPU/8 GiB; ưu tiên vì PG/state fallback là bottleneck chung của cả ba group |
 | `REDIS_HOST` / `REDIS_PORT` | `camara-redis` / `6379` | Thông tin kết nối Redis Standalone / Cluster |
 | `RADIUS_SHARED_SECRET` | `camara-radius-dev-secret` | Secret key tính Authenticator RFC 2866 |
 | `RADIUS_UDP_RECEIVE_BUFFER_BYTES` | `33554432` (32MB) | Kích thước socket buffer nhận UDP |
 | `RADIUS_UDP_QUEUE_MAX_RECORDS` | `20000` | Burst buffer profile 8 GiB; capture mới là nguồn bền vững |
 | `RADIUS_UDP_KAFKA_BATCH_RECORDS` | `64` | Kích thước tối đa của micro-batch UDP Ingestion |
 | `RADIUS_UDP_KAFKA_BATCH_WAIT_MS` | `1` | Thời gian gom batch Kafka của Ingestion (ms) |
-| `RADIUS_UDP_KAFKA_MAX_INFLIGHT_BATCHES_PER_WORKER` | `4` | Số lượng batch Kafka baseline cho mỗi worker |
+| `RADIUS_UDP_KAFKA_MAX_INFLIGHT_BATCHES_PER_WORKER` | `6` | Số batch Kafka baseline cho mỗi worker; tổng vẫn bị chặn bởi global inflight limit |
 | `RADIUS_UDP_KAFKA_PRESSURE_INFLIGHT_BATCHES_PER_WORKER` | `6` | Trần tạm thời khi queue shard vượt ngưỡng pressure |
 | `RADIUS_UDP_KAFKA_PRESSURE_QUEUE_RATIO` | `0.25` | Tỷ lệ queue kích hoạt concurrency tăng cường |
-| `RADIUS_UDP_KAFKA_PRODUCERS` | `4` | Số Kafka producer độc lập; worker được ánh xạ cố định để giữ thứ tự theo MSISDN |
+| `RADIUS_UDP_KAFKA_PRODUCERS` | `1` | Producer dùng chung cho bốn publisher coroutine; Kafka giữ FIFO theo partition/key và gom batch tốt hơn |
 | `RADIUS_UDP_KAFKA_TOTAL_MAX_INFLIGHT_BATCHES` | `24` | Trần tuyệt đối batch Kafka đang ghi trên toàn process |
 | `INGESTION_KAFKA_ACKS` / `INGESTION_ENABLE_IDEMPOTENCE` | `1` / `false` | Latency-first vì capture ngoài repo chịu durability/replay |
 | `PIPELINE_RECOMMENDED_SUSTAINED_PPS` | `2900` | Admission ceiling profile 8 GiB để bảo vệ E2E p95 |

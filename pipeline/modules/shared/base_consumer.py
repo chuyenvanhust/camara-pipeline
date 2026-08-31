@@ -36,10 +36,10 @@ PARTITION_QUEUE_RECORDS = int(
 )
 PARTITION_QUEUE_HIGH_RATIO = float(os.getenv("PROCESSING_PARTITION_QUEUE_HIGH_RATIO", "0.75"))
 PARTITION_QUEUE_LOW_RATIO = float(os.getenv("PROCESSING_PARTITION_QUEUE_LOW_RATIO", "0.25"))
-PARTITION_QUEUE_MAX_AGE_MS = float(os.getenv("PROCESSING_PARTITION_QUEUE_MAX_AGE_MS", "7"))
-PARTITION_QUEUE_RESUME_AGE_MS = float(os.getenv("PROCESSING_PARTITION_QUEUE_RESUME_AGE_MS", "3"))
-COMMIT_INTERVAL_MS = float(os.getenv("PROCESSING_COMMIT_INTERVAL_MS", "5"))
-COMMIT_MAX_RECORDS = int(os.getenv("PROCESSING_COMMIT_MAX_RECORDS", "256"))
+PARTITION_QUEUE_MAX_AGE_MS = float(os.getenv("PROCESSING_PARTITION_QUEUE_MAX_AGE_MS", "12"))
+PARTITION_QUEUE_RESUME_AGE_MS = float(os.getenv("PROCESSING_PARTITION_QUEUE_RESUME_AGE_MS", "4"))
+COMMIT_INTERVAL_MS = float(os.getenv("PROCESSING_COMMIT_INTERVAL_MS", "25"))
+COMMIT_MAX_RECORDS = int(os.getenv("PROCESSING_COMMIT_MAX_RECORDS", "512"))
 COMMIT_MAX_FAILURES = int(os.getenv("PROCESSING_COMMIT_MAX_FAILURES", "5"))
 COMMIT_RETRY_BACKOFF_MS = float(os.getenv("PROCESSING_COMMIT_RETRY_BACKOFF_MS", "25"))
 SHUTDOWN_DRAIN_TIMEOUT_SECONDS = float(os.getenv("PROCESSING_SHUTDOWN_DRAIN_SECONDS", "10"))
@@ -295,6 +295,7 @@ class BaseKafkaConsumer(ABC):
     async def _process_partition_batch(
         self, topic_partition: TopicPartition, records: List[Any]
     ) -> None:
+        self.metrics.observe_preprocess_lag(self._message_lags_ms(records))
         self.metrics.increment("processed", len(records))
         batch_started = time.monotonic()
         for attempt in range(1, MAX_BATCH_RETRIES + 1):
@@ -417,14 +418,25 @@ class BaseKafkaConsumer(ABC):
             )
             self._refresh_kafka_lag()
 
-    def _observe_e2e(self, records: List[Any]) -> None:
+    @staticmethod
+    def _message_lags_ms(records: List[Any]) -> List[float]:
         now_epoch = time.time()
         now_utc = datetime.fromtimestamp(now_epoch, timezone.utc)
-        lags_ms = []
+        lags_ms: List[float] = []
         for record in records:
             value = getattr(record, "value", None)
             if not isinstance(value, dict):
                 continue
+            ingest_epoch_ns = value.get("ingest_epoch_ns")
+            if ingest_epoch_ns is not None:
+                try:
+                    lags_ms.append(max(
+                        0.0,
+                        (now_epoch - int(ingest_epoch_ns) / 1_000_000_000) * 1000.0,
+                    ))
+                    continue
+                except (ValueError, TypeError):
+                    pass
             ingest_epoch = value.get("ingest_epoch_s")
             if ingest_epoch is not None:
                 try:
@@ -439,6 +451,10 @@ class BaseKafkaConsumer(ABC):
                     lags_ms.append(max(0.0, (now_utc - timestamp).total_seconds() * 1000.0))
                 except (TypeError, ValueError):
                     pass
+        return lags_ms
+
+    def _observe_e2e(self, records: List[Any]) -> None:
+        lags_ms = self._message_lags_ms(records)
         if lags_ms:
             self.metrics.observe_e2e_lag(lags_ms)
 

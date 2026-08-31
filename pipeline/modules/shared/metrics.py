@@ -33,6 +33,7 @@ _OFFSET_COMMIT_LATENCY = None
 _OFFSET_COMMIT_RECORDS = None
 _OFFSET_COMMIT_ERRORS = None
 _OFFSET_COMMIT_PENDING = None
+_PREPROCESS_LATENCY = None
 
 
 def _init_prometheus():
@@ -43,6 +44,7 @@ def _init_prometheus():
     global _PARTITION_QUEUE_RECORDS, _PARTITION_WORKERS, _PARTITIONS_PAUSED
     global _PARTITION_QUEUE_AGE, _OFFSET_COMMIT_LATENCY, _OFFSET_COMMIT_RECORDS
     global _OFFSET_COMMIT_ERRORS, _OFFSET_COMMIT_PENDING
+    global _PREPROCESS_LATENCY
     if _prom_initialized:
         return
     try:
@@ -85,6 +87,11 @@ def _init_prometheus():
         _E2E_LATENCY = Histogram(
             "pipeline_e2e_message_lag_seconds",
             "Độ trễ từ khi gói tin vào Ingestion đến khi hoàn tất ghi DB/Redis",
+            ["group_id"],
+        )
+        _PREPROCESS_LATENCY = Histogram(
+            "pipeline_preprocess_message_lag_seconds",
+            "Latency from UDP socket receipt until business processing starts",
             ["group_id"],
         )
         _REDIS_MGET_LATENCY = Histogram(
@@ -182,6 +189,8 @@ class ModuleMetrics:
         self.e2e_lag_max_ms = 0.0
         self.e2e_lag_count = 0
         self.e2e_lag_window_ms = deque(maxlen=max(1000, E2E_WINDOW_SAMPLE_LIMIT))
+        self.preprocess_lag_window_ms = deque(maxlen=max(1000, E2E_WINDOW_SAMPLE_LIMIT))
+        self.batch_latency_window_ms = deque(maxlen=10000)
         self.kafka_lag = 0
         self.latest_cache_hit_ratio = 1.0
         self.partition_queue_records = 0
@@ -213,9 +222,21 @@ class ModuleMetrics:
 
     def observe_batch(self, seconds: float) -> None:
         self.processing_seconds += seconds
+        self.batch_latency_window_ms.append(max(0.0, seconds * 1000.0))
         self.increment("batches")
         if _BATCH_LATENCY is not None:
             _BATCH_LATENCY.labels(group_id=self.name).observe(seconds)
+
+    def observe_preprocess_lag(self, lags_ms: list[float]) -> None:
+        """Record-level wait from UDP socket receipt until process_batch starts."""
+        if not lags_ms:
+            return
+        self.preprocess_lag_window_ms.extend(lags_ms)
+        if _PREPROCESS_LATENCY is not None:
+            labels = _PREPROCESS_LATENCY.labels(group_id=self.name)
+            sample_size = max(1, len(lags_ms) // 10)
+            for lag in random.sample(lags_ms, min(len(lags_ms), sample_size)):
+                labels.observe(max(0.0, lag) / 1000.0)
 
     def observe_stage(self, stage: str, seconds: float) -> None:
         self.stage_seconds[stage] = self.stage_seconds.get(stage, 0.0) + seconds
@@ -395,6 +416,12 @@ class ModuleMetrics:
             e2e_window = list(self.e2e_lag_window_ms)
             self.e2e_lag_window_ms.clear()
             e2e_p95_ms = self._percentile(e2e_window, 0.95)
+            preprocess_window = list(self.preprocess_lag_window_ms)
+            self.preprocess_lag_window_ms.clear()
+            preprocess_p95_ms = self._percentile(preprocess_window, 0.95)
+            batch_latency_window = list(self.batch_latency_window_ms)
+            self.batch_latency_window_ms.clear()
+            processing_p95_ms = self._percentile(batch_latency_window, 0.95)
             commit_window = list(self.commit_latency_window_ms)
             self.commit_latency_window_ms.clear()
             commit_p95_ms = self._percentile(commit_window, 0.95)
@@ -417,7 +444,7 @@ class ModuleMetrics:
                 level,
                 "[PROCESSING][%s][member=%s][%s] window=%.1fs | "
                 "Throughput: recv=%.1f/s success=%.1f/s (pg=%.1f/s, rds=%.1f/s) | "
-                "Latency: batch_avg=%.1frec/%.1fms stage(state=%.1fms[mget=%.1fms, pg_fb=%.1fms, hit=%.1f%%], pg=%.1fms, rds=%.1fms, persist_parallel=%.1fms, pool_acq=%.1fms) e2e_avg=%.1fms p95=%.1fms max=%.1fms slo_p95<%.0fms | "
+                "Latency: batch_avg=%.1frec/%.1fms stage(state=%.1fms[mget=%.1fms, pg_fb=%.1fms, hit=%.1f%%], pg=%.1fms, rds=%.1fms, persist_parallel=%.1fms, pool_acq=%.1fms) pre_process_p95=%.1fms processing_p95=%.1fms e2e_avg=%.1fms p95=%.1fms max=%.1fms slo_p95<%.0fms | "
                 "Swaps/Events: %s=%d(+%d) ignored=%d | "
                 "Flow: kafka_lag=%d partition_queue=%d oldest=%.1fms workers=%d concurrency_limit=%d paused=%d | "
                 "OffsetCommit: pending=%d records=%.1f/s requests=%.1f/s p95=%.1fms errors=%d(+%d) | "
@@ -437,6 +464,7 @@ class ModuleMetrics:
                 self._stage_average_ms("redis", previous_stage_seconds, previous_stage_calls),
                 self._stage_average_ms("persistence", previous_stage_seconds, previous_stage_calls),
                 self._stage_average_ms("db_pool_acquire", previous_stage_seconds, previous_stage_calls),
+                preprocess_p95_ms, processing_p95_ms,
                 e2e_avg_ms, e2e_p95_ms, e2e_max_ms, SLA_E2E_P95_MS,
                 event_name, current["events_detected"], events_delta, current["ignored"],
                 self.kafka_lag, self.partition_queue_records, self.partition_queue_oldest_ms,

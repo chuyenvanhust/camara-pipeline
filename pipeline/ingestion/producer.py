@@ -29,7 +29,7 @@ UDP_KAFKA_BATCH_RECORDS = int(os.getenv("RADIUS_UDP_KAFKA_BATCH_RECORDS", "64"))
 UDP_KAFKA_BATCH_WAIT_MS = int(os.getenv("RADIUS_UDP_KAFKA_BATCH_WAIT_MS", "1"))
 UDP_KAFKA_MAX_INFLIGHT_BATCHES_PER_WORKER = int(
     os.getenv("RADIUS_UDP_KAFKA_MAX_INFLIGHT_BATCHES_PER_WORKER",
-              os.getenv("RADIUS_UDP_KAFKA_MAX_INFLIGHT_BATCHES", "4"))
+              os.getenv("RADIUS_UDP_KAFKA_MAX_INFLIGHT_BATCHES", "6"))
 )
 UDP_KAFKA_PRESSURE_INFLIGHT_BATCHES_PER_WORKER = int(
     os.getenv("RADIUS_UDP_KAFKA_PRESSURE_INFLIGHT_BATCHES_PER_WORKER", "6")
@@ -37,7 +37,7 @@ UDP_KAFKA_PRESSURE_INFLIGHT_BATCHES_PER_WORKER = int(
 UDP_KAFKA_PRESSURE_QUEUE_RATIO = float(
     os.getenv("RADIUS_UDP_KAFKA_PRESSURE_QUEUE_RATIO", "0.25")
 )
-UDP_KAFKA_PRODUCERS = int(os.getenv("RADIUS_UDP_KAFKA_PRODUCERS", "4"))
+UDP_KAFKA_PRODUCERS = int(os.getenv("RADIUS_UDP_KAFKA_PRODUCERS", "1"))
 INGESTION_METRICS_PORT = int(os.getenv("INGESTION_METRICS_PORT", "9201"))
 INGESTION_KAFKA_PERSIST_WARN_MS = float(os.getenv("INGESTION_KAFKA_PERSIST_WARN_MS", "20"))
 INGESTION_QUEUE_WARN_MS = float(os.getenv("INGESTION_QUEUE_WARN_MS", "20"))
@@ -302,7 +302,7 @@ class RadiusLogProducer:
                 "Throughput: udp_in=%.1f/s kafka_persisted=%.1f/s gap=%+.1f/s | "
                 "Admission: sustained<=%d/s burst<=%d/s | "
                 "Queue: depth=%d/%d(%.1f%%) backlog=%.2fs | "
-                "Kafka: batch_avg=%.1frec last=%drec/%.1fms persist(p50=%.1fms p95=%.1fms p99=%.1fms) "
+                "Kafka: publish_group_avg=%.1frec last=%drec/%.1fms persist(p50=%.1fms p95=%.1fms p99=%.1fms) "
                 "queue_p95=%.1fms worker_slot_wait_p95=%.1fms global_wait_p95=%.1fms | "
                 "Quality/Loss: data_loss=%d(+%d) (queue_dropped=%d, pub_failed=%d, dlq=%d, invalid=%d) | "
                 "Totals: received=%d, kafka_persisted=%d",
@@ -552,7 +552,7 @@ class RadiusLogProducer:
                               stop_event: asyncio.Event | None = None) -> None:
         _start_ingestion_metrics_server()
         publisher_workers = max(1, int(os.getenv("RADIUS_UDP_PUBLISHER_WORKERS", "4")))
-        producer_count = min(UDP_KAFKA_PRODUCERS, publisher_workers)
+        producer_count = max(1, min(UDP_KAFKA_PRODUCERS, publisher_workers))
         if UDP_KAFKA_PRESSURE_INFLIGHT_BATCHES_PER_WORKER < UDP_KAFKA_MAX_INFLIGHT_BATCHES_PER_WORKER:
             raise ValueError(
                 "RADIUS_UDP_KAFKA_PRESSURE_INFLIGHT_BATCHES_PER_WORKER must be "

@@ -97,8 +97,8 @@ Lớp cơ sở trừu tượng cho tất cả các consumer trong hệ thống:
 - **Vòng lặp tiêu thụ (`run()`)**: Sử dụng `AIOKafkaConsumer.getmany()` gom tối đa `BATCH_MAX_RECORDS` hoặc chờ `BATCH_TIMEOUT_MS`.
 - **Per-partition temporal pipeline**: `getmany()` đưa record vào FIFO riêng; mỗi partition có một mutating worker, còn các partition độc lập chạy song song tới `PROCESSING_PARTITION_CONCURRENCY`.
 - **Batch coalescing**: Worker ghép fragment cùng partition tới `BATCH_MAX_RECORDS`; mặc định IP=16 và Swap=24 để giữ ngân sách p95.
-- **Age-aware backpressure**: `pause()` khi FIFO đạt 75% hoặc record cũ nhất chờ 7ms; `resume()` tại 25% và 3ms. Partition nhanh không bị partition chậm chặn.
-- **Coalesced Manual Offset Commit**: Sau batch thành công (`enable_auto_commit=False`), worker công bố offset cho coordinator. Coordinator commit nhiều partition mỗi 5ms/256 record, tách Kafka RTT khỏi critical path. Khi rebalance/crash, cửa sổ chưa commit được phát lại và store xử lý idempotent/version-fenced.
+- **Age-aware backpressure**: `pause()` khi FIFO đạt 75% hoặc record cũ nhất chờ 12ms; `resume()` tại 25% và 4ms. Partition nhanh không bị partition chậm chặn, còn hysteresis tránh flapping vì jitter ngắn.
+- **Coalesced Manual Offset Commit**: Sau batch thành công (`enable_auto_commit=False`), worker công bố offset cho coordinator. Coordinator commit nhiều partition mỗi 25ms/512 record, tách Kafka RTT khỏi critical path và giảm request tới broker. Khi rebalance/crash, cửa sổ chưa commit được phát lại và store xử lý idempotent/version-fenced.
 - **Dead Letter Queue (DLQ)**: Khi một record hoặc batch bị lỗi cấu trúc dữ liệu nghiêm trọng vượt quá `MAX_BATCH_RETRIES` (mặc định 3 lần), toàn bộ thông tin nguồn (topic, partition, offset, error_type, payload) được đẩy vào `<topic>.dlq`.
 
 ### 2.2. `DatabasePool` (`db.py`)
@@ -122,11 +122,12 @@ Hệ thống thu thập và xuất dữ liệu đo lường (Telemetry):
   - `pipeline_offset_commit_latency_seconds`, `pipeline_offset_commit_pending_records`, `pipeline_offset_commit_records_total`, `pipeline_offset_commit_errors_total`
   - `pipeline_batch_latency_seconds` (Histogram)
   - `pipeline_stage_latency_seconds` (Histogram theo stage: state, postgres, redis)
+  - `pipeline_preprocess_message_lag_seconds` (Histogram từ lúc nhận UDP đến khi bắt đầu business processing)
   - `pipeline_kafka_lag_records` (Gauge theo từng member)
   - `pipeline_e2e_message_lag_seconds` (Histogram đo độ trễ từ lúc gói tin vào Ingestion đến khi hoàn tất ghi DB/Redis)
 - **Sliding-Window Structured Logger**: Định kỳ in ra log phân khối trực quan (`|`), theo dõi riêng biệt:
   - Throughput (`recv`, `success`, `pg`, `rds`)
-  - Latency (`batch_avg`, `stage(state, pg, rds, persist_parallel)`, `e2e_avg/p95/max`)
+  - Latency (`batch_avg`, `stage(...)`, `pre_process_p95`, `processing_p95`, `e2e_avg/p95/max`)
   - Sự kiện Swap (`events_detected(+delta)`, `ignored`)
   - **Giám sát thất thoát (`data_loss = errors + dlq`)**
   - Số liệu tích lũy (`Totals`).

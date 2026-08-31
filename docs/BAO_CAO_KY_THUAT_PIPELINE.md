@@ -75,7 +75,7 @@ flowchart TD
 
 #### Kỹ thuật 4: Kernel Socket Load Balancing (`SO_REUSEPORT`) & Gắn Thẻ Thời Gian Ingest
 - Socket UDP được cấu hình cờ `SO_REUSEPORT` và buffer nhận tối đa 32MB (`SO_RCVBUF`). Khi chạy nhiều tiến trình Ingestion trên Linux, Kernel tự động băm (hash) 4-tuple (`src_ip, src_port, dst_ip, dst_port`) phân bổ gói tin đều cho các tiến trình mà không cần Proxy trung gian.
-- Gắn nhãn thời gian tiếp nhận tức thời `ingest_timestamp` (UTC ISO-8601) và float timestamp `ingest_epoch_s` = `time.time()` vào bản ghi phục vụ đo lường độ trễ bản tin End-to-End với tốc độ cực nhanh (triệt tiêu 100% chi phí parse ISO string datetime).
+- Ngay sau `sock_recvfrom`, gắn `ingest_timestamp`, `ingest_epoch_s` và mốc nanosecond nguyên `ingest_epoch_ns`. Consumer ưu tiên mốc nguyên để đo End-to-End chính xác hơn và chỉ fallback sang ISO cho record cũ.
 
 ---
 
@@ -89,10 +89,10 @@ flowchart TD
 
 #### Kỹ thuật 2: Khống Chế Inflight Toàn Cục Trực Tiếp qua Semaphore (`RADIUS_UDP_KAFKA_TOTAL_MAX_INFLIGHT_BATCHES`)
 - Sử dụng `asyncio.Semaphore(total_inflight_limit)` để khống chế trần tổng số Kafka produce futures đồng thời trên toàn bộ workers (profile 8 GiB tối đa 24 batch × 64 record).
-- Mỗi worker giữ baseline 4 batch và tự nâng lên 6 khi queue shard đạt 25%; bốn worker tương ứng 16 batch baseline và 24 batch khi pressure. Mức này được sizing từ bandwidth-delay product và ngân sách p95.
-- Các worker được ánh xạ cố định lên một pool Kafka producer độc lập (mặc định 4).
-  Một MSISDN luôn thuộc cùng worker và producer, nên loại bỏ contention của một
-  producer duy nhất trong khi vẫn giữ thứ tự record theo thuê bao/Kafka key.
+- Mỗi worker có trần 6 batch; semaphore toàn process giữ tổng tối đa 24 batch ở profile 8 GiB. Mức này được sizing từ bandwidth-delay product và ngân sách p95.
+- Bốn publisher coroutine dùng chung một `AIOKafkaProducer` ở profile 8/16 GiB.
+  Kafka giữ thứ tự theo partition/key, còn accumulator chung gom record cùng
+  partition hiệu quả hơn và giảm số connection/request nhỏ tới broker.
 - Ngăn ngừa tình trạng áp lực bộ nhớ và biến động latency khi Kafka Cluster gặp hiện tượng nghẽn I/O hoặc rebalance.
 
 #### Kỹ thuật 3: Passive Mirror Boundary

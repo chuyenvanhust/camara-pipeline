@@ -7,6 +7,7 @@ import logging
 import os
 import socket
 import struct
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, AsyncIterator, Dict
 
@@ -46,7 +47,9 @@ class PacketReader:
             raise PacketDecodeError("empty string attribute")
         return result
 
-    def decode_radius(self, packet: bytes) -> Dict[str, Any]:
+    def decode_radius(
+        self, packet: bytes, *, received_epoch_ns: int | None = None
+    ) -> Dict[str, Any]:
         if len(packet) < 20:
             raise PacketDecodeError("packet shorter than RADIUS header")
         if packet[0] != 4:
@@ -89,11 +92,15 @@ class PacketReader:
                     result[name] = self._text(value)
             offset += attr_len
 
-        received_at = datetime.now(timezone.utc)
+        if received_epoch_ns is None:
+            received_epoch_ns = time.time_ns()
+        received_at = datetime.fromtimestamp(received_epoch_ns / 1_000_000_000, timezone.utc)
         if "event_timestamp" not in result:
             delay = max(int(result.get("acct_delay_time", 0)), 0)
             result["event_timestamp"] = (received_at - timedelta(seconds=delay)).isoformat()
         result["ingest_timestamp"] = received_at.isoformat()
+        result["ingest_epoch_ns"] = received_epoch_ns
+        result["ingest_epoch_s"] = received_epoch_ns / 1_000_000_000
         return result
 
     def _decode_vendor(self, value: bytes, result: Dict[str, Any]) -> None:
@@ -144,9 +151,12 @@ class PacketReader:
         try:
             while True:
                 packet, address = await loop.sock_recvfrom(sock, 4096)
+                received_epoch_ns = time.time_ns()
                 self.stats["datagrams"] += 1
                 try:
-                    decoded = self.decode_radius(packet)
+                    decoded = self.decode_radius(
+                        packet, received_epoch_ns=received_epoch_ns
+                    )
                     self.stats["decoded"] += 1
                     request_authenticator = packet[4:20]
                     event_id = f"radius:{request_authenticator.hex()}"

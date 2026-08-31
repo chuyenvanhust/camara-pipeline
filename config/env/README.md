@@ -10,21 +10,28 @@ nay chi ghi de cac bien tai nguyen/hieu nang, khong lap lai secret hay dia chi d
 | `32gb.env` | 24 | 24 | 3 x 2 | 2 x 3 | 7.8k pkt/s | E2E p95 < 100ms |
 | `64gb.env` | 32 | 48 | 4 x 2 | 2 x 4 | 15.5k pkt/s | E2E p95 < 100ms |
 
-CPU quota của Kafka, ingestion, PostgreSQL và các replica pipeline chỉ dùng khoảng
-85–95% số core profile; phần còn lại dành cho Redis, Docker networking, kernel UDP
-và monitoring. Đây là chủ ý để bảo vệ tail latency, không phải tài nguyên bị bỏ phí.
+CPU quota là trần burst của từng container, không phải phần core được giữ chỗ.
+Tổng trần của các đường nóng được đặt gần số core profile để broker và database
+có thể hấp thụ tail ngắn; admission ceiling vẫn phải bảo đảm CPU host không bão
+hòa kéo dài và còn thời gian chạy cho Redis, networking, kernel UDP, monitoring.
+
+Profile 8 GiB phân đúng ngân sách 12 CPU cho critical path:
+`3 x Kafka(1.5) + PostgreSQL(2.5) + Redis(0.5) + Ingestion(1) + IP(1.5) + Device(1) + SIM(1) = 12`.
+Đây là tổng quota tối đa, không phải reservation. PostgreSQL được ưu tiên vì log
+cho thấy PG/state fallback chiếm phần lớn processing latency; ingestion bị hạ quota
+vì tại admission 2.9k/s queue rỗng và Kafka persisted bám sát UDP input.
 
 Moi member co FIFO rieng cho tung partition. Cung mot MSISDN luon vao cung Kafka
 partition, nen ba partition cua mot member co the xu ly dong thoi ma van giu dung
 thu tu tren tung MSISDN. Tat ca profile giu IP batch=16/timeout=1ms va Swap
 batch=24/timeout=1ms. Profile lon tang so process va partition lanes thay vi tang
 batch. FIFO cuc bo chi giu toi da bon batch; partition pause tai 75% hoac khi
-record cu nhat cho 7ms, va resume tai 25%/3ms.
+record cu nhat cho 12ms, va resume tai 25%/4ms.
 
 Capture la nguon ben vung va phai admission-control theo sustained rate trong
 profile. Ingestion dung `acks=1`; PostgreSQL van `synchronous_commit=on` va Kafka
 offset chi duoc danh dau sau khi PostgreSQL + Redis hoan tat. Commit coordinator
-gom offset da xu ly moi 5ms/256 records ngoai critical path. Crash co the replay
+gom offset da xu ly moi 25ms/512 records ngoai critical path. Crash co the replay
 mot cua so nho; version fence/idempotency bao ve state va event.
 
 Ingestion inflight duoc sizing theo bandwidth-delay product:
@@ -64,6 +71,7 @@ Sau khi doi `KAFKA_TOPIC_PARTITIONS`, phai chay quy trinh cap nhat topic; Compos
 khong tu giam partition va consumer chi can scale den so partition huu dung.
 
 Muc throughput la admission ceiling latency-first, khong phai throughput toi da
-de queue day. Khong cho phep burst cao hon ceiling neu p95 <100ms la invariant.
+de queue day. Cac ceiling lon hon 2.9k/s la diem khoi dau benchmark, chua phai
+cam ket tren phan cung dich. Khong tang ceiling neu p95 <100ms chua on dinh.
 Chi cong nhan profile tren phan cung dich khi soak test cho thay
 event-level E2E p95 < 100ms, loss=0 va Kafka lag khong tang lien tuc.

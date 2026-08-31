@@ -3,7 +3,8 @@
 > **Trạng thái: tài liệu lịch sử/superseded.** Baseline 15k dưới đây giải thích sự cố cũ.
 > Cấu hình vận hành hiện hành nằm trong `config/env/*.env`: ingestion batch 64/1ms,
 > Kafka `acks=1`, queue theo profile và admission limit 2.9k/3.9k/7.8k/15.5k để bảo vệ
-> E2E p95 <100ms. Không áp các con số batch/queue trong phần lịch sử này.
+> E2E p95 <100ms. Profile 8 GiB dùng 4 worker/1 producer dùng chung và inflight
+> 6/worker, tối đa 24 toàn process. Không áp các con số batch/queue trong phần lịch sử này.
 
 ## 1. Kết luận từ baseline 15.000 pkt/s
 
@@ -101,9 +102,9 @@ thấp hơn nếu ingestion còn drop, nhưng không được bằng 0 khi state
 
 ### Nếu chưa đạt
 
-1. Nếu `worker_slot_wait_p95` cao nhưng `global_wait_p95` thấp sau khi producer
-   pool hoạt động: A/B `RADIUS_UDP_KAFKA_PRODUCERS=2` và `4`; giữ batch/inflight
-   cố định, chọn cấu hình có throughput cao hơn mà broker p99 không xấu đi.
+1. Nếu `worker_slot_wait_p95` cao nhưng `global_wait_p95` thấp: kiểm tra persist
+   p95 và broker trước. Chỉ A/B tăng producer từ 1 lên 2 nếu producer dùng chung
+   thật sự bão hòa; không mặc định quay lại một producer cho mỗi worker.
 2. Nếu `global_wait_p95` cao và Kafka persist p95 ổn định: thử total 32 trong
    một A/B test riêng; rollback nếu p99 hoặc broker CPU tăng mạnh.
 3. Nếu Kafka persist p95 vẫn >200ms: không tăng inflight tiếp. Kiểm tra broker

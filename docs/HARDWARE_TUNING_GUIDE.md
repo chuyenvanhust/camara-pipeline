@@ -46,7 +46,7 @@ Hệ thống **CAMARA Network API Data Pipeline** tuân thủ 100% nguyên lý *
 | `KAFKA_NUM_IO_THREADS` | `16` | Integer | Số thread xử lý truy xuất đĩa đĩa của Kafka Broker. Tăng khi sử dụng mảng ổ đĩa NVMe/SSD. |
 | `ZOOKEEPER_MEM_LIMIT` | `192m` | RAM | Giới hạn RAM tối đa cấp cho Container ZooKeeper. |
 | `KAFKA_MEM_LIMIT` | `900m` | RAM | Giới hạn RAM mỗi broker, gồm JVM heap và phần còn lại cho native/page cache. |
-| `KAFKA_CPUS` | `2` | Cores | Giới hạn CPU mỗi broker trong profile 12 vCPU/8 GiB. |
+| `KAFKA_CPUS` | `1.5` | Cores | Giới hạn CPU **mỗi broker** trong profile 12 vCPU/8 GiB; ba broker có tổng quota 4,5 CPU. |
 | `KAFKA_HEAP_OPTS` | `-Xms448M -Xmx448M` | JVM | Heap thực sự truyền vào cả ba broker; không đặt heap sát `mem_limit`. |
 
 ---
@@ -68,7 +68,7 @@ Hệ thống **CAMARA Network API Data Pipeline** tuân thủ 100% nguyên lý *
 | `DEVICE_SWAP_DB_POOL_MAX` | `8` | Connections | Kích thước pool kết nối tối đa `asyncpg` cho service `pipeline-device-swap`. |
 | `SIM_SWAP_DB_POOL_MAX` | `8` | Connections | Kích thước pool kết nối tối đa `asyncpg` cho service `pipeline-sim-swap`. |
 | `POSTGRES_MEM_LIMIT` | `1g` | RAM | Giới hạn RAM PostgreSQL của profile cơ sở. |
-| `POSTGRES_CPUS` | `1.5` | Cores | CPU PostgreSQL của profile cơ sở. |
+| `POSTGRES_CPUS` | `2.5` | Cores | CPU PostgreSQL của profile cơ sở; bottleneck dùng chung cho mapping và hai nhánh swap. |
 
 ---
 
@@ -83,6 +83,7 @@ Hệ thống **CAMARA Network API Data Pipeline** tuân thủ 100% nguyên lý *
 | `REDIS_MASTER_NAME` | `camara-master` | String | Tên master group trong Redis Sentinel cluster. |
 | `REDIS_MAXMEMORY` | `256mb` | RAM | Bộ nhớ tối đa cho dataset Redis. |
 | `REDIS_MEM_LIMIT` | `384m` | RAM | Container limit, cao hơn dataset để chừa overhead. |
+| `REDIS_CPUS` | `0.5` | Cores | Quota Redis trong profile 8 GiB; theo dõi throttling và Redis p95 trước khi tăng throughput. |
 
 ---
 
@@ -95,10 +96,10 @@ Hệ thống **CAMARA Network API Data Pipeline** tuân thủ 100% nguyên lý *
 | `RADIUS_UDP_QUEUE_MAX_RECORDS` | `20000` | Records | Burst buffer ngắn trước Kafka. Queue không phải durable storage; queue lớn che giấu overload và trực tiếp làm tăng E2E. |
 | `RADIUS_UDP_KAFKA_BATCH_RECORDS` | `64` | Records | Micro-batch latency-first; tăng số lane để scale thay vì tăng batch. |
 | `RADIUS_UDP_KAFKA_BATCH_WAIT_MS` | `1` | ms | Ngân sách chờ gom batch phía ingestion. |
-| `RADIUS_UDP_KAFKA_MAX_INFLIGHT_BATCHES_PER_WORKER` | `4` | Batches | Baseline trên mỗi worker; profile 8 GiB có 16 batch đồng thời. |
+| `RADIUS_UDP_KAFKA_MAX_INFLIGHT_BATCHES_PER_WORKER` | `6` | Batches | Baseline trên mỗi worker; global limit 24 ngăn tổng concurrency vượt ngân sách. |
 | `RADIUS_UDP_KAFKA_PRESSURE_INFLIGHT_BATCHES_PER_WORKER` | `6` | Batches | Trần tạm thời khi queue shard vượt ngưỡng pressure. |
 | `RADIUS_UDP_KAFKA_PRESSURE_QUEUE_RATIO` | `0.25` | Ratio | Tỷ lệ queue shard kích hoạt pressure concurrency sớm. |
-| `RADIUS_UDP_KAFKA_PRODUCERS` | `4` | Producers | Producer pool theo shard; cùng MSISDN luôn đi qua cùng worker/producer. |
+| `RADIUS_UDP_KAFKA_PRODUCERS` | `1` | Producers | Producer dùng chung cho bốn shard coroutine. FIFO do key/partition bảo đảm; accumulator chung giảm batch fragmentation. |
 | `RADIUS_UDP_KAFKA_TOTAL_MAX_INFLIGHT_BATCHES` | `24` | Batches | Trần tuyệt đối toàn process của profile 8 GiB. |
 | `INGESTION_BATCH_SIZE_BYTES` | `262144` | Bytes | Buffer batch tối đa của Kafka producer. |
 | `RADIUS_UDP_PUBLISHER_WORKERS` | `4` | Workers | Số lượng worker coroutines publish song song (đã được định tuyến theo MSISDN Key Sharding). |
@@ -106,7 +107,7 @@ Hệ thống **CAMARA Network API Data Pipeline** tuân thủ 100% nguyên lý *
 | `INGESTION_KAFKA_PERSIST_WARN_MS` | `20` | ms | Ngưỡng cảnh báo p95 thời gian Kafka xác nhận ghi batch nội bộ. |
 | `INGESTION_QUEUE_WARN_MS` | `20` | ms | Ngưỡng cảnh báo p95 thời gian record nằm trong queue RAM. |
 | `RADIUS_INGESTION_MEM_LIMIT` | `1g` | RAM | Giới hạn RAM Docker cấp cho Container Ingestion. |
-| `RADIUS_INGESTION_CPUS` | `2` | Cores | CPU ingestion; receiver/decode vẫn là một event loop nên theo dõi CPU từng container, không dùng tổng CPU host để kết luận. |
+| `RADIUS_INGESTION_CPUS` | `1` | Cores | Ingestion tại 2,9k/s có queue gần 0 và không phải bottleneck; chỉ tăng lại nếu CPU throttling đi kèm kernel `RcvbufErrors`. |
 
 ---
 
@@ -119,13 +120,13 @@ Hệ thống **CAMARA Network API Data Pipeline** tuân thủ 100% nguyên lý *
 | `*_PARTITION_CONCURRENCY` | `3` | Workers | Ba partition/member chạy đồng thời; FIFO theo partition vẫn được giữ. |
 | `IP_MSISDN_PARTITION_QUEUE_RECORDS` / `*_SWAP_PARTITION_QUEUE_RECORDS` | `64` / `96` | Records/partition | Tối đa bốn batch cục bộ; Kafka mới là durable backlog. |
 | `PROCESSING_PARTITION_QUEUE_HIGH_RATIO` / `LOW_RATIO` | `0.75` / `0.25` | Ratio | High/low watermark cho backpressure riêng partition. |
-| `PROCESSING_PARTITION_QUEUE_MAX_AGE_MS` / `RESUME_AGE_MS` | `7` / `3` | ms | Chặn queue tích lũy latency dù depth còn thấp. |
-| `PROCESSING_COMMIT_INTERVAL_MS` / `MAX_RECORDS` | `5` / `256` | ms / records | Coalesce offset commit ngoài đường xử lý nghiệp vụ. |
+| `PROCESSING_PARTITION_QUEUE_MAX_AGE_MS` / `RESUME_AGE_MS` | `12` / `4` | ms | Backpressure theo tuổi record với hysteresis đủ rộng để tránh flapping do jitter ngắn. |
+| `PROCESSING_COMMIT_INTERVAL_MS` / `MAX_RECORDS` | `25` / `512` | ms / records | Coalesce offset commit ở coordinator nền, giảm request Kafka; không đổi thời điểm xác nhận business write. |
 | `IP_MSISDN_BATCH_MAX_RECORDS` / `*_SWAP_BATCH_MAX_RECORDS` | `16` / `24` | Records | IP có write amplification lớn hơn nên dùng batch nhỏ hơn swap. |
 | `*_BATCH_TIMEOUT_MS` | `2` | ms | Thời gian gom micro-batch tối đa. |
 | `THROUGHPUT_LOG_INTERVAL_SECONDS` | `10` | Giây | Chu kỳ in log thống kê thông lượng telemetry nội bộ. |
 | `PIPELINE_IP_MEM_LIMIT` / `DEVICE...` / `SIM...` | `512m` / `512m` / `512m` | RAM | Phân bổ RAM profile 8 GiB theo trọng lượng workload. |
-| `PIPELINE_IP_CPUS` / `DEVICE...` / `SIM...` | `2` / `1` / `1` | Cores | IP xử lý mọi mapping event và được ưu tiên CPU; swap có tỷ lệ event thấp hơn. |
+| `PIPELINE_IP_CPUS` / `DEVICE...` / `SIM...` | `1.5` / `1` / `1` | Cores | Consumer chủ yếu chờ shared stores; CPU được chuyển cho PostgreSQL thay vì tăng quota worker I/O-bound. |
 | `PIPELINE_SLA_E2E_P95_MS` | `100` | ms | Log chuyển thành `SLO_BREACH` nếu p95 cửa sổ vượt ngưỡng. |
 
 ---
@@ -182,15 +183,15 @@ Hệ thống **CAMARA Network API Data Pipeline** tuân thủ 100% nguyên lý *
 | Kafka partitions | 9 | 12 | 24 | 48 |
 | Kafka RAM / broker | 900m | 1536m | 3g | 6g |
 | Kafka heap / broker | 448M | 768M | 1536M | 3G |
-| Kafka CPU / broker | 1 | 1.2 | 2.2 | 2.5 |
-| PostgreSQL RAM / CPU | 1g / 1.5 | 2560m / 2.5 | 6g / 4.5 | 12g / 6 |
-| Redis container / dataset | 384m / 256mb | 1g / 768mb | 2g / 1536mb | 4g / 3gb |
+| Kafka CPU / broker | 1.5 | 1.5 | 2.5 | 2.5 |
+| PostgreSQL RAM / CPU | 1g / 2.5 | 2560m / 2.5 | 6g / 4.5 | 12g / 6 |
+| Redis container / dataset / CPU | 384m / 256mb / 0.5 | 1g / 768mb / 1 | 2g / 1536mb / 1.5 | 4g / 3gb / 2 |
 | Ingestion queue | 20k | 30k | 60k | 120k |
 | Ingestion batch / wait / linger | 64 / 1ms / 0ms | 64 / 1ms / 0ms | 64 / 1ms / 0ms | 64 / 1ms / 0ms |
-| Ingestion workers / producers | 4 / 4 | 4 / 4 | 8 / 8 | 8 / 8 |
-| Ingestion RAM / CPU | 1g / 1.5 | 1g / 1.5 | 1536m / 2.5 | 3g / 3 |
+| Ingestion workers / producers | 4 / 1 | 4 / 1 | 8 / 2 | 8 / 4 |
+| Ingestion RAM / CPU | 1g / 1 | 1g / 1.5 | 1536m / 2.5 | 3g / 3 |
 | IP replicas x members / concurrency | 1x3 / 3 | 2x2 / 3 | 3x2 / 4 | 4x2 / 6 |
-| IP batch / timeout / CPU mỗi replica | 16 / 1ms / 2 | 16 / 1ms / 1.5 | 16 / 1ms / 1.5 | 16 / 1ms / 2 |
+| IP batch / timeout / CPU mỗi replica | 16 / 1ms / 1.5 | 16 / 1ms / 1.5 | 16 / 1ms / 1.5 | 16 / 1ms / 2 |
 | Swap replicas x members / concurrency | 1x3 / 3 | 2x2 / 3 | 2x3 / 4 | 2x4 / 6 |
 | Swap batch / timeout / CPU mỗi replica | 24 / 1ms / 1 | 24 / 1ms / 1 | 24 / 1ms / 1 | 24 / 1ms / 1.5 |
 
@@ -198,9 +199,14 @@ Profile mặc định 8 GiB dùng 3 consumer cho 9 partition để mỗi member 
 
 Trong IP-MSISDN, hai store được ghi **đồng thời**. Sau khi cả hai thành công,
 worker chỉ công bố offset đã bền cho commit coordinator; coordinator coalesce offset
-mỗi 5ms hoặc 256 record rồi commit ngoài critical path. Vì vậy batch latency tiến
+mỗi 25ms hoặc 512 record rồi commit ngoài critical path. Vì vậy batch latency tiến
 gần `max(pg, redis)` và không cộng thêm một Kafka commit round-trip cho mỗi batch.
 Crash có thể replay cửa sổ chưa commit; version fence làm lần ghi lặp lại idempotent.
+
+E2E được đo từ `ingest_epoch_ns` đóng dấu ngay sau khi application nhận UDP đến
+sau khi business state đã ghi xong. `pre_process_p95` bao gồm ingestion/Kafka/queue,
+`processing_p95` đo riêng `process_batch`, còn offset commit được báo cáo riêng.
+Không cộng các p95 này để suy ra E2E p95 vì chúng không nhất thiết thuộc cùng record.
 
 Khởi chạy profile override:
 
@@ -219,7 +225,7 @@ Khi tự điều chỉnh thông số cho cấu hình phần cứng bất kỳ, �
 ### 1. Thời Gian Hấp Thụ Tràn Hàng Đợi RAM Ingestion (Hold Time)
 $$T_{\text{hold (seconds)}} = \frac{\text{RADIUS\_UDP\_QUEUE\_MAX\_RECORDS}}{\text{Input Packet Rate (pkt/s)}}$$
 *Ví dụ*: Queue 20.000 bản ghi ở 2.900 pkt/s là gần 6,9 giây đệm lỗi,
-không phải ngân sách latency. Partition bị pause theo tuổi record 7ms; khi queue
+không phải ngân sách latency. Partition bị pause theo tuổi record 12ms; khi queue
 residence tăng, capture phải giảm tốc/replay.
 
 ### 2. Dung Lượng Inflight Kafka Tối Đa Toàn Hệ Thống (Total Inflight Capacity)

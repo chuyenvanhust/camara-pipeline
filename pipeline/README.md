@@ -223,8 +223,8 @@ classDiagram
    - Mỗi partition có đúng một mutating worker nên offset trong partition luôn tuần tự. Các partition độc lập chạy song song tới giới hạn `PROCESSING_PARTITION_CONCURRENCY`.
    - Worker coalesce các fragment fetch liền kề tới `BATCH_MAX_RECORDS` trước khi ghi, tránh biến từng fragment nhỏ thành một transaction/commit riêng.
    - Concurrency là ngân sách downstream: profile 8 GiB dùng mức 3 vì mỗi member sở hữu ba partition độc lập. FIFO vẫn được giữ trong từng partition, nên cùng MSISDN không bị đảo thứ tự.
-   - Sau PostgreSQL/Redis, worker công bố offset cho commit coordinator. Coordinator gom offset của nhiều partition mỗi 5ms/256 records và commit ngoài critical path; partition nhanh không phải chờ một Kafka round-trip cho từng batch.
-   - Khi FIFO đạt 75% hoặc record cũ nhất chờ 7ms, consumer `pause()` riêng partition đó; chỉ `resume()` khi xuống 25% và tuổi hàng đợi dưới 3ms. Rebalance phát lại phần chưa commit cho owner mới.
+   - Sau PostgreSQL/Redis, worker công bố offset cho commit coordinator. Coordinator gom offset của nhiều partition mỗi 25ms/512 records và commit ngoài critical path; partition nhanh không phải chờ một Kafka round-trip cho từng batch.
+   - Khi FIFO đạt 75% hoặc record cũ nhất chờ 12ms, consumer `pause()` riêng partition đó; chỉ `resume()` khi xuống 25% và tuổi hàng đợi dưới 4ms. Rebalance phát lại phần chưa commit cho owner mới.
 6. **Giám sát Supervisor & Graceful Shutdown**:
    - Lắng nghe tín hiệu `SIGINT`/`SIGTERM` tập trung.
    - Khi có sự cố unhandled, Supervisor sẽ kích hoạt fail-fast dừng an toàn, đóng Database Pool và flush metrics.
@@ -236,13 +236,15 @@ classDiagram
 Hệ thống ghi log định kỳ mỗi `THROUGHPUT_LOG_INTERVAL_SECONDS` (10s) theo định dạng phân khối trực quan bằng ký tự `|`:
 
 ```
-[PROCESSING][<group-id>][member=<m>/<n>][OK|SLO_BREACH|ERROR] ... | Latency: batch_avg=16.0rec/... e2e_avg=... p95=... | Flow: kafka_lag=0 partition_queue=0 oldest=0.0ms workers=3 concurrency_limit=3 paused=0 | OffsetCommit: pending=0 records=.../s requests=.../s p95=...ms errors=0(+0) | Quality/Loss: ...
+[PROCESSING][<group-id>][member=<m>/<n>][OK|SLO_BREACH|ERROR] ... | Latency: batch_avg=16.0rec/... pre_process_p95=... processing_p95=... e2e_avg=... p95=... | Flow: kafka_lag=0 partition_queue=0 oldest=0.0ms workers=3 concurrency_limit=3 paused=0 | OffsetCommit: pending=0 records=.../s requests=.../s p95=...ms errors=0(+0) | Quality/Loss: ...
 ```
 
 ### Các trường đo lường chính:
 - **`Throughput`**: Tốc độ nhận message (`recv`), tốc độ xử lý thành công (`success`), tốc độ ghi thực tế xuống PostgreSQL (`pg`) và Redis (`rds`).
 - **`Latency`**: 
   - `batch_avg`: Số record/thời gian trung bình của một batch; dùng để phát hiện batch fragmentation.
+  - `pre_process_p95`: Từ lúc nhận UDP đến lúc batch bắt đầu business processing; bao gồm ingestion, Kafka và queue phía consumer.
+  - `processing_p95`: p95 thời gian `process_batch`; offset commit không nằm trong chỉ số này.
   - `stage(...)`: Phân rã độ trễ chi tiết từng chặng nội bộ:
     - `state`: Thời gian nạp state (bao gồm `mget`: Redis MGET latency, `pg_fb`: Postgres fallback query latency, `hit`: Cache hit ratio %).
     - `pg`: Thời gian ghi batch xuống PostgreSQL.
