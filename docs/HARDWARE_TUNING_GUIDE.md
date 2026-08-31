@@ -126,7 +126,8 @@ Hệ thống **CAMARA Network API Data Pipeline** tuân thủ 100% nguyên lý *
 | `*_BATCH_TIMEOUT_MS` | `2` | ms | Thời gian gom micro-batch tối đa. |
 | `THROUGHPUT_LOG_INTERVAL_SECONDS` | `10` | Giây | Chu kỳ in log thống kê thông lượng telemetry nội bộ. |
 | `PIPELINE_IP_MEM_LIMIT` / `DEVICE...` / `SIM...` | `512m` / `512m` / `512m` | RAM | Phân bổ RAM profile 8 GiB theo trọng lượng workload. |
-| `PIPELINE_IP_CPUS` / `DEVICE...` / `SIM...` | `1.5` / `1` / `1` | Cores | Consumer chủ yếu chờ shared stores; CPU được chuyển cho PostgreSQL thay vì tăng quota worker I/O-bound. |
+| `PIPELINE_*_CPU_SHARES` | `1024 / 768 / 768` | Weight | Trọng số tương đối khi CPU contention; pipeline không dùng hard `cpus` quota để tránh CFS throttling gây tail latency. |
+| `PROCESSING_COMBINE_WAIT_MS` / `MAX_RECORDS` | `2 / 64` | ms / records | Gom batch từ các partition độc lập ở cấp process trước một lần ghi downstream. |
 | `PIPELINE_SLA_E2E_P95_MS` | `100` | ms | Log chuyển thành `SLO_BREACH` nếu p95 cửa sổ vượt ngưỡng. |
 
 ---
@@ -177,8 +178,8 @@ Hệ thống **CAMARA Network API Data Pipeline** tuân thủ 100% nguyên lý *
 
 | Biến | 8 GiB / 12 CPU | 16 GiB / 16 CPU | 32 GiB / 24 CPU | 64 GiB / 32 CPU |
 |---|---:|---:|---:|---:|
-| Admission ceiling | **2.9k/s** | **3.9k/s** | **7.8k/s** | **15.5k/s** |
-| Burst vẫn giữ SLO | 2.9k/s | 3.9k/s | 7.8k/s | 15.5k/s |
+| Admission ceiling | **800/s baseline** | **3.9k/s candidate** | **7.8k/s candidate** | **15.5k/s candidate** |
+| Burst/benchmark target | 900/s | 3.9k/s | 7.8k/s | 15.5k/s |
 | SLO bắt buộc | p95 <100ms | p95 <100ms | p95 <100ms | p95 <100ms |
 | Kafka partitions | 9 | 12 | 24 | 48 |
 | Kafka RAM / broker | 900m | 1536m | 3g | 6g |
@@ -190,12 +191,23 @@ Hệ thống **CAMARA Network API Data Pipeline** tuân thủ 100% nguyên lý *
 | Ingestion batch / wait / linger | 64 / 1ms / 0ms | 64 / 1ms / 0ms | 64 / 1ms / 0ms | 64 / 1ms / 0ms |
 | Ingestion workers / producers | 4 / 1 | 4 / 1 | 8 / 2 | 8 / 4 |
 | Ingestion RAM / CPU | 1g / 1 | 1g / 1.5 | 1536m / 2.5 | 3g / 3 |
-| IP replicas x members / concurrency | 1x3 / 3 | 2x2 / 3 | 3x2 / 4 | 4x2 / 6 |
-| IP batch / timeout / CPU mỗi replica | 16 / 1ms / 1.5 | 16 / 1ms / 1.5 | 16 / 1ms / 1.5 | 16 / 1ms / 2 |
-| Swap replicas x members / concurrency | 1x3 / 3 | 2x2 / 3 | 2x3 / 4 | 2x4 / 6 |
-| Swap batch / timeout / CPU mỗi replica | 24 / 1ms / 1 | 24 / 1ms / 1 | 24 / 1ms / 1 | 24 / 1ms / 1.5 |
+| IP replicas x members / concurrency | 3x1 / 2 | 4x1 / 3 | 6x1 / 4 | 8x1 / 6 |
+| IP partition batch / fetch wait / CPU | 16 / 2ms / no hard cap | 16 / 2ms / no hard cap | 16 / 2ms / no hard cap | 16 / 2ms / no hard cap |
+| Swap replicas x members / concurrency | 3x1 / 2 | 4x1 / 3 | 6x1 / 4 | 8x1 / 6 |
+| Swap partition batch / fetch wait / CPU | 24 / 2ms / no hard cap | 24 / 2ms / no hard cap | 24 / 2ms / no hard cap | 24 / 2ms / no hard cap |
+| Process write combine wait / max | 2ms / 64 | 2ms / 64 | 2ms / 96 | 2ms / 128 |
+| Swap checkpoint interval | 150ms | 150ms | 150ms | 150ms |
 
-Profile mặc định 8 GiB dùng 3 consumer cho 9 partition để mỗi member nhận đúng 3 partition. Ba partition độc lập được chạy đồng thời; FIFO vẫn được giữ bên trong từng partition và key MSISDN không đổi partition. IP-MSISDN được cấp CPU riêng vì mọi mapping event đều phải ghi cả PostgreSQL và Redis.
+Mỗi member là một container/PID Python (`CONSUMERS_PER_GROUP=1`); không chạy ba
+consumer coroutine trong cùng interpreter. Profile 8 GiB dùng 3 replica cho 9
+partition để mỗi process nhận trung bình 3 partition. Không đặt hard CPU quota
+cho worker; admission control giới hạn tải tổng, còn `cpu_shares` ưu tiên IP khi
+host tranh chấp.
+
+Mỗi process tự sở hữu PostgreSQL pool và Redis client. PostgreSQL gắn
+`application_name` theo module; Redis dùng DB 0/1/2 tương ứng IP/Device/SIM.
+PostgreSQL vật lý vẫn là một cluster để giữ transaction outbox, audit,
+subscription và API nhất quán; tách cluster là một data-migration riêng.
 
 Trong IP-MSISDN, hai store được ghi **đồng thời**. Sau khi cả hai thành công,
 worker chỉ công bố offset đã bền cho commit coordinator; coordinator coalesce offset
@@ -224,7 +236,7 @@ Khi tự điều chỉnh thông số cho cấu hình phần cứng bất kỳ, �
 
 ### 1. Thời Gian Hấp Thụ Tràn Hàng Đợi RAM Ingestion (Hold Time)
 $$T_{\text{hold (seconds)}} = \frac{\text{RADIUS\_UDP\_QUEUE\_MAX\_RECORDS}}{\text{Input Packet Rate (pkt/s)}}$$
-*Ví dụ*: Queue 20.000 bản ghi ở 2.900 pkt/s là gần 6,9 giây đệm lỗi,
+*Ví dụ*: Queue 20.000 bản ghi ở 800 pkt/s là 25 giây đệm lỗi,
 không phải ngân sách latency. Partition bị pause theo tuổi record 12ms; khi queue
 residence tăng, capture phải giảm tốc/replay.
 

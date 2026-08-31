@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import signal
+import socket
 
 from aiokafka.admin import AIOKafkaAdminClient, NewTopic
 from aiokafka.errors import TopicAlreadyExistsError
@@ -12,7 +13,6 @@ from prometheus_client import start_http_server
 
 from pipeline.modules.device_swap.consumer import DeviceSwapConsumer
 from pipeline.modules.ip_msisdn.consumer import IPMsisdnConsumer
-from pipeline.modules.shared.db import DatabasePool
 from pipeline.modules.sim_swap.consumer import SimSwapConsumer
 
 logger = logging.getLogger(__name__)
@@ -65,22 +65,27 @@ async def run_pipeline(duration: int | None = None) -> None:
     else:
         consumer_specs = [(cls, group_id) for cls, group_id, _ in all_specs]
 
+    consumers_per_group = max(1, int(os.getenv("CONSUMERS_PER_GROUP", "1")))
+    if consumers_per_group != 1:
+        raise ValueError(
+            "CONSUMERS_PER_GROUP must be 1: one Kafka member is one OS process. "
+            "Scale the Docker service with PIPELINE_<MODULE>_REPLICAS instead."
+        )
+
     bootstrap = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "camara-kafka:9092")
     raw_topic = os.getenv("KAFKA_TOPIC_RAW", "radius.accounting.raw")
     dlq_topic = f"{raw_topic}.dlq"
     start_http_server(int(os.getenv("METRICS_PORT", "9200")))
     await ensure_topics(bootstrap, [raw_topic, dlq_topic])
 
-    database = DatabasePool()
-    await database.connect()
-
-    consumers_per_group = max(1, int(os.getenv("CONSUMERS_PER_GROUP", "4")))
     consumers = []
     for cls, group_id in consumer_specs:
-        for member_index in range(consumers_per_group):
-            consumer = cls(raw_topic, group_id, database)
-            consumer.metrics.member = f"{member_index + 1}/{consumers_per_group}"
-            consumers.append(consumer)
+        # Do not inject a process-global DatabasePool. Each member owns its pool,
+        # Redis client, Kafka client and checkpoint coordinator. Docker/Kafka
+        # replicas provide real multi-core parallelism without Python GIL sharing.
+        consumer = cls(raw_topic, group_id)
+        consumer.metrics.member = socket.gethostname()
+        consumers.append(consumer)
     tasks = {
         asyncio.create_task(consumer.run(), name=f"{consumer.group_id}-{i}"): consumer
         for i, consumer in enumerate(consumers)
@@ -90,8 +95,10 @@ async def run_pipeline(duration: int | None = None) -> None:
     watched = [*tasks, stop_task] + ([duration_task] if duration_task else [])
     failure: BaseException | None = None
     logger.info(
-        "Pipeline ready: %s (consumers_per_group=%d, %d task tổng cộng)",
-        ", ".join(group_id for _, group_id in consumer_specs), consumers_per_group, len(consumers),
+        "Pipeline process ready: modules=%s member_process=%s pid=%d "
+        "(one Kafka member per module in this process)",
+        ", ".join(group_id for _, group_id in consumer_specs),
+        socket.gethostname(), os.getpid(),
     )
     try:
         done, _ = await asyncio.wait(watched, return_when=asyncio.FIRST_COMPLETED)
@@ -117,7 +124,6 @@ async def run_pipeline(duration: int | None = None) -> None:
         for task in (stop_task, duration_task):
             if task and not task.done():
                 task.cancel()
-        await database.close()
     if failure:
         raise failure
 

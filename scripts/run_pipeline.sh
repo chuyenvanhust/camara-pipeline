@@ -19,7 +19,18 @@ set -a; [ -f .env ] && . .env; set +a
 set -a; [ -n "$PROFILE_ENV" ] && . "$PROFILE_ENV"; set +a
 [ -n "$PROFILE_ENV" ] && echo ">>> Hardware profile: $PROFILE_ENV"
 echo ">>> Latency SLO: E2E p95 < ${PIPELINE_SLA_E2E_P95_MS:-100}ms"
-echo ">>> Capture admission: sustained <= ${PIPELINE_RECOMMENDED_SUSTAINED_PPS:-2900} pkt/s, SLO-safe burst <= ${PIPELINE_RECOMMENDED_BURST_PPS:-2900} pkt/s"
+echo ">>> Capture admission: sustained <= ${PIPELINE_RECOMMENDED_SUSTAINED_PPS:-800} pkt/s, candidate burst <= ${PIPELINE_RECOMMENDED_BURST_PPS:-900} pkt/s"
+
+for member_count in \
+  "${IP_MSISDN_CONSUMERS_PER_GROUP:-1}" \
+  "${DEVICE_SWAP_CONSUMERS_PER_GROUP:-1}" \
+  "${SIM_SWAP_CONSUMERS_PER_GROUP:-1}"; do
+  if [ "$member_count" != "1" ]; then
+    echo "[ERROR] CONSUMERS_PER_GROUP must be 1. Scale PIPELINE_*_REPLICAS instead." >&2
+    exit 2
+  fi
+done
+echo ">>> Process topology: IP=${PIPELINE_IP_REPLICAS:-1}, Device=${PIPELINE_DEVICE_REPLICAS:-1}, SIM=${PIPELINE_SIM_REPLICAS:-1} replicas (1 Kafka member/PID each)"
 
 # Bootstrap theo tầng để Docker Compose không tạo broker từ dependency graph
 # stale (biểu hiện: "kafka-1 is missing dependency zookeeper"). Điều này cũng

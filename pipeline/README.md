@@ -196,7 +196,7 @@ classDiagram
 
 | Thư mục / File | Vai Trò & Chức Năng | Cách Thức Chạy |
 |---|---|---|
-| [`run_pipeline.py`](run_pipeline.py) | **Orchestrator chính**: Khởi tạo DatabasePool dùng chung, start HTTP metrics server, và chạy song song $N$ worker instances cho cả 3 Consumer Groups. | `python -m pipeline.run_pipeline [--duration N]` |
+| [`run_pipeline.py`](run_pipeline.py) | **Entrypoint một member/process**: start metrics và đúng một Kafka member cho module được chọn; member tự sở hữu DB pool, Redis client và checkpoint coordinator. | Scale bằng `PIPELINE_*_REPLICAS`; `CONSUMERS_PER_GROUP` bắt buộc bằng `1`. |
 | [`ingestion/`](ingestion/) | **Stage 1 (Ingestion)**: Nhận passive mirror UDP/1813 hoặc CSV, giải mã RFC 2866 và ghi Kafka `radius.accounting.raw` bằng bounded queues/micro-batches. ACK/response/replay thuộc capture server ngoài repo. | Chạy độc lập: `python -m pipeline.ingestion.producer --udp --port 1813` |
 | [`modules/shared/`](modules/shared/) | **Hạ tầng dùng chung**: `BaseKafkaConsumer`, `DatabasePool` (quản lý connection pool + transaction), `ModuleMetrics` (Prometheus exporter), `redis_client`, `events` normalization. | Được import bởi 3 modules con. |
 | [`modules/ip_msisdn/`](modules/ip_msisdn/) | **Module 1 (IP↔MSISDN)**: Quản lý ánh xạ IP nguồn với MSISDN theo phiên mạng, chạy Lua Scripts trên Redis và lưu session state vào Postgres. | Task con của `run_pipeline.py`, group `cg-ip-msisdn`. |
@@ -215,19 +215,30 @@ classDiagram
    - Để triệt tiêu nút thắt GIL của Python khi chạy cả 3 groups chung 1 event loop, hệ thống tách thành 3 worker containers/services (`pipeline-ip-msisdn`, `pipeline-device-swap`, `pipeline-sim-swap`).
    - Biến `PIPELINE_GROUPS` (`ip-msisdn`, `device-swap`, `sim-swap`) quyết định group được kích hoạt trong mỗi container.
 3. **Phân Chia Connection Pool Bất Đồng Bộ (`DatabasePool`)**:
-   - Mỗi worker tiến trình sở hữu connection pool riêng biệt với dung lượng tối ưu (IP-MSISDN: max 12, Device Swap: max 8, SIM Swap: max 8) để tránh tranh chấp connection socket.
+   - Mỗi Kafka member/process sở hữu connection pool riêng; pool không còn được dùng chung giữa các member. `DB_APPLICATION_NAME` tách workload trong `pg_stat_activity`, còn `*_DB_POOL_MAX` là quota trên **mỗi replica**.
+   - Redis cache được tách logical DB: IP-MSISDN=`0`, Device=`1`, SIM=`2`. API đọc mapping IP tại DB 0; cache state swap là nội bộ của từng module.
 4. **Mô hình Multi-Member Consumer Group**:
-   - Mỗi container nhận `CONSUMERS_PER_GROUP` riêng từ Compose. Profile 8 GiB dùng 3 member; Kafka rebalance 9 partition thành 3 partition/member.
+   - Kiến trúc bắt buộc `CONSUMERS_PER_GROUP=1`. Profile 8 GiB chạy 3 replica/module, vì vậy 3 member là 3 container/PID Python thật; Kafka rebalance 9 partition thành 3 partition/member.
+   - Cấu hình lớn hơn `1` bị fail-fast. Muốn tăng lane phải tăng `PIPELINE_IP_REPLICAS`, `PIPELINE_DEVICE_REPLICAS` hoặc `PIPELINE_SIM_REPLICAS`.
 5. **Temporal pipeline theo Kafka partition**:
    - `getmany()` chỉ làm nhiệm vụ fetch và phân phối record vào FIFO riêng của từng partition; không còn gom nhiều partition thành một shard hay chờ `gather()` toàn member.
    - Mỗi partition có đúng một mutating worker nên offset trong partition luôn tuần tự. Các partition độc lập chạy song song tới giới hạn `PROCESSING_PARTITION_CONCURRENCY`.
    - Worker coalesce các fragment fetch liền kề tới `BATCH_MAX_RECORDS` trước khi ghi, tránh biến từng fragment nhỏ thành một transaction/commit riêng.
-   - Concurrency là ngân sách downstream: profile 8 GiB dùng mức 3 vì mỗi member sở hữu ba partition độc lập. FIFO vẫn được giữ trong từng partition, nên cùng MSISDN không bị đảo thứ tự.
+   - Concurrency là ngân sách downstream: profile 8 GiB dùng mức 2/process. FIFO vẫn được giữ trong từng partition, nên cùng MSISDN không bị đảo thứ tự.
+   - Mỗi partition batch được gửi vào write combiner cấp process. Combiner đợi tối đa 2ms hoặc 64 record rồi gọi `process_batch()` một lần cho nhiều partition độc lập. Future riêng của từng partition chỉ hoàn tất sau lần ghi chung, do đó FIFO/offset barrier không bị yếu đi.
    - Sau PostgreSQL/Redis, worker công bố offset cho commit coordinator. Coordinator gom offset của nhiều partition mỗi 25ms/512 records và commit ngoài critical path; partition nhanh không phải chờ một Kafka round-trip cho từng batch.
    - Khi FIFO đạt 75% hoặc record cũ nhất chờ 12ms, consumer `pause()` riêng partition đó; chỉ `resume()` khi xuống 25% và tuổi hàng đợi dưới 4ms. Rebalance phát lại phần chưa commit cho owner mới.
 6. **Giám sát Supervisor & Graceful Shutdown**:
    - Lắng nghe tín hiệu `SIGINT`/`SIGTERM` tập trung.
-   - Khi có sự cố unhandled, Supervisor sẽ kích hoạt fail-fast dừng an toàn, đóng Database Pool và flush metrics.
+   - Khi có sự cố unhandled, process fail-fast, drain durability/offset, rồi tự đóng pool/client mà nó sở hữu; restart một replica không kéo theo member khác.
+
+### Ranh giới độc lập storage
+
+PostgreSQL hiện vẫn là một cluster giao dịch dùng chung vì API, subscription,
+audit và transactional outbox có quan hệ dữ liệu chung. Refactor này tách ownership
+kết nối và quota, không giả vờ rằng ba PostgreSQL vật lý là thay đổi nội bộ an toàn.
+Muốn tách máy chủ PostgreSQL phải có migration riêng cho schema, API federation và
+outbox/subscription; nếu chỉ nhân server ngay trong Compose sẽ phá atomicity.
 
 ---
 
@@ -236,7 +247,7 @@ classDiagram
 Hệ thống ghi log định kỳ mỗi `THROUGHPUT_LOG_INTERVAL_SECONDS` (10s) theo định dạng phân khối trực quan bằng ký tự `|`:
 
 ```
-[PROCESSING][<group-id>][member=<m>/<n>][OK|SLO_BREACH|ERROR] ... | Latency: batch_avg=16.0rec/... pre_process_p95=... processing_p95=... e2e_avg=... p95=... | Flow: kafka_lag=0 partition_queue=0 oldest=0.0ms workers=3 concurrency_limit=3 paused=0 | OffsetCommit: pending=0 records=.../s requests=.../s p95=...ms errors=0(+0) | Quality/Loss: ...
+[PROCESSING][<group-id>][member=<hostname>][OK|SLO_BREACH|ERROR] ... | Latency: batch_avg=16.0rec/... pre_process_p95=... processing_p95=... e2e_avg=... p95=... | Flow: kafka_lag=0 partition_queue=0 oldest=0.0ms workers=3 concurrency_limit=2 paused=0 | OffsetCommit: pending=0 records=.../s requests=.../s p95=...ms errors=0(+0) | Quality/Loss: ...
 ```
 
 ### Các trường đo lường chính:

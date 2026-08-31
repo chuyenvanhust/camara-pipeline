@@ -5,16 +5,32 @@ import json
 import logging
 import os
 import time
+from collections.abc import Awaitable
 from typing import Any, Dict, List, Optional
 
 from pipeline.modules.shared.base_consumer import BaseKafkaConsumer
 from pipeline.modules.shared.db import DatabasePool
 from pipeline.modules.shared.events import InvalidMessageError, canonical_msisdn, event_id, parse_event_time, required_text
+from pipeline.modules.shared.swap_checkpoint import StateCheckpointCoordinator
 
 
 class DeviceSwapConsumer(BaseKafkaConsumer):
     def __init__(self, topic: str = os.getenv("KAFKA_TOPIC_RAW", "radius.accounting.raw"), group_id: str = "cg-device-swap", db: Optional[DatabasePool] = None):
         super().__init__(topic=topic, group_id=group_id, db=db)
+        self.checkpoints: Optional[StateCheckpointCoordinator] = None
+
+    async def initialize(self) -> None:
+        await super().initialize()
+        self.checkpoints = StateCheckpointCoordinator(
+            self.group_id, self.db.checkpoint_device_states, self.metrics
+        )
+        self.checkpoints.start()
+
+    async def stop(self) -> None:
+        if self.checkpoints is not None:
+            await self.checkpoints.close()
+            self.checkpoints = None
+        await super().stop()
 
     @staticmethod
     def _cache_key(msisdn: str) -> str:
@@ -30,7 +46,10 @@ class DeviceSwapConsumer(BaseKafkaConsumer):
         for msisdn, raw in zip(msisdns, cached):
             try:
                 item = json.loads(raw) if raw else None
-                required = ("imei_current", "last_event_at", "last_source_partition", "last_source_offset")
+                required = (
+                    "imei_current", "last_event_at", "last_event_id",
+                    "last_source_partition", "last_source_offset",
+                )
                 if item and all(key in item for key in required):
                     item["last_event_at"] = parse_event_time({"event_timestamp": item["last_event_at"]})
                     state[msisdn] = item
@@ -46,7 +65,10 @@ class DeviceSwapConsumer(BaseKafkaConsumer):
             self.metrics.observe_postgres_fallback(time.monotonic() - fb_started)
         return state
 
-    async def process_batch(self, records: List[Any]) -> None:
+    async def process_batch(
+        self, records: List[Any]
+    ) -> Optional[Awaitable[None]]:
+        assert self.checkpoints is not None
         parsed = []
         for record in records:
             try:
@@ -71,7 +93,11 @@ class DeviceSwapConsumer(BaseKafkaConsumer):
         states_by_msisdn: Dict[str, tuple] = {}
         history, audit, outbox = [], [], []
         cache_updates: Dict[str, str] = {}
+        changed_msisdns: set[str] = set()
+        replay_checkpoints: Dict[str, tuple] = {}
         ignored_count = 0
+        same_value_count = 0
+        stale_count = 0
         events_count = 0
         for record, msisdn, imei_new, occurred_at in parsed:
             eid = event_id(record)
@@ -79,9 +105,21 @@ class DeviceSwapConsumer(BaseKafkaConsumer):
             version = (occurred_at, record.partition, record.offset)
             if previous and previous.get("last_event_id") == eid:
                 ignored_count += 1
+                stale_count += 1
+                replay_checkpoints[msisdn] = (
+                    msisdn, previous.get("value", previous.get("imei_current")),
+                    previous["last_event_at"], previous["last_event_id"],
+                    previous["last_source_partition"], previous["last_source_offset"],
+                )
                 continue
             if previous and version <= (previous["last_event_at"], previous["last_source_partition"], previous["last_source_offset"]):
                 ignored_count += 1
+                stale_count += 1
+                replay_checkpoints[msisdn] = (
+                    msisdn, previous.get("value", previous.get("imei_current")),
+                    previous["last_event_at"], previous["last_event_id"],
+                    previous["last_source_partition"], previous["last_source_offset"],
+                )
                 continue
             imei_old = previous.get("value", previous.get("imei_current")) if previous else None
             states_by_msisdn[msisdn] = (msisdn, imei_new, occurred_at, eid, record.partition, record.offset)
@@ -91,17 +129,33 @@ class DeviceSwapConsumer(BaseKafkaConsumer):
             cache_updates[self._cache_key(msisdn)] = json.dumps({**current, "last_event_at": occurred_at.isoformat()})
             if imei_old is None or imei_old == imei_new:
                 ignored_count += 1
+                same_value_count += 1
                 continue
+            changed_msisdns.add(msisdn)
             details = json.dumps({"imei_old": imei_old, "imei_new": imei_new, "event_time": occurred_at.isoformat()})
             history.append((eid, record.topic, record.partition, record.offset, msisdn, imei_old, imei_new, occurred_at))
             audit.append((eid, "DEVICE_SWAP", msisdn, details, occurred_at))
             outbox.append((eid, "DEVICE_SWAP", msisdn, details))
             events_count += 1
 
+        swap_states = [
+            value for msisdn, value in states_by_msisdn.items()
+            if msisdn in changed_msisdns
+        ]
+        checkpoint_by_msisdn = {
+            msisdn: value for msisdn, value in replay_checkpoints.items()
+            if msisdn not in changed_msisdns
+        }
+        checkpoint_by_msisdn.update({
+            msisdn: value for msisdn, value in states_by_msisdn.items()
+            if msisdn not in changed_msisdns
+        })
+        checkpoint_states = list(checkpoint_by_msisdn.values())
+
         async def persist_postgres() -> None:
             stage_started = time.monotonic()
             await self.db.persist_device_batch(
-                list(states_by_msisdn.values()), history, audit, outbox
+                swap_states, history, audit, outbox
             )
             self.metrics.observe_stage("postgres", time.monotonic() - stage_started)
 
@@ -114,22 +168,25 @@ class DeviceSwapConsumer(BaseKafkaConsumer):
             self.metrics.observe_stage("redis", time.monotonic() - stage_started)
 
         persistence_started = time.monotonic()
-        postgres_result, redis_result = await asyncio.gather(
-            persist_postgres(), persist_redis(), return_exceptions=True
-        )
+        # Publish swap state to Redis only after the atomic PostgreSQL event
+        # transaction succeeds. This prevents a cache-ahead retry from treating a
+        # failed history/outbox write as an already-completed event. The common
+        # no-change path still performs no synchronous PostgreSQL transaction.
+        if swap_states or history or audit or outbox:
+            await persist_postgres()
+        await persist_redis()
         self.metrics.observe_stage("persistence", time.monotonic() - persistence_started)
-        failures = [
-            result for result in (postgres_result, redis_result)
-            if isinstance(result, BaseException)
-        ]
-        if failures:
-            raise failures[0]
         if cache_updates:
             self.metrics.increment("redis_records", len(cache_updates))
-        self.metrics.increment("postgres_records", len(states_by_msisdn))
+        self.metrics.increment("postgres_records", len(swap_states))
         self.metrics.increment("ignored", ignored_count)
+        self.metrics.increment("same_value", same_value_count)
+        self.metrics.increment("stale", stale_count)
         self.metrics.increment("events_detected", events_count)
         self.metrics.increment("success", len(parsed))
+        if checkpoint_states:
+            return await self.checkpoints.submit(checkpoint_states)
+        return None
 
 
 if __name__ == "__main__":

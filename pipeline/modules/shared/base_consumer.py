@@ -10,6 +10,7 @@ from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from collections.abc import Awaitable
 from typing import Any, List, Optional
 
 import redis.asyncio as aioredis
@@ -42,6 +43,9 @@ COMMIT_INTERVAL_MS = float(os.getenv("PROCESSING_COMMIT_INTERVAL_MS", "25"))
 COMMIT_MAX_RECORDS = int(os.getenv("PROCESSING_COMMIT_MAX_RECORDS", "512"))
 COMMIT_MAX_FAILURES = int(os.getenv("PROCESSING_COMMIT_MAX_FAILURES", "5"))
 COMMIT_RETRY_BACKOFF_MS = float(os.getenv("PROCESSING_COMMIT_RETRY_BACKOFF_MS", "25"))
+COMBINE_WAIT_MS = float(os.getenv("PROCESSING_COMBINE_WAIT_MS", "2"))
+COMBINE_MAX_RECORDS = int(os.getenv("PROCESSING_COMBINE_MAX_RECORDS", "64"))
+COMBINE_QUEUE_BATCHES = int(os.getenv("PROCESSING_COMBINE_QUEUE_BATCHES", "64"))
 SHUTDOWN_DRAIN_TIMEOUT_SECONDS = float(os.getenv("PROCESSING_SHUTDOWN_DRAIN_SECONDS", "10"))
 THROUGHPUT_LOG_INTERVAL_SECONDS = float(os.getenv("THROUGHPUT_LOG_INTERVAL_SECONDS", "10"))
 
@@ -77,6 +81,15 @@ class _PartitionPipeline:
     processing_records: int = 0
     paused: bool = False
     revoked: bool = False
+
+
+@dataclass
+class _ProcessRequest:
+    """One FIFO-safe partition batch waiting for process-level coalescing."""
+
+    topic_partition: TopicPartition
+    records: List[Any]
+    completed: asyncio.Future
 
 
 class _RebalanceListener(ConsumerRebalanceListener):
@@ -130,6 +143,11 @@ class BaseKafkaConsumer(ABC):
         self._commit_stop = asyncio.Event()
         self._commit_task: Optional[asyncio.Task] = None
         self._consecutive_commit_failures = 0
+        self._durability_tasks: dict[TopicPartition, asyncio.Task[None]] = {}
+        self._process_queue: asyncio.Queue[Optional[_ProcessRequest]] = asyncio.Queue(
+            maxsize=COMBINE_QUEUE_BATCHES
+        )
+        self._process_combiner_task: Optional[asyncio.Task] = None
 
     async def initialize(self) -> None:
         if self._owns_db:
@@ -156,15 +174,19 @@ class BaseKafkaConsumer(ABC):
         )
         await self.consumer.start()
         await self.dlq_producer.start()
+        self._process_combiner_task = asyncio.create_task(
+            self._process_combiner_loop(), name=f"{self.group_id}-write-combiner"
+        )
         self._commit_task = asyncio.create_task(
             self._commit_loop(), name=f"{self.group_id}-offset-commit"
         )
         logger.info(
             "[%s] consuming %s with partition workers concurrency=%d queue=%d records "
-            "fetch_max=%d queue_age=%.1fms commit_interval=%.1fms commit_max_records=%d",
+            "fetch_max=%d queue_age=%.1fms combine_wait=%.1fms "
+            "combine_max_records=%d commit_interval=%.1fms commit_max_records=%d",
             self.group_id, self.topic, PARTITION_CONCURRENCY, PARTITION_QUEUE_RECORDS,
-            FETCH_MAX_RECORDS, PARTITION_QUEUE_MAX_AGE_MS, COMMIT_INTERVAL_MS,
-            COMMIT_MAX_RECORDS,
+            FETCH_MAX_RECORDS, PARTITION_QUEUE_MAX_AGE_MS, COMBINE_WAIT_MS,
+            COMBINE_MAX_RECORDS, COMMIT_INTERVAL_MS, COMMIT_MAX_RECORDS,
         )
 
     async def send_to_dlq(self, record: Any, error: Exception) -> None:
@@ -185,8 +207,8 @@ class BaseKafkaConsumer(ABC):
         self.metrics.increment("dlq")
 
     @abstractmethod
-    async def process_batch(self, records: List[Any]) -> None:
-        """Process one partition batch in ascending Kafka offset order."""
+    async def process_batch(self, records: List[Any]) -> Optional[Awaitable[None]]:
+        """Process one partition batch and optionally return deferred durability."""
 
     async def _on_partitions_assigned(self, partitions: set[TopicPartition]) -> None:
         for topic_partition in partitions:
@@ -224,10 +246,17 @@ class BaseKafkaConsumer(ABC):
         # released. If the rebalance already invalidated the generation, replay is
         # safe because every store write is idempotent/version fenced.
         await self._flush_pending_commits(partitions, fatal=False)
+        cancelled_durability: list[asyncio.Task[None]] = []
         for topic_partition in partitions:
+            durability_task = self._durability_tasks.pop(topic_partition, None)
+            if durability_task is not None:
+                durability_task.cancel()
+                cancelled_durability.append(durability_task)
             self._processed_offsets.pop(topic_partition, None)
             self._pending_commit_offsets.pop(topic_partition, None)
             self._pending_commit_records.pop(topic_partition, None)
+        if cancelled_durability:
+            await asyncio.gather(*cancelled_durability, return_exceptions=True)
         self.metrics.set_commit_pending(sum(self._pending_commit_records.values()))
         self._update_partition_metrics()
         if partitions:
@@ -245,11 +274,14 @@ class BaseKafkaConsumer(ABC):
                 self._update_partition_metrics()
                 try:
                     async with self._processing_slots:
-                        await self._process_partition_batch(state.topic_partition, records)
+                        durability = await self._process_partition_batch(
+                            state.topic_partition, records
+                        )
                     if state.revoked:
                         return
-                    self._mark_partition_processed(
-                        state.topic_partition, records[-1].offset + 1, len(records)
+                    self._register_partition_completion(
+                        state.topic_partition, records[-1].offset + 1,
+                        len(records), durability,
                     )
                 finally:
                     state.processing_records = 0
@@ -294,27 +326,162 @@ class BaseKafkaConsumer(ABC):
 
     async def _process_partition_batch(
         self, topic_partition: TopicPartition, records: List[Any]
-    ) -> None:
+    ) -> Optional[Awaitable[None]]:
+        if self._process_combiner_task is None or self._process_combiner_task.done():
+            raise RuntimeError("process-level write combiner is not running")
+        completed = asyncio.get_running_loop().create_future()
+        await self._process_queue.put(_ProcessRequest(
+            topic_partition=topic_partition, records=records, completed=completed
+        ))
+        return await completed
+
+    async def _process_combiner_loop(self) -> None:
+        """Coalesce independent partition batches into one downstream write.
+
+        A partition worker does not submit its next batch until its request future
+        completes, preserving exact FIFO per partition. Kafka keys keep one entity
+        on one partition, so records coalesced across partitions are independent.
+        """
+        try:
+            while True:
+                first = await self._process_queue.get()
+                if first is None:
+                    self._process_queue.task_done()
+                    return
+                requests = [first]
+                record_count = len(first.records)
+                stop_after_group = False
+                deadline = asyncio.get_running_loop().time() + max(
+                    0.0, COMBINE_WAIT_MS / 1000.0
+                )
+                while record_count < COMBINE_MAX_RECORDS:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        break
+                    try:
+                        request = await asyncio.wait_for(
+                            self._process_queue.get(), timeout=remaining
+                        )
+                    except asyncio.TimeoutError:
+                        break
+                    if request is None:
+                        self._process_queue.task_done()
+                        stop_after_group = True
+                        break
+                    if record_count + len(request.records) > COMBINE_MAX_RECORDS:
+                        # Queue FIFO cannot push left. Including one oversized tail
+                        # is preferable to reordering requests; max is a soft bound.
+                        requests.append(request)
+                        record_count += len(request.records)
+                        break
+                    requests.append(request)
+                    record_count += len(request.records)
+
+                records = [record for request in requests for record in request.records]
+                durability: Optional[Awaitable[None]] = None
+                failure: Optional[BaseException] = None
+                try:
+                    durability = await self._execute_process_batch(requests, records)
+                    if durability is not None:
+                        durability = asyncio.ensure_future(durability)
+                except BaseException as exc:
+                    failure = exc
+                finally:
+                    for request in requests:
+                        self._process_queue.task_done()
+
+                for request in requests:
+                    if request.completed.done():
+                        continue
+                    if failure is not None:
+                        request.completed.set_exception(failure)
+                    else:
+                        request.completed.set_result(durability)
+                if stop_after_group:
+                    return
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:
+            self._fatal_error = exc
+            self.running = False
+            while True:
+                try:
+                    request = self._process_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                self._process_queue.task_done()
+                if request is not None and not request.completed.done():
+                    request.completed.set_exception(exc)
+            logger.exception("[%s] process-level write combiner failed", self.group_id)
+
+    async def _execute_process_batch(
+        self, requests: List[_ProcessRequest], records: List[Any]
+    ) -> Optional[Awaitable[None]]:
         self.metrics.observe_preprocess_lag(self._message_lags_ms(records))
         self.metrics.increment("processed", len(records))
         batch_started = time.monotonic()
         for attempt in range(1, MAX_BATCH_RETRIES + 1):
             try:
-                await self.process_batch(records)
+                durability = await self.process_batch(records)
                 break
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception(
-                    "[%s] partition batch failed partition=%d offsets=%d-%d attempt=%d/%d",
-                    self.group_id, topic_partition.partition, records[0].offset,
-                    records[-1].offset, attempt, MAX_BATCH_RETRIES,
+                    "[%s] combined batch failed partitions=%s records=%d attempt=%d/%d",
+                    self.group_id,
+                    sorted({request.topic_partition.partition for request in requests}),
+                    len(records), attempt, MAX_BATCH_RETRIES,
                 )
                 if attempt == MAX_BATCH_RETRIES:
                     raise
                 await asyncio.sleep(min(2 ** attempt, 10))
         self.metrics.observe_batch(time.monotonic() - batch_started)
         self._observe_e2e(records)
+        return durability
+
+    def _register_partition_completion(
+        self,
+        topic_partition: TopicPartition,
+        next_offset: int,
+        record_count: int,
+        durability: Optional[Awaitable[None]],
+    ) -> None:
+        previous = self._durability_tasks.get(topic_partition)
+
+        async def complete_in_order() -> None:
+            try:
+                if previous is not None:
+                    await previous
+                if durability is not None:
+                    # A rebalance may cancel this waiter, but must not cancel the
+                    # shared checkpoint future used by other partition batches.
+                    await asyncio.shield(durability)
+                self._mark_partition_processed(
+                    topic_partition, next_offset, record_count
+                )
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:
+                self._fatal_error = exc
+                self.running = False
+                logger.exception(
+                    "[%s] deferred durability failed topic=%s partition=%d next_offset=%d",
+                    self.group_id, topic_partition.topic,
+                    topic_partition.partition, next_offset,
+                )
+            finally:
+                current = asyncio.current_task()
+                if self._durability_tasks.get(topic_partition) is current:
+                    self._durability_tasks.pop(topic_partition, None)
+
+        self._durability_tasks[topic_partition] = asyncio.create_task(
+            complete_in_order(),
+            name=(
+                f"{self.group_id}-{topic_partition.partition}-"
+                f"durable-{next_offset}"
+            ),
+        )
 
     def _mark_partition_processed(
         self, topic_partition: TopicPartition, next_offset: int, record_count: int
@@ -548,6 +715,8 @@ class BaseKafkaConsumer(ABC):
             raise ValueError("partition queue age must satisfy 0 <= resume_age < max_age")
         if COMMIT_INTERVAL_MS <= 0 or COMMIT_MAX_RECORDS < 1 or COMMIT_MAX_FAILURES < 1:
             raise ValueError("commit coordinator settings must be positive")
+        if COMBINE_WAIT_MS < 0 or COMBINE_MAX_RECORDS < 1 or COMBINE_QUEUE_BATCHES < 1:
+            raise ValueError("process combiner settings must be non-negative/positive")
         await self.initialize()
         self.running = True
         self._telemetry_task = asyncio.create_task(
@@ -594,6 +763,28 @@ class BaseKafkaConsumer(ABC):
                 *(state.task for state in states if state.task is not None),
                 return_exceptions=True,
             )
+        durability_tasks = list(self._durability_tasks.values())
+        if durability_tasks and self._fatal_error is None:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*durability_tasks, return_exceptions=False),
+                    timeout=SHUTDOWN_DRAIN_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[%s] durability drain exceeded %.1fs; records will replay",
+                    self.group_id, SHUTDOWN_DRAIN_TIMEOUT_SECONDS,
+                )
+            except BaseException as exc:
+                self._fatal_error = self._fatal_error or exc
+        for task in tuple(self._durability_tasks.values()):
+            if not task.done():
+                task.cancel()
+        if self._durability_tasks:
+            await asyncio.gather(
+                *self._durability_tasks.values(), return_exceptions=True
+            )
+        self._durability_tasks.clear()
         await self._flush_pending_commits(fatal=False)
         self._partition_pipelines.clear()
         self._update_partition_metrics()
@@ -603,6 +794,11 @@ class BaseKafkaConsumer(ABC):
             return
         self._stopped = True
         self.running = False
+        if self._process_combiner_task is not None:
+            if not self._process_combiner_task.done():
+                await self._process_queue.put(None)
+            await asyncio.gather(self._process_combiner_task, return_exceptions=True)
+            self._process_combiner_task = None
         if self._telemetry_task is not None:
             self._telemetry_task.cancel()
             await asyncio.gather(self._telemetry_task, return_exceptions=True)

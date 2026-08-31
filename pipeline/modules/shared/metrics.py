@@ -34,6 +34,11 @@ _OFFSET_COMMIT_RECORDS = None
 _OFFSET_COMMIT_ERRORS = None
 _OFFSET_COMMIT_PENDING = None
 _PREPROCESS_LATENCY = None
+_CHECKPOINT_LATENCY = None
+_CHECKPOINT_RECORDS = None
+_CHECKPOINT_ERRORS = None
+_CHECKPOINT_QUEUE_RECORDS = None
+_CHECKPOINT_QUEUE_AGE = None
 
 
 def _init_prometheus():
@@ -44,7 +49,8 @@ def _init_prometheus():
     global _PARTITION_QUEUE_RECORDS, _PARTITION_WORKERS, _PARTITIONS_PAUSED
     global _PARTITION_QUEUE_AGE, _OFFSET_COMMIT_LATENCY, _OFFSET_COMMIT_RECORDS
     global _OFFSET_COMMIT_ERRORS, _OFFSET_COMMIT_PENDING
-    global _PREPROCESS_LATENCY
+    global _PREPROCESS_LATENCY, _CHECKPOINT_LATENCY, _CHECKPOINT_RECORDS
+    global _CHECKPOINT_ERRORS, _CHECKPOINT_QUEUE_RECORDS, _CHECKPOINT_QUEUE_AGE
     if _prom_initialized:
         return
     try:
@@ -154,6 +160,31 @@ def _init_prometheus():
             "Durably processed records not yet covered by a committed Kafka offset",
             ["group_id", "member"],
         )
+        _CHECKPOINT_LATENCY = Histogram(
+            "pipeline_swap_checkpoint_latency_seconds",
+            "PostgreSQL watermark checkpoint latency",
+            ["group_id", "member"],
+        )
+        _CHECKPOINT_RECORDS = Counter(
+            "pipeline_swap_checkpoint_records_total",
+            "Non-swap state records persisted by the checkpoint coordinator",
+            ["group_id", "member"],
+        )
+        _CHECKPOINT_ERRORS = Counter(
+            "pipeline_swap_checkpoint_errors_total",
+            "Failed swap watermark checkpoint flushes",
+            ["group_id", "member"],
+        )
+        _CHECKPOINT_QUEUE_RECORDS = Gauge(
+            "pipeline_swap_checkpoint_queue_records",
+            "Coalesced non-swap states waiting for PostgreSQL checkpoint",
+            ["group_id", "member"],
+        )
+        _CHECKPOINT_QUEUE_AGE = Gauge(
+            "pipeline_swap_checkpoint_queue_oldest_seconds",
+            "Age of the oldest state waiting for a PostgreSQL checkpoint",
+            ["group_id", "member"],
+        )
         _prom_initialized = True
     except ImportError:
         logger.debug("prometheus_client not installed — Prometheus metrics disabled")
@@ -181,6 +212,11 @@ class ModuleMetrics:
             "commit_requests": 0,
             "commit_records": 0,
             "commit_errors": 0,
+            "same_value": 0,
+            "stale": 0,
+            "checkpoint_records": 0,
+            "checkpoint_flushes": 0,
+            "checkpoint_errors": 0,
         }
         self.processing_seconds = 0.0
         self.stage_seconds: Dict[str, float] = {}
@@ -200,6 +236,11 @@ class ModuleMetrics:
         self.partition_queue_oldest_ms = 0.0
         self.commit_pending_records = 0
         self.commit_latency_window_ms = deque(maxlen=10000)
+        self.checkpoint_latency_window_ms = deque(maxlen=10000)
+        self.checkpoint_queue_age_window_ms = deque(maxlen=10000)
+        self.checkpoint_queue_records = 0
+        self.checkpoint_queue_oldest_ms = 0.0
+        self.checkpoint_flushing = False
         # F-08: Initialize Prometheus counters
         _init_prometheus()
         if _STAGE_RECORDS is not None:
@@ -342,6 +383,41 @@ class ModuleMetrics:
                 _OFFSET_COMMIT_RECORDS.labels(**labels).inc(max(0, records))
         self.set_commit_pending(pending)
 
+    def set_checkpoint_queue(
+        self, records: int, oldest_ms: float, *, flushing: bool
+    ) -> None:
+        self.checkpoint_queue_records = max(0, records)
+        self.checkpoint_queue_oldest_ms = max(0.0, oldest_ms)
+        self.checkpoint_flushing = flushing
+        labels = {"group_id": self.name, "member": self.member or "1/1"}
+        if _CHECKPOINT_QUEUE_RECORDS is not None:
+            _CHECKPOINT_QUEUE_RECORDS.labels(**labels).set(
+                self.checkpoint_queue_records
+            )
+        if _CHECKPOINT_QUEUE_AGE is not None:
+            _CHECKPOINT_QUEUE_AGE.labels(**labels).set(
+                self.checkpoint_queue_oldest_ms / 1000.0
+            )
+
+    def observe_checkpoint(
+        self, seconds: float, records: int, queue_age_ms: float, *, failed: bool
+    ) -> None:
+        labels = {"group_id": self.name, "member": self.member or "1/1"}
+        latency_ms = max(0.0, seconds * 1000.0)
+        self.checkpoint_latency_window_ms.append(latency_ms)
+        self.checkpoint_queue_age_window_ms.append(max(0.0, queue_age_ms))
+        self.increment("checkpoint_flushes")
+        if _CHECKPOINT_LATENCY is not None:
+            _CHECKPOINT_LATENCY.labels(**labels).observe(max(0.0, seconds))
+        if failed:
+            self.increment("checkpoint_errors")
+            if _CHECKPOINT_ERRORS is not None:
+                _CHECKPOINT_ERRORS.labels(**labels).inc()
+        else:
+            self.increment("checkpoint_records", max(0, records))
+            if _CHECKPOINT_RECORDS is not None:
+                _CHECKPOINT_RECORDS.labels(**labels).inc(max(0, records))
+
     def _stage_average_ms(
         self, stage: str, previous_seconds: Dict[str, float], previous_calls: Dict[str, int]
     ) -> float:
@@ -365,12 +441,15 @@ class ModuleMetrics:
         data_loss = self.get("errors") + self.get("dlq")
         logger.info(
             "[PROCESSING][%s][member=%s][SUMMARY] "
-            "received=%d | success=%d | ignored=%d | %s=%d | "
-            "db_writes(pg=%d, rds=%d) | data_loss=%d (err=%d, dlq=%d) | batches=%d",
+            "received=%d | success=%d | ignored=%d (same=%d, stale=%d) | %s=%d | "
+            "db_writes(pg=%d, rds=%d, checkpoint=%d/%d_flushes) | "
+            "data_loss=%d (err=%d, dlq=%d) | batches=%d",
             self.name, self.member or "1/1",
             self.get("processed"), self.get("success"), self.get("ignored"),
+            self.get("same_value"), self.get("stale"),
             event_name, self.get("events_detected"),
             self.get("postgres_records"), self.get("redis_records"),
+            self.get("checkpoint_records"), self.get("checkpoint_flushes"),
             data_loss, self.get("errors"), self.get("dlq"), self.get("batches"),
         )
 
@@ -405,6 +484,15 @@ class ModuleMetrics:
             commit_requests_delta = current["commit_requests"] - previous["commit_requests"]
             commit_records_delta = current["commit_records"] - previous["commit_records"]
             commit_errors_delta = current["commit_errors"] - previous["commit_errors"]
+            checkpoint_records_delta = (
+                current["checkpoint_records"] - previous["checkpoint_records"]
+            )
+            checkpoint_flushes_delta = (
+                current["checkpoint_flushes"] - previous["checkpoint_flushes"]
+            )
+            checkpoint_errors_delta = (
+                current["checkpoint_errors"] - previous["checkpoint_errors"]
+            )
             loss_delta = errors_delta + dlq_delta
             loss_total = current["errors"] + current["dlq"]
 
@@ -425,12 +513,18 @@ class ModuleMetrics:
             commit_window = list(self.commit_latency_window_ms)
             self.commit_latency_window_ms.clear()
             commit_p95_ms = self._percentile(commit_window, 0.95)
+            checkpoint_window = list(self.checkpoint_latency_window_ms)
+            self.checkpoint_latency_window_ms.clear()
+            checkpoint_p95_ms = self._percentile(checkpoint_window, 0.95)
+            checkpoint_age_window = list(self.checkpoint_queue_age_window_ms)
+            self.checkpoint_queue_age_window_ms.clear()
+            checkpoint_age_p95_ms = self._percentile(checkpoint_age_window, 0.95)
 
             hits_delta = current["cache_hits"] - previous["cache_hits"]
             lookups_delta = current["cache_lookups"] - previous["cache_lookups"]
             hit_ratio_pct = (hits_delta / lookups_delta * 100.0) if lookups_delta else (self.latest_cache_hit_ratio * 100.0)
 
-            if errors_delta or dlq_delta or commit_errors_delta:
+            if errors_delta or dlq_delta or commit_errors_delta or checkpoint_errors_delta:
                 status = "ERROR"
                 level = logging.ERROR
             elif e2e_count_window and e2e_p95_ms >= SLA_E2E_P95_MS:
@@ -445,9 +539,10 @@ class ModuleMetrics:
                 "[PROCESSING][%s][member=%s][%s] window=%.1fs | "
                 "Throughput: recv=%.1f/s success=%.1f/s (pg=%.1f/s, rds=%.1f/s) | "
                 "Latency: batch_avg=%.1frec/%.1fms stage(state=%.1fms[mget=%.1fms, pg_fb=%.1fms, hit=%.1f%%], pg=%.1fms, rds=%.1fms, persist_parallel=%.1fms, pool_acq=%.1fms) pre_process_p95=%.1fms processing_p95=%.1fms e2e_avg=%.1fms p95=%.1fms max=%.1fms slo_p95<%.0fms | "
-                "Swaps/Events: %s=%d(+%d) ignored=%d | "
+                "Swaps/Events: %s=%d(+%d) ignored=%d (same=%d stale=%d) | "
                 "Flow: kafka_lag=%d partition_queue=%d oldest=%.1fms workers=%d concurrency_limit=%d paused=%d | "
                 "OffsetCommit: pending=%d records=%.1f/s requests=%.1f/s p95=%.1fms errors=%d(+%d) | "
+                "Checkpoint: queue=%d oldest=%.1fms records=%.1f/s flushes=%.1f/s p95=%.1fms queue_p95=%.1fms errors=%d(+%d) | "
                 "Quality/Loss: data_loss=%d(+%d) (err=%d, dlq=%d) | "
                 "Totals: recv=%d, ok=%d, pg=%d, rds=%d, batches=%d",
                 self.name, self.member or "1/1", status, elapsed,
@@ -466,12 +561,18 @@ class ModuleMetrics:
                 self._stage_average_ms("db_pool_acquire", previous_stage_seconds, previous_stage_calls),
                 preprocess_p95_ms, processing_p95_ms,
                 e2e_avg_ms, e2e_p95_ms, e2e_max_ms, SLA_E2E_P95_MS,
-                event_name, current["events_detected"], events_delta, current["ignored"],
+                event_name, current["events_detected"], events_delta,
+                current["ignored"], current["same_value"], current["stale"],
                 self.kafka_lag, self.partition_queue_records, self.partition_queue_oldest_ms,
                 self.partition_workers, self.partition_concurrency_limit, self.partitions_paused,
                 self.commit_pending_records, commit_records_delta / elapsed,
                 commit_requests_delta / elapsed, commit_p95_ms,
                 current["commit_errors"], commit_errors_delta,
+                self.checkpoint_queue_records, self.checkpoint_queue_oldest_ms,
+                checkpoint_records_delta / elapsed,
+                checkpoint_flushes_delta / elapsed, checkpoint_p95_ms,
+                checkpoint_age_p95_ms, current["checkpoint_errors"],
+                checkpoint_errors_delta,
                 loss_total, loss_delta, current["errors"], current["dlq"],
                 current["processed"], current["success"], current["postgres_records"],
                 current["redis_records"], current["batches"],

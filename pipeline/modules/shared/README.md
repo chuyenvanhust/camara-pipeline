@@ -93,17 +93,32 @@ classDiagram
 ## 2. Chi tiết các thành phần trong `shared/`
 
 ### 2.1. `BaseKafkaConsumer` (`base_consumer.py`)
+
+`process_batch()` có thể trả về một deferred-durability future. Business E2E được
+ghi nhận ngay khi Redis và các transaction nghiệp vụ bắt buộc đã sẵn sàng; worker
+partition tiếp tục xử lý batch kế tiếp. Một chuỗi completion FIFO riêng trên từng
+partition chỉ chuyển offset sang commit coordinator sau khi future thành công, vì
+vậy checkpoint nền không cho phép commit vượt qua một durability gap.
+
+### 2.2. `StateCheckpointCoordinator` (`swap_checkpoint.py`)
+
+Coordinator gom watermark SIM/Device không phát sinh swap theo MSISDN, chỉ giữ
+version mới nhất và bulk UPSERT PostgreSQL theo cửa sổ/threshhold cấu hình. Queue
+có giới hạn để tạo backpressure. Lỗi flush làm future thất bại, dừng consumer và
+để Kafka replay các offset chưa commit; swap thật không đi qua đường checkpoint
+mà vẫn dùng transaction state + history + audit + outbox.
 Lớp cơ sở trừu tượng cho tất cả các consumer trong hệ thống:
 - **Vòng lặp tiêu thụ (`run()`)**: Sử dụng `AIOKafkaConsumer.getmany()` gom tối đa `BATCH_MAX_RECORDS` hoặc chờ `BATCH_TIMEOUT_MS`.
 - **Per-partition temporal pipeline**: `getmany()` đưa record vào FIFO riêng; mỗi partition có một mutating worker, còn các partition độc lập chạy song song tới `PROCESSING_PARTITION_CONCURRENCY`.
 - **Batch coalescing**: Worker ghép fragment cùng partition tới `BATCH_MAX_RECORDS`; mặc định IP=16 và Swap=24 để giữ ngân sách p95.
+- **Process-level write combiner**: Các partition worker gửi batch vào queue chung của đúng process. Combiner chờ tối đa 2ms/64 record rồi gọi `process_batch()` một lần; mỗi partition vẫn chờ future riêng nên FIFO và durability barrier không đổi.
 - **Age-aware backpressure**: `pause()` khi FIFO đạt 75% hoặc record cũ nhất chờ 12ms; `resume()` tại 25% và 4ms. Partition nhanh không bị partition chậm chặn, còn hysteresis tránh flapping vì jitter ngắn.
 - **Coalesced Manual Offset Commit**: Sau batch thành công (`enable_auto_commit=False`), worker công bố offset cho coordinator. Coordinator commit nhiều partition mỗi 25ms/512 record, tách Kafka RTT khỏi critical path và giảm request tới broker. Khi rebalance/crash, cửa sổ chưa commit được phát lại và store xử lý idempotent/version-fenced.
 - **Dead Letter Queue (DLQ)**: Khi một record hoặc batch bị lỗi cấu trúc dữ liệu nghiêm trọng vượt quá `MAX_BATCH_RETRIES` (mặc định 3 lần), toàn bộ thông tin nguồn (topic, partition, offset, error_type, payload) được đẩy vào `<topic>.dlq`.
 
-### 2.2. `DatabasePool` (`db.py`)
+### 2.3. `DatabasePool` (`db.py`)
 Lớp bọc `asyncpg.Pool` tối ưu hoá hiệu năng cho PostgreSQL:
-- **Single Connection Pool**: Quản lý connection pool duy nhất dùng chung cho toàn bộ các worker trong tiến trình, cấu hình qua `DB_POOL_MIN` và `DB_POOL_MAX`.
+- **Member-owned Connection Pool**: Mỗi member/PID sở hữu đúng một pool cho các partition worker của nó, cấu hình qua `DB_POOL_MIN` và `DB_POOL_MAX`; không chia pool qua process.
 - **Giao dịch Nguyên Tử 4 Bảng (`_persist_swap_batch`)**:
   Thực thi trong cùng 1 `connection.transaction()`:
   1. `_upsert_state`: Upsert bảng state hiện tại (`msisdn_sim` hoặc `msisdn_device`) qua mệnh đề `UNNEST` kết hợp điều kiện so sánh phiên bản `(last_event_at, last_source_partition, last_source_offset)`.
@@ -112,7 +127,7 @@ Lớp bọc `asyncpg.Pool` tối ưu hoá hiệu năng cho PostgreSQL:
   4. `_insert_outbox`: Ghi thông báo chờ gửi (`notification_log`) cho các subscription đang hoạt động.
 - **Session State Tracking (`persist_session_batch`)**: Cập nhật `radius_session_state` với version fence; shared/exclusive row lock trên `radius_nas_off_watermark` ngăn Start cũ chạy khác partition hồi sinh state sau Accounting-Off mà không tuần tự hóa các Start thông thường.
 
-### 2.3. `ModuleMetrics` (`metrics.py`)
+### 2.4. `ModuleMetrics` (`metrics.py`)
 Hệ thống thu thập và xuất dữ liệu đo lường (Telemetry):
 - **Prometheus Exporter**: Tự động đăng ký các metrics chuẩn:
   - `pipeline_batch_processed_total` (Counter)
@@ -132,12 +147,12 @@ Hệ thống thu thập và xuất dữ liệu đo lường (Telemetry):
   - **Giám sát thất thoát (`data_loss = errors + dlq`)**
   - Số liệu tích lũy (`Totals`).
 
-### 2.4. `redis_client.py`
+### 2.5. `redis_client.py`
 Khởi tạo kết nối Redis hỗ trợ 2 chế độ:
 - **Chế độ Standalone (Môi trường Dev)**: Kết nối trực tiếp qua `REDIS_HOST` và `REDIS_PORT`.
 - **Chế độ Sentinel HA (Môi trường Production)**: Tự động khám phá Master Node thông qua danh sách Sentinel Nodes (`REDIS_SENTINELS`), hỗ trợ tự động failover mà không làm gián đoạn pipeline.
 
-### 2.5. `events.py`
+### 2.6. `events.py`
 Bộ công cụ chuẩn hoá và kiểm tra ràng buộc dữ liệu:
 - `canonical_msisdn()`: Chuẩn hoá số thuê bao theo định dạng quốc tế E.164 (bắt đầu bằng dấu `+`, từ 8 đến 15 chữ số).
 - `parse_event_time()`: Phân giải timestamp từ chuỗi ISO-8601 hoặc Unix epoch thành đối tượng `datetime` có múi giờ chuẩn UTC.

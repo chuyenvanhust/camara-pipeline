@@ -14,9 +14,9 @@ flowchart TD
 
     CACHE_LOOKUP --> DECISION{So sánh IMEI Mới vs IMEI Cũ}
 
-    DECISION -->|Chưa có dữ liệu cũ<br/>(Lần đầu thấy MSISDN)| INIT["Khởi tạo trạng thái ban đầu:<br/>- Upsert msisdn_device<br/>- KHÔNG tính là Swap<br/>- KHÔNG ghi History/Outbox"]
+    DECISION -->|Chưa có dữ liệu cũ<br/>(Lần đầu thấy MSISDN)| INIT["Khởi tạo trạng thái ban đầu:<br/>- Redis business-ready<br/>- Queue PostgreSQL checkpoint<br/>- KHÔNG tính là Swap"]
 
-    DECISION -->|IMEI Mới == IMEI Cũ| SAME["Không đổi máy:<br/>- Bỏ qua (ignored counter +1)"]
+    DECISION -->|IMEI Mới == IMEI Cũ| SAME["Không đổi máy:<br/>- Cập nhật Redis watermark<br/>- Queue PostgreSQL checkpoint"]
 
     DECISION -->|Bản ghi cũ hơn<br/>(Out-of-Order / Duplicate)| OLD["Sự kiện đến trễ / trùng event_id:<br/>- Bỏ qua (ignored counter +1)"]
 
@@ -24,9 +24,10 @@ flowchart TD
 
     SWAP_EVENT --> ATOMIC_TX["Thực Thi Giao Dịch PostgreSQL (Atomic Transaction):<br/>- Upsert msisdn_device (State mới)<br/>- Insert device_swap_history (Lịch sử)<br/>- Insert audit_log (Kiểm toán)<br/>- Insert notification_log (Outbox status=PENDING)"]
 
-    INIT --> ATOMIC_TX
+    INIT --> CHECKPOINT["Checkpoint coordinator:<br/>coalesce theo MSISDN<br/>bulk UPSERT nền"]
+    SAME --> CHECKPOINT
+    CHECKPOINT --> COMMIT_OFFSET["Chỉ commit offset sau checkpoint durable"]
     ATOMIC_TX --> REDIS_SYNC["Cập nhật Redis Cache:<br/>MSET device:MSISDN"]
-    SAME --> COMMIT_OFFSET["Commit Kafka Offset"]
     OLD --> COMMIT_OFFSET
     REDIS_SYNC --> COMMIT_OFFSET
 ```
@@ -52,10 +53,14 @@ flowchart TD
    - Khi duyệt qua từng bản ghi trong batch, state in-memory của MSISDN được cập nhật ngay lập tức.
    - Điều này đảm bảo tính đúng đắn khi một thuê bao đổi máy nhiều lần liên tiếp trong cùng một batch (bản ghi thứ 2 sẽ so sánh với kết quả của bản ghi thứ 1).
    - Sử dụng `dict` theo `msisdn` để giữ lại bản ghi mới nhất cho mỗi thuê bao, tránh xung đột `CardinalityViolationError` khi thực thi câu lệnh SQL `ON CONFLICT DO UPDATE`.
-4. **Giao dịch Cơ sở dữ liệu Nguyên tử (`db.persist_device_batch`)**:
-   - Mở 1 `connection.transaction()` duy nhất để thực thi đồng thời cả 4 thao tác ghi.
-5. **Đồng bộ Read Cache (`redis.mset`)**:
-   - Chỉ cập nhật cache Redis **sau khi** PostgreSQL commit thành công, đảm bảo Redis luôn là hình chiếu trung thực của dữ liệu nguồn.
+4. **Hai đường persistence**:
+   - IMEI đổi: mở một transaction nguyên tử cho state, history, audit và outbox.
+   - IMEI không đổi: Redis hoàn tất business path; watermark PostgreSQL được
+     coalesce và bulk UPSERT bởi `StateCheckpointCoordinator`.
+5. **Durability barrier**:
+   - Worker tiếp tục xử lý sau khi business-ready, nhưng Kafka offset chỉ được
+     commit khi checkpoint future thành công. Nếu checkpoint lỗi, record chưa
+     commit được Kafka replay và version fence giữ tính idempotent.
 
 ---
 

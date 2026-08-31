@@ -14,9 +14,9 @@ flowchart TD
 
     CACHE_LOOKUP --> DECISION{So sánh IMSI Mới vs IMSI Cũ}
 
-    DECISION -->|Chưa có dữ liệu cũ<br/>(Lần đầu thấy MSISDN)| INIT["Khởi tạo trạng thái ban đầu:<br/>- Upsert msisdn_sim<br/>- KHÔNG tính là Swap<br/>- KHÔNG ghi History/Outbox"]
+    DECISION -->|Chưa có dữ liệu cũ<br/>(Lần đầu thấy MSISDN)| INIT["Khởi tạo trạng thái ban đầu:<br/>- Redis business-ready<br/>- Queue PostgreSQL checkpoint<br/>- KHÔNG tính là Swap"]
 
-    DECISION -->|IMSI Mới == IMSI Cũ| SAME["Không đổi SIM:<br/>- Bỏ qua (ignored counter +1)"]
+    DECISION -->|IMSI Mới == IMSI Cũ| SAME["Không đổi SIM:<br/>- Cập nhật Redis watermark<br/>- Queue PostgreSQL checkpoint"]
 
     DECISION -->|Bản ghi cũ hơn<br/>(Out-of-Order / Duplicate)| OLD["Sự kiện đến trễ / trùng event_id:<br/>- Bỏ qua (ignored counter +1)"]
 
@@ -24,9 +24,10 @@ flowchart TD
 
     SWAP_EVENT --> ATOMIC_TX["Thực Thi Giao Dịch PostgreSQL (Atomic Transaction):<br/>- Upsert msisdn_sim (State mới)<br/>- Insert sim_swap_history (Lịch sử)<br/>- Insert audit_log (Kiểm toán)<br/>- Insert notification_log (Outbox status=PENDING)"]
 
-    INIT --> ATOMIC_TX
+    INIT --> CHECKPOINT["Checkpoint coordinator:<br/>coalesce theo MSISDN<br/>bulk UPSERT nền"]
+    SAME --> CHECKPOINT
+    CHECKPOINT --> COMMIT_OFFSET["Chỉ commit offset sau checkpoint durable"]
     ATOMIC_TX --> REDIS_SYNC["Cập nhật Redis Cache:<br/>MSET sim:MSISDN<br/>(Lưu kèm last_time_sim_change)"]
-    SAME --> COMMIT_OFFSET["Commit Kafka Offset"]
     OLD --> COMMIT_OFFSET
     REDIS_SYNC --> COMMIT_OFFSET
 ```
@@ -67,7 +68,19 @@ Mặc dù có mô hình kiến trúc tương đồng với `device_swap`, module
 
 ---
 
-## 3. Cấu trúc Bảng Cơ Sở Dữ Liệu
+## 3. Fast path và durability checkpoint
+
+- Record trùng hoặc cũ không ghi Redis/PostgreSQL.
+- Record mới nhưng IMSI không đổi cập nhật Redis ngay; state watermark được
+  coalesce theo MSISDN trong `StateCheckpointCoordinator`.
+- Coordinator bulk UPSERT PostgreSQL theo
+  `SWAP_CHECKPOINT_INTERVAL_MS`/`SWAP_CHECKPOINT_MAX_RECORDS`. Kafka offset chỉ
+  được commit sau khi checkpoint future thành công; crash trước checkpoint sẽ
+  replay an toàn.
+- Swap thật vẫn dùng transaction đồng bộ gồm current state, history, audit và
+  outbox, nên checkpoint nền không làm yếu tính nguyên tử của sự kiện CAMARA.
+
+## 4. Cấu trúc Bảng Cơ Sở Dữ Liệu
 
 ### Bảng `msisdn_sim` (Trạng thái hiện tại)
 ```sql
@@ -100,7 +113,7 @@ CREATE TABLE sim_swap_history (
 
 ---
 
-## 4. Xử lý Trùng Lặp & Thứ Tự trong Batch
+## 5. Xử lý Trùng Lặp & Thứ Tự trong Batch
 
 - **Khử trùng lặp theo MSISDN**: Trong một batch lớn, nếu một số thuê bao đổi SIM nhiều lần (ví dụ qua lại giữa các mạng), danh sách `states_by_msisdn` (kiểu `dict`) chỉ giữ lại bản ghi cuối cùng của batch để gửi lệnh `UPSERT` xuống PostgreSQL, loại bỏ hoàn toàn lỗi tranh chấp `ON CONFLICT DO UPDATE` khi cập nhật cùng 1 khóa chính trong 1 câu truy vấn SQL duy nhất.
 - **Tính toàn vẹn lịch sử**: Tất cả các bước chuyển SIM trung gian vẫn được lưu đầy đủ vào bảng `sim_swap_history` để phục vụ công tác điều tra viễn thông và kiểm toán.

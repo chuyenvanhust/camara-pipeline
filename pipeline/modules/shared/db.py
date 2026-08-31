@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import socket
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -50,14 +51,26 @@ class DatabasePool:
             maximum = int(os.getenv("DB_POOL_MAX", "32"))
             if minimum < 1 or maximum < minimum:
                 raise ValueError("invalid DB_POOL_MIN/DB_POOL_MAX")
+            application_name = (
+                f"{os.getenv('DB_APPLICATION_NAME', 'camara-pipeline-member')}:"
+                f"{socket.gethostname()}"
+            )
             self.pool = await asyncpg.create_pool(
                 dsn=self.dsn,
                 min_size=minimum,
                 max_size=maximum,
                 command_timeout=30,
                 timeout=10,
+                server_settings={
+                    "application_name": application_name
+                },
             )
-            logger.info("Database pool initialized min=%d max=%d", minimum, maximum)
+            logger.info(
+                "Database pool initialized owner=%s min=%d max=%d",
+                application_name,
+                minimum,
+                maximum,
+            )
 
     async def close(self) -> None:
         if self.pool is not None:
@@ -222,6 +235,20 @@ class DatabasePool:
             "msisdn_device", "imei_current", "device_swap_history", "imei_old",
             "imei_new", states, history, audit, outbox
         )
+
+    async def checkpoint_sim_states(self, states: Sequence[StateRecord]) -> None:
+        """Bulk-checkpoint non-swap SIM watermarks in one database round trip."""
+        if not states:
+            return
+        async with self.acquire(timeout=3) as connection:
+            await self._upsert_state(connection, "msisdn_sim", "imsi_current", states)
+
+    async def checkpoint_device_states(self, states: Sequence[StateRecord]) -> None:
+        """Bulk-checkpoint non-swap device watermarks in one database round trip."""
+        if not states:
+            return
+        async with self.acquire(timeout=3) as connection:
+            await self._upsert_state(connection, "msisdn_device", "imei_current", states)
 
     async def persist_session_batch(self, records: Sequence[SessionRecord]) -> None:
         if not records:

@@ -294,7 +294,12 @@ Nó không nhận response, không retry và không dùng để chứng minh đ�
 | `RADIUS_UDP_KAFKA_PRODUCERS` | `1` | Producer dùng chung cho bốn publisher coroutine; Kafka giữ FIFO theo partition/key và gom batch tốt hơn |
 | `RADIUS_UDP_KAFKA_TOTAL_MAX_INFLIGHT_BATCHES` | `24` | Trần tuyệt đối batch Kafka đang ghi trên toàn process |
 | `INGESTION_KAFKA_ACKS` / `INGESTION_ENABLE_IDEMPOTENCE` | `1` / `false` | Latency-first vì capture ngoài repo chịu durability/replay |
-| `PIPELINE_RECOMMENDED_SUSTAINED_PPS` | `2900` | Admission ceiling profile 8 GiB để bảo vệ E2E p95 |
+| `PIPELINE_RECOMMENDED_SUSTAINED_PPS` | `800` | Baseline bảo thủ trước soak test cho E2E p95 < 100ms |
+| `SWAP_CHECKPOINT_INTERVAL_MS` | `150` | Cửa sổ gom watermark không phát sinh SIM/Device swap |
+| `SWAP_CHECKPOINT_MAX_RECORDS` | `256` | Số state kích hoạt một bulk PostgreSQL checkpoint |
+| `SWAP_CHECKPOINT_QUEUE_RECORDS` | `4096` | Backpressure bound cho checkpoint mỗi consumer member |
+| `PROCESSING_COMBINE_WAIT_MS` | `2` | Cửa sổ gom ghi giữa các partition trong cùng process |
+| `PROCESSING_COMBINE_MAX_RECORDS` | `64` | Soft limit record cho một lần gọi persistence đã gom |
 | `RADIUS_UDP_PUBLISHER_WORKERS` | `4` | Số lượng worker coroutines publish song song (Key-sharded per MSISDN) |
 | `INGESTION_METRICS_PORT` | `9201` | Cổng Exporter Prometheus Ingestion (tự động thử 9201-9210 nếu bận) |
 | `DISPATCHER_BATCH_SIZE` | `50` | Số lượng notification claim mỗi vòng lặp của Dispatcher |

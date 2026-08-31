@@ -2,7 +2,8 @@
 
 > **Trạng thái: tài liệu lịch sử/superseded.** Baseline 15k dưới đây giải thích sự cố cũ.
 > Cấu hình vận hành hiện hành nằm trong `config/env/*.env`: ingestion batch 64/1ms,
-> Kafka `acks=1`, queue theo profile và admission limit 2.9k/3.9k/7.8k/15.5k để bảo vệ
+> Kafka `acks=1`, queue theo profile; 8 GiB dùng baseline 800/s, còn target
+> 3.9k/7.8k/15.5k của profile lớn phải được soak-test để bảo vệ
 > E2E p95 <100ms. Profile 8 GiB dùng 4 worker/1 producer dùng chung và inflight
 > 6/worker, tối đa 24 toàn process. Không áp các con số batch/queue trong phần lịch sử này.
 
