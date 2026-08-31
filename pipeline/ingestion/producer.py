@@ -182,6 +182,26 @@ class RadiusLogProducer:
         self._inflight_wait_ms: deque[float] = deque(maxlen=4096)
         self._worker_slot_wait_ms: deque[float] = deque(maxlen=4096)
         self._batch_sizes: deque[int] = deque(maxlen=4096)
+        # Real admission control: token bucket sized to the burst ceiling.
+        # RECOMMENDED_SUSTAINED_PPS/BURST_PPS were previously log-only labels
+        # (see the telemetry loop) and never rejected a single packet.
+        self._admission_tokens: float = float(RECOMMENDED_BURST_PPS or 0)
+        self._admission_last_ts: float = time.monotonic()
+
+    def _admission_allow(self) -> bool:
+        if RECOMMENDED_BURST_PPS <= 0:
+            return True
+        now = time.monotonic()
+        elapsed = now - self._admission_last_ts
+        self._admission_last_ts = now
+        self._admission_tokens = min(
+            float(RECOMMENDED_BURST_PPS),
+            self._admission_tokens + elapsed * RECOMMENDED_SUSTAINED_PPS,
+        )
+        if self._admission_tokens < 1.0:
+            return False
+        self._admission_tokens -= 1.0
+        return True
 
     @staticmethod
     def _percentile(values, quantile: float) -> float:
@@ -389,6 +409,11 @@ class RadiusLogProducer:
 
     def _put_udp_item(self, item: QueueItem) -> bool:
         assert self._worker_queues
+        if not self._admission_allow():
+            self._counts["queue_dropped"] += 1
+            if _PROM_QUEUE_DROPPED is not None:
+                _PROM_QUEUE_DROPPED.inc()
+            return False
         if item.key:
             target_idx = hash(item.key) % len(self._worker_queues)
         else:

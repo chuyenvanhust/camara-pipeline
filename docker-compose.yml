@@ -140,7 +140,7 @@ services:
     image: postgres:15-alpine
     container_name: camara-postgres
     restart: unless-stopped
-    command: ["postgres", "-c", "synchronous_commit=on", "-c", "max_connections=${POSTGRES_MAX_CONNECTIONS:-200}", "-c", "shared_buffers=${POSTGRES_SHARED_BUFFERS:-512MB}", "-c", "effective_cache_size=${POSTGRES_EFFECTIVE_CACHE_SIZE:-1GB}", "-c", "work_mem=${POSTGRES_WORK_MEM:-8MB}", "-c", "max_wal_size=${POSTGRES_MAX_WAL_SIZE:-2GB}", "-c", "checkpoint_timeout=15min"]
+    command: ["postgres", "-c", "synchronous_commit=${POSTGRES_SYNCHRONOUS_COMMIT:-on}", "-c", "max_connections=${POSTGRES_MAX_CONNECTIONS:-200}", "-c", "shared_buffers=${POSTGRES_SHARED_BUFFERS:-512MB}", "-c", "effective_cache_size=${POSTGRES_EFFECTIVE_CACHE_SIZE:-1GB}", "-c", "work_mem=${POSTGRES_WORK_MEM:-8MB}", "-c", "max_wal_size=${POSTGRES_MAX_WAL_SIZE:-2GB}", "-c", "checkpoint_timeout=15min"]
     networks: [camara-network]
     environment:
       POSTGRES_USER: ${POSTGRES_LOCAL_USER:-postgres}
