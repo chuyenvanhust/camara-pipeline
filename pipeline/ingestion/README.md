@@ -74,7 +74,7 @@ python -m pipeline.ingestion.radius_udp_sender \
 ## Telemetry
 
 ```text
-[INGESTION][OK] window=10.0s | Throughput: udp_in=2900.0/s kafka_persisted=2900.0/s gap=+0.0/s | Admission: sustained<=2900/s burst<=2900/s | Queue: depth=0/20000(0.0%) backlog=0.00s | Kafka: publish_group_avg=48.0rec last=64rec/8.0ms persist(p50=6.0ms p95=12.0ms p99=18.0ms) queue_p95=2.0ms worker_slot_wait_p95=0.0ms global_wait_p95=0.0ms | Quality/Loss: data_loss=0(+0) (queue_dropped=0, pub_failed=0, dlq=0, invalid=0) | Totals: received=29000, kafka_persisted=29000
+[INGESTION][OK] window=10.0s | Throughput: udp_in=2900.0/s kafka_persisted=2900.0/s gap=+0.0/s | Capacity target (observe-only): sustained<=2900/s burst<=2900/s | Queue: depth=0/20000(0.0%) backlog=0.00s | Kafka: publish_group_avg=48.0rec last=64rec/8.0ms persist(p50=6.0ms p95=12.0ms p99=18.0ms) queue_p95=2.0ms worker_slot_wait_p95=0.0ms global_wait_p95=0.0ms | Quality/Loss: data_loss=0(+0) (queue_dropped=0, pub_failed=0, dlq=0, invalid=0) | Totals: received=29000, kafka_persisted=29000
 ```
 
 `publish_group_avg` là số record mà publisher coroutine giao cho Kafka trong một
@@ -97,9 +97,10 @@ tăng liên tục và `data_loss=0`. Queue chỉ hấp thụ burst ngắn; nó k
 durable buffering tại capture server hoặc Kafka.
 
 Sizing inflight phải theo bandwidth-delay product. Profile 8 GiB cấp tối đa
-`24*64=1536` record đang bay, lớn hơn nhiều BDP tại admission ceiling 2.9k/s nếu
+`24*64=1536` record đang bay, lớn hơn nhiều BDP tại capacity target 2.9k/s nếu
 Kafka leader p95 đạt ngân sách 20ms. Queue 20.000 record chỉ là đệm burst; capture
-phải giới hạn sustained rate theo profile.
+phải giới hạn sustained rate theo profile. Ingestion không thể backpressure nguồn
+UDP nên tuyệt đối không dùng capacity target để loại gói trước queue.
 
 `packet_reader` đóng dấu `ingest_epoch_ns` ngay sau `sock_recvfrom`. Pipeline dùng
 mốc này để đo E2E từ lúc application nhận UDP đến khi PostgreSQL/Redis đã hoàn tất.
@@ -107,6 +108,6 @@ Log processing tách `pre_process_p95` (UDP → bắt đầu business processing
 `processing_p95` (thời gian xử lý batch) và E2E. Các percentile này mô tả những
 phân bố khác nhau nên không được cộng trực tiếp với nhau.
 
-Telemetry phát `ADMISSION_EXCEEDED` khi tốc độ trung bình cửa sổ vượt sustained
-ceiling. Đây là cảnh báo để capture giảm tốc hoặc replay sau, không phải cơ chế
-drop/throttle trong repo.
+Telemetry phát `CAPACITY_TARGET_EXCEEDED` khi tốc độ trung bình cửa sổ vượt mục
+tiêu sustained. Đây chỉ là cảnh báo để capture giảm tốc hoặc replay sau; ingestion
+vẫn nhận và enqueue mọi datagram hợp lệ cho đến khi RAM queue thực sự đầy.

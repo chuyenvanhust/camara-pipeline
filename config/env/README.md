@@ -3,7 +3,7 @@
 `.env` la profile mac dinh cho may **12 vCPU / 8 GiB RAM**. Cac file trong thu muc
 nay chi ghi de cac bien tai nguyen/hieu nang, khong lap lai secret hay dia chi dich vu.
 
-| Profile | CPU | Partitions | IP replicas x members | Swap replicas x members | Admission ceiling | SLO |
+| Profile | CPU | Partitions | IP replicas x members | Swap replicas x members | Observe-only capacity target | SLO |
 |---|---:|---:|---:|---:|---:|---:|
 | `8gb.env` / `.env` | 12 | 9 | 3 x 1 | 3 x 1 | 800 pkt/s sustained, 900 burst candidate | E2E p95 < 100ms |
 | `16gb.env` | 16 | 12 | 4 x 1 | 4 x 1 | 3.9k pkt/s | E2E p95 < 100ms |
@@ -12,8 +12,9 @@ nay chi ghi de cac bien tai nguyen/hieu nang, khong lap lai secret hay dia chi d
 
 CPU quota là trần burst của từng container, không phải phần core được giữ chỗ.
 Tổng trần của các đường nóng được đặt gần số core profile để broker và database
-có thể hấp thụ tail ngắn; admission ceiling vẫn phải bảo đảm CPU host không bão
-hòa kéo dài và còn thời gian chạy cho Redis, networking, kernel UDP, monitoring.
+có thể hấp thụ tail ngắn. Capacity target dùng để cấu hình tốc độ ở capture và
+cảnh báo khi CPU host có nguy cơ bão hòa; ingestion không dùng target này để drop
+hoặc throttle UDP. Redis, networking, kernel UDP và monitoring vẫn cần headroom.
 
 Profile 8 GiB không đặt CFS hard quota cho chín process pipeline. Kafka,
 PostgreSQL, Redis và ingestion có tổng ceiling 8.5 CPU; các process business được
@@ -35,8 +36,9 @@ record truoc mot lan goi PostgreSQL/Redis. Profile lon tang so process va
 partition lanes. FIFO cuc bo chi giu toi da bon batch; partition pause tai 75% hoac khi
 record cu nhat cho 12ms, va resume tai 25%/4ms.
 
-Capture la nguon ben vung va phai admission-control theo sustained rate trong
-profile. Ingestion dung `acks=1`; PostgreSQL van `synchronous_commit=on` va Kafka
+Capture la nguon ben vung va phai dieu tiet/replay theo sustained target trong
+profile. Ingestion chi canh bao khi vuot target, khong loai goi theo PPS. Ingestion
+dung `acks=1`; PostgreSQL van `synchronous_commit=on` va Kafka
 offset chi duoc danh dau sau khi PostgreSQL + Redis hoan tat. Commit coordinator
 gom offset da xu ly moi 25ms/512 records ngoai critical path. Crash co the replay
 mot cua so nho; version fence/idempotency bao ve state va event.
@@ -77,10 +79,10 @@ profile lon. Hay giu cac bien `*_CPUS` cua `.env`, chi sao chep cac override RAM
 Sau khi doi `KAFKA_TOPIC_PARTITIONS`, phai chay quy trinh cap nhat topic; Compose
 khong tu giam partition va consumer chi can scale den so partition huu dung.
 
-Muc throughput la admission ceiling latency-first, khong phai throughput toi da
-de queue day. Ceiling 8 GiB hien la baseline bao thu 800/s; cac ceiling profile
-lon hon chi la diem khoi dau benchmark, chua phai cam ket tren phan cung dich.
-Khong tang ceiling neu p95 <100ms chua on dinh.
-Các ceiling 16/32/64 GiB là target benchmark, chưa phải cam kết SLO. Chỉ công
+Muc throughput la capacity target latency-first, khong phai hard limit hay
+throughput toi da de queue day. Target 8 GiB hien la baseline bao thu 800/s; cac
+target profile lon hon chi la diem khoi dau benchmark, chua phai cam ket tren phan
+cung dich. Khong tang toc do capture neu p95 <100ms chua on dinh.
+Các target 16/32/64 GiB chưa phải cam kết SLO. Chỉ công
 nhận bất kỳ profile nào trên phần cứng đích khi soak test cho thấy
 event-level E2E p95 < 100ms, loss=0 va Kafka lag khong tang lien tuc.

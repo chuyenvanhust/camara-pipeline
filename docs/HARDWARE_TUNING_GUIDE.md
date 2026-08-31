@@ -201,8 +201,9 @@ Hệ thống **CAMARA Network API Data Pipeline** tuân thủ 100% nguyên lý *
 Mỗi member là một container/PID Python (`CONSUMERS_PER_GROUP=1`); không chạy ba
 consumer coroutine trong cùng interpreter. Profile 8 GiB dùng 3 replica cho 9
 partition để mỗi process nhận trung bình 3 partition. Không đặt hard CPU quota
-cho worker; admission control giới hạn tải tổng, còn `cpu_shares` ưu tiên IP khi
-host tranh chấp.
+cho worker; capture server chịu trách nhiệm điều tiết/replay, còn `cpu_shares` ưu
+tiên IP khi host tranh chấp. Các biến `PIPELINE_RECOMMENDED_*_PPS` chỉ tạo cảnh
+báo capacity và không giới hạn hay loại gói tại ingestion.
 
 Mỗi process tự sở hữu PostgreSQL pool và Redis client. PostgreSQL gắn
 `application_name` theo module; Redis dùng DB 0/1/2 tương ứng IP/Device/SIM.
@@ -244,8 +245,9 @@ residence tăng, capture phải giảm tốc/replay.
 $$\text{Required batches}=\left\lceil\frac{\text{target records/s}\times\text{persist latency s}}{\text{batch records}}\right\rceil$$
 $$\text{Capacity}_{\text{inflight}} = \text{inflight batches} \times \text{batch records}$$
 *Ví dụ*: 2,9k/s, persist p95 18ms và batch 64 cần ít nhất 1 batch theo BDP.
-Profile cấp inflight headroom cho tail ngắn; admission control vẫn phải chặn tải
-sustained vượt profile.
+Profile cấp inflight headroom cho tail ngắn. Capture server phải điều tiết tải
+sustained vượt profile; UDP ingestion chỉ quan sát/cảnh báo và không được loại gói
+theo ngưỡng cấu hình.
 
 ### 3. Ngân Sách Kết Nối PostgreSQL (Connection Budget)
 $$\text{Total} = 10 + R_{ip}P_{ip} + R_{dev}P_{dev} + R_{sim}P_{sim} + 5 + 10$$

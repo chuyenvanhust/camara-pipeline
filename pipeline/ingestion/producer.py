@@ -182,26 +182,6 @@ class RadiusLogProducer:
         self._inflight_wait_ms: deque[float] = deque(maxlen=4096)
         self._worker_slot_wait_ms: deque[float] = deque(maxlen=4096)
         self._batch_sizes: deque[int] = deque(maxlen=4096)
-        # Real admission control: token bucket sized to the burst ceiling.
-        # RECOMMENDED_SUSTAINED_PPS/BURST_PPS were previously log-only labels
-        # (see the telemetry loop) and never rejected a single packet.
-        self._admission_tokens: float = float(RECOMMENDED_BURST_PPS or 0)
-        self._admission_last_ts: float = time.monotonic()
-
-    def _admission_allow(self) -> bool:
-        if RECOMMENDED_BURST_PPS <= 0:
-            return True
-        now = time.monotonic()
-        elapsed = now - self._admission_last_ts
-        self._admission_last_ts = now
-        self._admission_tokens = min(
-            float(RECOMMENDED_BURST_PPS),
-            self._admission_tokens + elapsed * RECOMMENDED_SUSTAINED_PPS,
-        )
-        if self._admission_tokens < 1.0:
-            return False
-        self._admission_tokens -= 1.0
-        return True
 
     @staticmethod
     def _percentile(values, quantile: float) -> float:
@@ -309,7 +289,11 @@ class RadiusLogProducer:
                 and RECOMMENDED_SUSTAINED_PPS > 0
                 and input_rate > RECOMMENDED_SUSTAINED_PPS
             ):
-                status = "ADMISSION_EXCEEDED"
+                # The capture source is the durable owner and UDP has no
+                # backpressure/replay handshake.  This is deliberately an
+                # observe-only capacity warning: ingestion must never discard
+                # a datagram merely because a recommended profile is exceeded.
+                status = "CAPACITY_TARGET_EXCEEDED"
             level = logging.WARNING if status != "OK" else logging.INFO
             if _PROM_QUEUE_DEPTH is not None:
                 _PROM_QUEUE_DEPTH.set(queue_depth)
@@ -320,7 +304,7 @@ class RadiusLogProducer:
                 level,
                 "[INGESTION][%s] window=%.1fs | "
                 "Throughput: udp_in=%.1f/s kafka_persisted=%.1f/s gap=%+.1f/s | "
-                "Admission: sustained<=%d/s burst<=%d/s | "
+                "Capacity target (observe-only): sustained<=%d/s burst<=%d/s | "
                 "Queue: depth=%d/%d(%.1f%%) backlog=%.2fs | "
                 "Kafka: publish_group_avg=%.1frec last=%drec/%.1fms persist(p50=%.1fms p95=%.1fms p99=%.1fms) "
                 "queue_p95=%.1fms worker_slot_wait_p95=%.1fms global_wait_p95=%.1fms | "
@@ -409,11 +393,6 @@ class RadiusLogProducer:
 
     def _put_udp_item(self, item: QueueItem) -> bool:
         assert self._worker_queues
-        if not self._admission_allow():
-            self._counts["queue_dropped"] += 1
-            if _PROM_QUEUE_DROPPED is not None:
-                _PROM_QUEUE_DROPPED.inc()
-            return False
         if item.key:
             target_idx = hash(item.key) % len(self._worker_queues)
         else:

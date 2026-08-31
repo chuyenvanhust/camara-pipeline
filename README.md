@@ -169,7 +169,7 @@ sequenceDiagram
 4. **Passive Mirror Ingestion & Bounded Buffer**:
    - Capture server ngoài repo chịu trách nhiệm bền vững và RADIUS ACK/response; ingestion chỉ nhận mirror một chiều.
    - Queue RAM có giới hạn hấp thụ burst ngắn. Queue đầy hoặc Kafka publish lỗi được tính là `data_loss` và phải cảnh báo để replay từ capture server.
-   - Profile mặc định dùng Kafka `acks=1`, không idempotence, vì capture ngoài repo chịu durability/replay. Có thể đổi sang `acks=all` + idempotence nếu hợp đồng nguồn thay đổi, nhưng phải hạ admission limit và đo lại p95.
+   - Profile mặc định dùng Kafka `acks=1`, không idempotence, vì capture ngoài repo chịu durability/replay. Có thể đổi sang `acks=all` + idempotence nếu hợp đồng nguồn thay đổi, nhưng phải hạ tốc độ mirror tại capture và đo lại p95. Ingestion không hard-limit theo `PIPELINE_RECOMMENDED_*_PPS`.
 
 5. **Manual Offset Commit & Dead Letter Queue (DLQ)**:
    - Tắt hoàn toàn `enable_auto_commit`. Offset chỉ được commit sau khi batch đã ghi thành công vào DB.
@@ -294,7 +294,7 @@ Nó không nhận response, không retry và không dùng để chứng minh đ�
 | `RADIUS_UDP_KAFKA_PRODUCERS` | `1` | Producer dùng chung cho bốn publisher coroutine; Kafka giữ FIFO theo partition/key và gom batch tốt hơn |
 | `RADIUS_UDP_KAFKA_TOTAL_MAX_INFLIGHT_BATCHES` | `24` | Trần tuyệt đối batch Kafka đang ghi trên toàn process |
 | `INGESTION_KAFKA_ACKS` / `INGESTION_ENABLE_IDEMPOTENCE` | `1` / `false` | Latency-first vì capture ngoài repo chịu durability/replay |
-| `PIPELINE_RECOMMENDED_SUSTAINED_PPS` | `800` | Baseline bảo thủ trước soak test cho E2E p95 < 100ms |
+| `PIPELINE_RECOMMENDED_SUSTAINED_PPS` | `800` | Mục tiêu capacity dùng cho cảnh báo/soak test; không phải hard limit và không làm rơi gói |
 | `SWAP_CHECKPOINT_INTERVAL_MS` | `150` | Cửa sổ gom watermark không phát sinh SIM/Device swap |
 | `SWAP_CHECKPOINT_MAX_RECORDS` | `256` | Số state kích hoạt một bulk PostgreSQL checkpoint |
 | `SWAP_CHECKPOINT_QUEUE_RECORDS` | `4096` | Backpressure bound cho checkpoint mỗi consumer member |

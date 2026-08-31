@@ -19,7 +19,7 @@ set -a; [ -f .env ] && . .env; set +a
 set -a; [ -n "$PROFILE_ENV" ] && . "$PROFILE_ENV"; set +a
 [ -n "$PROFILE_ENV" ] && echo ">>> Hardware profile: $PROFILE_ENV"
 echo ">>> Latency SLO: E2E p95 < ${PIPELINE_SLA_E2E_P95_MS:-100}ms"
-echo ">>> Capture admission: sustained <= ${PIPELINE_RECOMMENDED_SUSTAINED_PPS:-800} pkt/s, candidate burst <= ${PIPELINE_RECOMMENDED_BURST_PPS:-900} pkt/s"
+echo ">>> Observe-only capacity target: sustained <= ${PIPELINE_RECOMMENDED_SUSTAINED_PPS:-800} pkt/s, candidate burst <= ${PIPELINE_RECOMMENDED_BURST_PPS:-900} pkt/s (ingestion does not rate-limit or drop at this threshold)"
 
 for member_count in \
   "${IP_MSISDN_CONSUMERS_PER_GROUP:-1}" \
