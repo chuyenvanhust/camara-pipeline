@@ -24,10 +24,10 @@ from pipeline.modules.shared.redis_client import create_redis_client
 
 logger = logging.getLogger(__name__)
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "camara-kafka:9092")
-BATCH_MAX_RECORDS = int(os.getenv("BATCH_MAX_RECORDS", "24"))
-BATCH_TIMEOUT_MS = int(os.getenv("BATCH_TIMEOUT_MS", "1"))
+BATCH_MAX_RECORDS = int(os.getenv("BATCH_MAX_RECORDS", "48"))
+BATCH_TIMEOUT_MS = int(os.getenv("BATCH_TIMEOUT_MS", "5"))
 MAX_BATCH_RETRIES = int(os.getenv("MAX_BATCH_RETRIES", "3"))
-PARTITION_CONCURRENCY = int(os.getenv("PROCESSING_PARTITION_CONCURRENCY", "4"))
+PARTITION_CONCURRENCY = int(os.getenv("PROCESSING_PARTITION_CONCURRENCY", "3"))
 FETCH_MAX_RECORDS = int(os.getenv(
     "PROCESSING_FETCH_MAX_RECORDS",
     str(BATCH_MAX_RECORDS * max(1, PARTITION_CONCURRENCY)),

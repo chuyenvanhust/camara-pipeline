@@ -6,10 +6,11 @@ Output là file CSV tuân thủ RFC 2866 + 3GPP TS 29.061 VSA.
 ## Vai trò trong hệ thống
 
 ```
-simulator/
-    │  sinh radius_log.csv
-    ▼
-pipeline/ingestion/producer.py  →  Kafka radius.raw
+simulator/ -- sinh CSV --> data/radius_log.csv
+       |                         |
+       | --kafka (direct test)   +--> UDP sender --> radius-ingestion
+       v                                           |
+Kafka radius.accounting.raw <----------------------+
 ```
 
 ## Files
@@ -41,7 +42,7 @@ python simulator/simulator.py \
   --output data/radius_log.csv
 
 # Stream thẳng vào Kafka (bỏ qua bước ghi file)
-python simulator/simulator.py --kafka --kafka-topic radius.raw
+python simulator/simulator.py --kafka --kafka-topic radius.accounting.raw
 ```
 
 ## Phụ thuộc external

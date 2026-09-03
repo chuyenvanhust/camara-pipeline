@@ -110,7 +110,7 @@ mà vẫn dùng transaction state + history + audit + outbox.
 Lớp cơ sở trừu tượng cho tất cả các consumer trong hệ thống:
 - **Vòng lặp tiêu thụ (`run()`)**: Sử dụng `AIOKafkaConsumer.getmany()` gom tối đa `BATCH_MAX_RECORDS` hoặc chờ `BATCH_TIMEOUT_MS`.
 - **Per-partition temporal pipeline**: `getmany()` đưa record vào FIFO riêng; mỗi partition có một mutating worker, còn các partition độc lập chạy song song tới `PROCESSING_PARTITION_CONCURRENCY`.
-- **Batch coalescing**: Worker ghép fragment cùng partition tới `BATCH_MAX_RECORDS`; mặc định IP=16 và Swap=24 để giữ ngân sách p95.
+- **Batch coalescing**: Worker ghép fragment cùng partition tới `BATCH_MAX_RECORDS`; profile hiện hành dùng IP=48 và Swap=64, timeout 5ms. Batch thực tế thường nhỏ hơn vì worker không chờ khi FIFO đã tạm hết.
 - **Process-level write combiner**: Các partition worker gửi batch vào queue chung của đúng process. Combiner chờ tối đa 2ms/64 record rồi gọi `process_batch()` một lần; mỗi partition vẫn chờ future riêng nên FIFO và durability barrier không đổi.
 - **Age-aware backpressure**: `pause()` khi FIFO đạt 75% hoặc record cũ nhất chờ 12ms; `resume()` tại 25% và 4ms. Partition nhanh không bị partition chậm chặn, còn hysteresis tránh flapping vì jitter ngắn.
 - **Coalesced Manual Offset Commit**: Sau batch thành công (`enable_auto_commit=False`), worker công bố offset cho coordinator. Coordinator commit nhiều partition mỗi 25ms/512 record, tách Kafka RTT khỏi critical path và giảm request tới broker. Khi rebalance/crash, cửa sổ chưa commit được phát lại và store xử lý idempotent/version-fenced.
@@ -159,7 +159,8 @@ Bộ công cụ chuẩn hoá và kiểm tra ràng buộc dữ liệu:
 - `normalize_status()`: Chuẩn hoá các trạng thái phiên RADIUS (`start`, `stop`, `interim-update`, `accounting-on`, `accounting-off`).
 - `event_id()`: Tạo khóa định danh duy nhất cho sự kiện để đảm bảo tính Idempotency.
 
-> 📖 **Báo cáo Kỹ thuật Chuyên sâu**: Đọc tài liệu phân tích kiến trúc chi tiết tại [`docs/BAO_CAO_KY_THUAT_PIPELINE.md`](../../docs/BAO_CAO_KY_THUAT_PIPELINE.md).
+> 📖 **Tài liệu liên quan**: xem [kiến trúc và luồng dữ liệu](../../../docs/PIPELINE_ARCHITECTURE.md)
+> cùng [báo cáo kỹ thuật chuyên sâu](../../../docs/BAO_CAO_KY_THUAT_PIPELINE.md).
 
 ---
 

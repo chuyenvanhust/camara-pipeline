@@ -84,12 +84,7 @@ class DeviceSwapConsumer(BaseKafkaConsumer):
         stage_started = time.monotonic()
         state = await self._load_state(list({item[1] for item in parsed}))
         self.metrics.observe_stage("state", time.monotonic() - stage_started)
-        # F-BATCH-DUP-FIX: dict thay vì list — nếu CÙNG msisdn xuất hiện nhiều lần
-        # trong 1 batch (nhiều bản ghi RADIUS liên tiếp của cùng thuê bao), UPSERT
-        # nhiều dòng CÙNG msisdn trong 1 lệnh SQL sẽ bị Postgres từ chối
-        # ("ON CONFLICT DO UPDATE command cannot affect row a second time").
-        # records của process_batch luôn thuộc 1 partition, đã sắp theo offset,
-        # nên ghi đè theo thứ tự lặp = giữ lại đúng bản ghi MỚI NHẤT.
+        
         states_by_msisdn: Dict[str, tuple] = {}
         history, audit, outbox = [], [], []
         cache_updates: Dict[str, str] = {}

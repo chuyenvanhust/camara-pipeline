@@ -34,10 +34,7 @@ class IPMsisdnConsumer(BaseKafkaConsumer):
     async def process_batch(self, records: List[Any]) -> None:
         assert self.store is not None
         operations = []
-        # F-BATCH-DUP-FIX: dict thay vì list — cùng 1 acct_session_id (vd Start rồi
-        # Interim-Update trong cùng batch) trước đây tạo 2 dòng cùng khóa trong 1
-        # lệnh UPSERT -> Postgres từ chối (CardinalityViolationError). records của
-        # process_batch thuộc 1 partition, đã theo thứ tự offset -> ghi đè giữ bản mới nhất.
+        
         session_by_id: Dict[str, tuple] = {}
         for record in records:
             try:

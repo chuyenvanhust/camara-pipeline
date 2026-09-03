@@ -10,17 +10,17 @@ Thư mục `pipeline/` chứa logic nhận bản mirror RADIUS Accounting từ c
 flowchart TD
     subgraph INGESTION["1. Ingestion Layer (pipeline/ingestion)"]
         UDP["UDP Listener (Port 1813)<br/>PacketReader"]
-        CSVPROD["CSV File Reader<br/>LocalCSVReader"]
+        CSVPROD["CSV File Reader<br/>direct benchmark path"]
         QUEUE[("Bounded Ingestion Queue<br/>asyncio.Queue (RAM)")]
         KPROD["Kafka Async Producer<br/>(micro-batch + acks=1)"]
         
         UDP -->|Decode RFC 2866| QUEUE
-        CSVPROD -->|Read records| QUEUE
+        CSVPROD -->|normalize + future groups| KPROD
         QUEUE --> KPROD
     end
 
     subgraph BROKER["2. Message Broker (Apache Kafka)"]
-        TOPIC["Topic: radius.accounting.raw<br/>16 Partitions, Partition Key: MSISDN"]
+        TOPIC["Topic: radius.accounting.raw<br/>9/12/24/48 partitions theo profile<br/>Partition Key: MSISDN"]
         DLQ["Topic: radius.accounting.raw.dlq<br/>Error / Malformed Messages"]
         
         KPROD -->|Partitioned Send| TOPIC
@@ -199,9 +199,9 @@ classDiagram
 | [`run_pipeline.py`](run_pipeline.py) | **Entrypoint một member/process**: start metrics và đúng một Kafka member cho module được chọn; member tự sở hữu DB pool, Redis client và checkpoint coordinator. | Scale bằng `PIPELINE_*_REPLICAS`; `CONSUMERS_PER_GROUP` bắt buộc bằng `1`. |
 | [`ingestion/`](ingestion/) | **Stage 1 (Ingestion)**: Nhận passive mirror UDP/1813 hoặc CSV, giải mã RFC 2866 và ghi Kafka `radius.accounting.raw` bằng bounded queues/micro-batches. ACK/response/replay thuộc capture server ngoài repo. | Chạy độc lập: `python -m pipeline.ingestion.producer --udp --port 1813` |
 | [`modules/shared/`](modules/shared/) | **Hạ tầng dùng chung**: `BaseKafkaConsumer`, `DatabasePool` (quản lý connection pool + transaction), `ModuleMetrics` (Prometheus exporter), `redis_client`, `events` normalization. | Được import bởi 3 modules con. |
-| [`modules/ip_msisdn/`](modules/ip_msisdn/) | **Module 1 (IP↔MSISDN)**: Quản lý ánh xạ IP nguồn với MSISDN theo phiên mạng, chạy Lua Scripts trên Redis và lưu session state vào Postgres. | Task con của `run_pipeline.py`, group `cg-ip-msisdn`. |
-| [`modules/device_swap/`](modules/device_swap/) | **Module 2 (Device Swap)**: Theo dõi IMEI của từng MSISDN, phát hiện đổi máy, ghi nhận lịch sử và tạo Outbox event. | Task con của `run_pipeline.py`, group `cg-device-swap`. |
-| [`modules/sim_swap/`](modules/sim_swap/) | **Module 3 (SIM Swap)**: Theo dõi IMSI của từng MSISDN, phát hiện đổi SIM, ghi nhận lịch sử và tạo Outbox event. | Task con của `run_pipeline.py`, group `cg-sim-swap`. |
+| [`modules/ip_msisdn/`](modules/ip_msisdn/) | **Module 1 (IP↔MSISDN)**: Quản lý ánh xạ IP nguồn với MSISDN theo phiên mạng, chạy Lua Scripts trên Redis và lưu session state vào Postgres. | Một member mỗi PID, group `cg-ip-msisdn`; Compose scale bằng `PIPELINE_IP_REPLICAS`. |
+| [`modules/device_swap/`](modules/device_swap/) | **Module 2 (Device Swap)**: Theo dõi IMEI của từng MSISDN, phát hiện đổi máy, ghi nhận lịch sử và tạo Outbox event. | Một member mỗi PID, group `cg-device-swap`; scale bằng `PIPELINE_DEVICE_REPLICAS`. |
+| [`modules/sim_swap/`](modules/sim_swap/) | **Module 3 (SIM Swap)**: Theo dõi IMSI của từng MSISDN, phát hiện đổi SIM, ghi nhận lịch sử và tạo Outbox event. | Một member mỗi PID, group `cg-sim-swap`; scale bằng `PIPELINE_SIM_REPLICAS`. |
 | [`dispatcher/`](dispatcher/) | **Stage 3 (Event Dispatcher)**: Tiến trình worker độc lập poll bảng `notification_log` và gửi HTTP Webhook callback tới các subscriber Open Gateway. | **Chạy độc lập**: `python -m pipeline.dispatcher.notification_dispatcher` |
 
 ---
@@ -209,7 +209,7 @@ classDiagram
 ## 4. Mô hình xử lý song song & Quản lý tiến trình (`run_pipeline.py`)
 
 1. **Khởi tạo hạ tầng & Topics**:
-   - `run_pipeline.py` sử dụng `AIOKafkaAdminClient` tự động tạo topic `radius.accounting.raw` và `radius.accounting.raw.dlq` với số partition cấu hình (`KAFKA_TOPIC_PARTITIONS=16`).
+   - `run_pipeline.py` sử dụng `AIOKafkaAdminClient` tạo topic `radius.accounting.raw` và `radius.accounting.raw.dlq` nếu chưa tồn tại, với số partition của profile (`9/12/24/48`). Nó không tự thay đổi topic đã tồn tại.
    - Mở cổng Prometheus Metrics (`METRICS_PORT`, ví dụ 9200, 9202, 9203).
 2. **Tách Tiến Trình & Lọc Consumer Group (`PIPELINE_GROUPS`)**:
    - Để triệt tiêu nút thắt GIL của Python khi chạy cả 3 groups chung 1 event loop, hệ thống tách thành 3 worker containers/services (`pipeline-ip-msisdn`, `pipeline-device-swap`, `pipeline-sim-swap`).
@@ -224,7 +224,7 @@ classDiagram
    - `getmany()` chỉ làm nhiệm vụ fetch và phân phối record vào FIFO riêng của từng partition; không còn gom nhiều partition thành một shard hay chờ `gather()` toàn member.
    - Mỗi partition có đúng một mutating worker nên offset trong partition luôn tuần tự. Các partition độc lập chạy song song tới giới hạn `PROCESSING_PARTITION_CONCURRENCY`.
    - Worker coalesce các fragment fetch liền kề tới `BATCH_MAX_RECORDS` trước khi ghi, tránh biến từng fragment nhỏ thành một transaction/commit riêng.
-   - Concurrency là ngân sách downstream: profile 8 GiB dùng mức 2/process. FIFO vẫn được giữ trong từng partition, nên cùng MSISDN không bị đảo thứ tự.
+   - Concurrency là ngân sách downstream: profile 8 GiB dùng mức 3/process, khớp ba partition/member. FIFO vẫn được giữ trong từng partition, nên cùng MSISDN không bị đảo thứ tự.
    - Mỗi partition batch được gửi vào write combiner cấp process. Combiner đợi tối đa 2ms hoặc 64 record rồi gọi `process_batch()` một lần cho nhiều partition độc lập. Future riêng của từng partition chỉ hoàn tất sau lần ghi chung, do đó FIFO/offset barrier không bị yếu đi.
    - Sau PostgreSQL/Redis, worker công bố offset cho commit coordinator. Coordinator gom offset của nhiều partition mỗi 25ms/512 records và commit ngoài critical path; partition nhanh không phải chờ một Kafka round-trip cho từng batch.
    - Khi FIFO đạt 75% hoặc record cũ nhất chờ 12ms, consumer `pause()` riêng partition đó; chỉ `resume()` khi xuống 25% và tuổi hàng đợi dưới 4ms. Rebalance phát lại phần chưa commit cho owner mới.
@@ -247,7 +247,7 @@ outbox/subscription; nếu chỉ nhân server ngay trong Compose sẽ phá atomi
 Hệ thống ghi log định kỳ mỗi `THROUGHPUT_LOG_INTERVAL_SECONDS` (10s) theo định dạng phân khối trực quan bằng ký tự `|`:
 
 ```
-[PROCESSING][<group-id>][member=<hostname>][OK|SLO_BREACH|ERROR] ... | Latency: batch_avg=16.0rec/... pre_process_p95=... processing_p95=... e2e_avg=... p95=... | Flow: kafka_lag=0 partition_queue=0 oldest=0.0ms workers=3 concurrency_limit=2 paused=0 | OffsetCommit: pending=0 records=.../s requests=.../s p95=...ms errors=0(+0) | Quality/Loss: ...
+[PROCESSING][<group-id>][member=<hostname>][OK|SLO_BREACH|ERROR] ... | Latency: batch_avg=... pre_process_p95=... processing_p95=... e2e_avg=... p95=... | Flow: kafka_lag=0 partition_queue=0 oldest=0.0ms workers=3 concurrency_limit=3 paused=0 | OffsetCommit: pending=0 records=.../s requests=.../s p95=...ms errors=0(+0) | Quality/Loss: ...
 ```
 
 ### Các trường đo lường chính:
@@ -261,14 +261,17 @@ Hệ thống ghi log định kỳ mỗi `THROUGHPUT_LOG_INTERVAL_SECONDS` (10s) 
     - `pg`: Thời gian ghi batch xuống PostgreSQL.
     - `rds`: Thời gian cập nhật cache Redis.
     - `pool_acq`: Thời gian chờ lấy connection từ `DatabasePool` (`db_pool_acquire_ms`).
-  - `e2e_avg/p95/max`: độ trễ từ khi gói vào ingestion tới khi cả PostgreSQL và Redis hoàn tất. `p95` là chỉ số quyết định SLO; log phát `SLO_BREACH` khi vượt `PIPELINE_SLA_E2E_P95_MS`.
+  - `e2e_avg/p95/max`: độ trễ từ UDP application receive tới business-ready
+    store. IP kết thúc sau PG+Redis; swap thật kết thúc sau transaction PG rồi
+    Redis; no-change swap kết thúc sau Redis, còn checkpoint/offset được báo riêng.
+    `p95` quyết định SLO và phát `SLO_BREACH` khi vượt ngưỡng.
 - **`Swaps/Events`**: Số lượng sự kiện phát hiện mới trong cửa sổ đo (`+delta`) và tổng tích lũy.
 - **`Flow`**: Kafka lag, số record/tuổi record cũ nhất trong FIFO partition, worker và partition bị pause.
 - **`OffsetCommit`**: record đã xử lý đang chờ commit, tốc độ record/request commit, commit p95 và lỗi. Đây không nằm trên critical path ghi nghiệp vụ.
 - **`Quality/Loss`**: `kafka_lag` và `data_loss` (`err`, `dlq`).
 - **`Totals`**: Tổng số lượng bản ghi tích lũy.
 
-> 📖 **Báo cáo Kỹ thuật Chuyên sâu**: Xem chi tiết toàn bộ các giải pháp kỹ thuật và thuật toán triển khai trong từng file tại [`docs/BAO_CAO_KY_THUAT_PIPELINE.md`](../docs/BAO_CAO_KY_THUAT_PIPELINE.md).
+> 📖 **Luồng dữ liệu triển khai hiện tại**: xem [`docs/PIPELINE_ARCHITECTURE.md`](../docs/PIPELINE_ARCHITECTURE.md). Báo cáo kỹ thuật bổ sung nằm tại [`docs/BAO_CAO_KY_THUAT_PIPELINE.md`](../docs/BAO_CAO_KY_THUAT_PIPELINE.md).
 
 ---
 

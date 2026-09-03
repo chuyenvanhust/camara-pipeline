@@ -28,7 +28,7 @@ set -a; [ -n "$PROFILE_ENV" ] && source "$PROFILE_ENV"; set +a
 
 # F-PARALLEL: đồng bộ đúng tên biến với docker-compose.yml/.env.example
 KAFKA_TOPIC_RAW="${KAFKA_TOPIC_RAW:-radius.accounting.raw}"
-KAFKA_PARTITIONS="${KAFKA_TOPIC_PARTITIONS:-12}"
+KAFKA_PARTITIONS="${KAFKA_TOPIC_PARTITIONS:-9}"
 KAFKA_REPL="${KAFKA_REPLICATION_FACTOR:-3}"
 KAFKA_CONSUMER_GROUPS="${KAFKA_CONSUMER_GROUPS:-cg-ip-msisdn cg-device-swap cg-sim-swap}"
 POSTGRES_USER="${POSTGRES_LOCAL_USER:-postgres}"

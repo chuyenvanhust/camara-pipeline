@@ -5,7 +5,10 @@
 > Kafka `acks=1`, queue theo profile; 8 GiB dùng baseline 800/s, còn target
 > 3.9k/7.8k/15.5k của profile lớn phải được soak-test để bảo vệ
 > E2E p95 <100ms. Profile 8 GiB dùng 4 worker/1 producer dùng chung và inflight
-> 6/worker, tối đa 24 toàn process. Không áp các con số batch/queue trong phần lịch sử này.
+> 6/worker, tối đa 24 toàn process. Pipeline hiện dùng 1 Kafka member/PID,
+> 3/4/6 partition worker song song tùy profile và batch IP=48, Swap=64, wait=5ms.
+> Không áp các con số batch/queue trong phần lịch sử này. Kiến trúc chuẩn hiện tại
+> được mô tả tại `docs/PIPELINE_ARCHITECTURE.md`.
 
 ## 1. Kết luận từ baseline 15.000 pkt/s
 

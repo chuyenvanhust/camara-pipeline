@@ -49,7 +49,9 @@ Mặc dù có mô hình kiến trúc tương đồng với `device_swap`, module
        "last_source_offset": 89450
      }
      ```
-   - Trường thời gian này phục vụ trực tiếp cho endpoint `GET /sim-swap/v0/retrieve-date` của CAMARA API trả về ngày đổi SIM gần nhất trong vòng $N$ giờ.
+   - Trường thời gian này hỗ trợ read state; endpoint thực tế là
+     `POST /sim-swap/v0/retrieve-date` và truy vấn history PostgreSQL để trả thời
+     điểm đổi SIM gần nhất theo `maxAge` ngày.
 
 2. **Cấu trúc Payload Notification (CAMARA Schema)**:
    - Khi phát hiện sự kiện SIM Swap, payload JSON được định dạng theo đúng quy chuẩn CAMARA Network API:

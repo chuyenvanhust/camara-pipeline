@@ -69,7 +69,9 @@ stateDiagram-v2
 
 1. **Khử Nghẽn Đường Xử Lý Chính (Decoupled Hot Path)**:
    - Các Consumer Kafka **không bao giờ thực hiện HTTP request**. Mọi thông báo chỉ được ghi vào bảng cơ sở dữ liệu `notification_log` trong cùng transaction với state thay đổi.
-   - Nhờ đó, nếu máy chủ của đối tác subscriber bị chậm, quá tải hoặc mất kết nối, consumer vẫn duy trì tốc độ xử lý hàng chục nghìn gói tin/giây mà không bị block.
+   - Nhờ đó, nếu subscriber chậm hoặc mất kết nối, consumer không bị block bởi
+     HTTP. Throughput thực tế vẫn phụ thuộc profile Kafka/PG/Redis và chỉ được
+     công nhận qua soak test; outbox không tự bảo đảm một con số pkt/s cụ thể.
 
 2. **Cơ chế Khóa Tranh Chấp `FOR UPDATE SKIP LOCKED`**:
    - Khi chạy nhiều instance Dispatcher song song (Horizontal Scaling), câu lệnh SQL sử dụng `FOR UPDATE SKIP LOCKED` đảm bảo mỗi notification chỉ được nhận bởi đúng một worker mà không gây xung đột lock table hay deadlock giữa các tiến trình.

@@ -36,7 +36,9 @@ flowchart TD
 
 ## 2. Chiến lược Tối ưu hóa Batching (`process_batch`)
 
-Để đạt thông lượng hàng chục nghìn message/giây, module thực hiện xử lý batch theo quy trình 5 bước nghiêm ngặt:
+Để giảm round-trip mà vẫn giữ ngân sách latency, module thực hiện xử lý batch theo
+quy trình 5 bước sau. Trần throughput chỉ được công nhận bằng soak test của profile,
+không suy ra trực tiếp từ kích thước batch:
 
 1. **Trích xuất & Gom nhóm MSISDN**:
    - Lọc các bản ghi hợp lệ trong batch, gom tập hợp các `msisdn` duy nhất.

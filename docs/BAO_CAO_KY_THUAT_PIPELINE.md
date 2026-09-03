@@ -1,6 +1,10 @@
 # BÁO CÁO KỸ THUẬT: CÁC KỸ THUẬT CHUYÊN SÂU TRONG CAMARA DATA PIPELINE
 
 > **Tài liệu Kỹ thuật Dự án Viễn thông**: Báo cáo mô tả chi tiết toàn bộ các giải pháp kiến trúc, thuật toán và kỹ thuật tối ưu hóa hiệu năng được triển khai trong các module trọng điểm của CAMARA Data Pipeline.
+>
+> Sơ đồ triển khai, trình tự record và ma trận profile chuẩn nằm tại
+> [`PIPELINE_ARCHITECTURE.md`](PIPELINE_ARCHITECTURE.md). Báo cáo này tập trung
+> vào kỹ thuật implementation và không công bố throughput nếu chưa soak-test.
 
 ---
 
@@ -35,7 +39,7 @@ flowchart TD
     KAFKA --> CG_DEV["Device Swap Consumer Group"]
     KAFKA --> CG_SIM["SIM Swap Consumer Group"]
 
-    CG_IP -->|Lua Scripts| REDIS[("Redis / Redis Sentinel")]
+    CG_IP -->|Lua Scripts| REDIS[("Redis DB 0/1/2")]
     CG_IP -->|Session Upsert| PG[("PostgreSQL")]
     CG_DEV -->|Two-Tier Lookup + Tx| PG
     CG_DEV -->|Cache MSET| REDIS
@@ -123,18 +127,24 @@ flowchart TD
 - Tắt hoàn toàn `enable_auto_commit`. Offset của từng partition chỉ được commit sau khi batch của chính partition đó ghi PostgreSQL/Redis thành công.
 - Cơ chế Exponential Backoff Retry (thử lại tối đa 3 lần). Nếu một bản ghi hoặc shard bị lỗi cấu trúc dữ liệu không thể xử lý, nó được chuyển hướng tự động sang topic `<topic>.dlq` kèm toàn bộ payload và stack trace lỗi mà không làm dừng pipeline.
 
-#### Kỹ thuật 3: Đo lường Độ trễ Bản tin Toàn trình Siêu Tốc (Fast Float Epoch E2E Lag)
-- Trích xuất `ingest_epoch_s` từ mỗi bản ghi trong batch, so sánh với thời điểm hiện tại `time.time()` ngay sau khi hoàn tất ghi DB/Redis:
+#### Kỹ thuật 3: Đo lường Độ trễ Bản tin Toàn trình
+- Ưu tiên trích xuất mốc nguyên `ingest_epoch_ns` được đóng dấu ngay sau UDP
+  receive; `ingest_epoch_s` chỉ là fallback tương thích record cũ. Mốc được so
+  với thời điểm ngay sau khi business store hoàn tất:
   $$\text{e2e\_lag\_ms} = (\text{now\_epoch} - \text{record.ingest\_epoch\_s}) \times 1000$$
-- Triệt tiêu 100% chi phí parse chuỗi ISO-8601 datetime trên $45.000 \text{ records/giây}$ tiêu thụ bởi 3 consumer groups.
+- Tránh parse ISO-8601 trên hot path và giữ cùng một mốc E2E xuyên qua ingestion,
+  Kafka và processing. Con số throughput phải lấy từ telemetry của profile.
 
 ---
 
 ### 3.2. `pipeline/modules/shared/db.py` — Giao Dịch Nguyên Tử 4 Bảng & Fencing Versioning
 
-#### Kỹ thuật 1: Quản lý Connection Pool Bất Đồng Bộ Duy Nhất (`asyncpg.Pool`)
-- Sử dụng 1 connection pool duy nhất dùng chung cho toàn bộ $N$ consumer members trong cùng một tiến trình OS (cấu hình `min=6, max=32`), ngăn chặn tình trạng cạn kiệt socket kết nối tới PostgreSQL.
-- PostgreSQL được giới hạn an toàn `max_connections=200` vừa vặn với container 2GB RAM (`work_mem=16MB`), ngăn ngừa hiện tượng memory pressure và context switching.
+#### Kỹ thuật 1: Connection Pool thuộc sở hữu của từng member/process (`asyncpg.Pool`)
+- Mỗi container chạy đúng một Kafka member và sở hữu một pool riêng. Các partition
+  worker trong process dùng chung pool đó; pool không được chia sẻ qua process.
+- `DB_POOL_MIN/MAX`, số replica và `POSTGRES_MAX_CONNECTIONS` thay đổi theo
+  hardware profile. Connection budget phải tính `replicas × pool_max` cho cả ba
+  module và chừa phần cho API/dispatcher/migration.
 
 #### Kỹ thuật 2: Giao dịch Nguyên tử 4 Bảng trong Cùng một Transaction (`_persist_swap_batch`)
 - Toàn bộ 4 thao tác ghi của một đợt phát hiện sự kiện Swap được đóng gói trong cùng một lệnh `connection.transaction()`:
@@ -170,7 +180,8 @@ flowchart TD
 
 #### Kỹ thuật 1: Sampling Ngẫu Nhiên 10% Prometheus Histogram (`random.sample()`)
 - Thay vì lấy vị trí cố định `[::10]` làm thiên lệch kết quả p95 theo thứ tự record trong batch, `metrics.py` sử dụng `random.sample(lags_ms, min(count, count // 10))` để thu thập dữ liệu thống kê Prometheus Histogram không thiên lệch (unbiased).
-- Giảm $90\%$ tải GIL/Lock Prometheus Exporter ở mức $45.000 \text{ ops/s}$.
+- Giảm khoảng 90% số lần gọi Prometheus Histogram so với observe mọi record;
+  counter/sum/window nội bộ vẫn ghi nhận toàn bộ record.
 
 #### Kỹ thuật 2: Phân Rã Độ Trễ Nội Bộ Từng Chặng (`latency_ms`)
 - Đo đạc chính xác thời gian thực thi của từng chặng trong pipeline: `state`, `postgres`, `redis`.
@@ -221,8 +232,8 @@ flowchart TD
 | [`packet_reader.py`](../pipeline/ingestion/packet_reader.py) | - RFC 2866 Binary TLV Parser<br/>- 3GPP VSA (Vendor 10415)<br/>- MD5 Authenticator<br/>- `SO_REUSEPORT` | - Giải mã cực nhanh không phụ thuộc thư viện ngoài<br/>- Kernel load-balancing đa tiến trình<br/>- Xác thực tính toàn vẹn gói tin |
 | [`producer.py`](../pipeline/ingestion/producer.py) | - Key-Sharded Queues per MSISDN<br/>- Global Inflight Semaphore<br/>- Passive mirror boundary<br/>- Split Metrics Exporter | - Bảo đảm thứ tự gửi theo MSISDN<br/>- Khống chế trần inflight toàn process<br/>- Không mang state giao thức RADIUS<br/>- Định vị queue/Kafka bottleneck và data loss |
 | [`radius_udp_sender.py`](../pipeline/ingestion/radius_udp_sender.py) | - Multi-Socket Sending (`--num-sockets 8`)<br/>- Token-bucket pacing<br/>- Pre-encoding/cache AVP | - Kích hoạt SO_REUSEPORT load balancing<br/>- Tạo tải fire-and-forget ổn định, không lẫn ACK/retry |
-| [`base_consumer.py`](../pipeline/modules/shared/base_consumer.py) | - Partition Sharding (`asyncio.gather`)<br/>- Manual Offset Commit<br/>- Fast Float Epoch Lag (`ingest_epoch_s`) | - Khai thác tối đa I/O đa nhân<br/>- Chống mất mát dữ liệu khi sập nguồn<br/>- Tính lag E2E cực nhanh (500x speedup) |
-| [`db.py`](../pipeline/modules/shared/db.py) | - Dynamic Connection Pool (`max=200`)<br/>- Giao dịch 4 bảng nguyên tử<br/>- Batch `UNNEST` SQL<br/>- Fencing Versioning Tuple | - Tiết kiệm bộ nhớ RAM Postgres<br/>- Bảo đảm 100% tính toàn vẹn ACID<br/>- Ghi hàng loạt tốc độ cao (< 25ms/batch)<br/>- Chống ghi đè gói tin đến sai thứ tự |
+| [`base_consumer.py`](../pipeline/modules/shared/base_consumer.py) | - FIFO/mutating worker theo partition<br/>- Process write combiner<br/>- Manual offset coordinator<br/>- E2E từ `ingest_epoch_ns` | - Song song partition độc lập nhưng giữ FIFO/key<br/>- Commit offset ngoài business critical path<br/>- Tách wait/processing/commit telemetry |
+| [`db.py`](../pipeline/modules/shared/db.py) | - Pool riêng theo member/process<br/>- Giao dịch 4 bảng nguyên tử<br/>- Batch `UNNEST` SQL<br/>- Fencing Versioning Tuple | - Connection budget theo profile<br/>- Atomic state/history/audit/outbox<br/>- Giảm SQL round-trip<br/>- Chống ghi đè record cũ/replay |
 | [`metrics.py`](../pipeline/modules/shared/metrics.py) | - Random Sampling 10% Histogram<br/>- In-Memory Sliding Window<br/>- Per-Worker Queue Depth Gauge | - Thu thập dữ liệu Histogram không thiên lệch<br/>- Tích hợp chuẩn Dashboard Grafana<br/>- Giám sát chi tiết RAM queue của từng worker |
 | [`ssrf_protection.py`](../pipeline/dispatcher/ssrf_protection.py) | - DNS Rebinding Validation<br/>- HMAC SHA-256 Signature Generator | - Ngăn chặn tấn công SSRF & DNS Rebinding vào mạng nội bộ<br/>- Đảm bảo tính toàn vẹn payload gửi webhook |
 | [`notification_dispatcher.py`](../pipeline/dispatcher/notification_dispatcher.py) | - Transactional Outbox Pattern<br/>- `FOR UPDATE SKIP LOCKED`<br/>- Header `Idempotency-Key` | - Cách ly hoàn toàn callback khỏi luồng chính<br/>- Scale ngang không bị deadlock |

@@ -25,27 +25,27 @@ flowchart TD
 
     subgraph KAFKALAYER["Message Broker: Apache Kafka"]
         direction TB
-        TOPIC["Topic: radius.accounting.raw<br/>(16 Partitions, Key = MSISDN)"]
+        TOPIC["Topic: radius.accounting.raw<br/>(9/12/24/48 partitions theo profile<br/>Key = MSISDN)"]
         DLQ["Topic: radius.accounting.raw.dlq<br/>(Dead Letter Queue)"]
     end
 
-    subgraph CONSUMERLAYER["Stage 2: Isolated Processing Services (3 Workers)"]
+    subgraph CONSUMERLAYER["Stage 2: Isolated Processing Services (3 Consumer Groups)"]
         direction TB
         subgraph SVC1["Service: pipeline-ip-msisdn (cg-ip-msisdn)"]
-            IPM1["Member 1..4 (GIL Loop 1, Pool max 12)"]
+            IPM1["R_ip replicas<br/>1 Kafka member/PID + 1 DB pool mỗi replica"]
         end
         subgraph SVC2["Service: pipeline-device-swap (cg-device-swap)"]
-            DEV1["Member 1..4 (GIL Loop 2, Pool max 8)"]
+            DEV1["R_device replicas<br/>1 Kafka member/PID + 1 DB pool mỗi replica"]
         end
         subgraph SVC3["Service: pipeline-sim-swap (cg-sim-swap)"]
-            SIM1["Member 1..4 (GIL Loop 3, Pool max 8)"]
+            SIM1["R_sim replicas<br/>1 Kafka member/PID + 1 DB pool mỗi replica"]
         end
     end
 
     subgraph STORAGELAYER["Storage & State Layer"]
         direction TB
         REDIS[("Redis / Redis Sentinel<br/>- ip-ggsn:* / ggsn-ips:*<br/>- device:* / sim:* cache")]
-        POSTGRES[("PostgreSQL Database (4 CPUs)<br/>- msisdn_device / msisdn_sim<br/>- device_swap_history / sim_swap_history<br/>- radius_session_state<br/>- audit_log<br/>- notification_log (Outbox)")]
+        POSTGRES[("PostgreSQL theo profile<br/>- msisdn_device / msisdn_sim<br/>- device_swap_history / sim_swap_history<br/>- radius_session_state<br/>- audit_log<br/>- notification_log (Outbox)")]
     end
 
     subgraph DISPATCHERLAYER["Stage 3: Event Dispatcher"]
@@ -172,7 +172,9 @@ sequenceDiagram
    - Profile mặc định dùng Kafka `acks=1`, không idempotence, vì capture ngoài repo chịu durability/replay. Có thể đổi sang `acks=all` + idempotence nếu hợp đồng nguồn thay đổi, nhưng phải hạ tốc độ mirror tại capture và đo lại p95. Ingestion không hard-limit theo `PIPELINE_RECOMMENDED_*_PPS`.
 
 5. **Manual Offset Commit & Dead Letter Queue (DLQ)**:
-   - Tắt hoàn toàn `enable_auto_commit`. Offset chỉ được commit sau khi batch đã ghi thành công vào DB.
+   - Tắt hoàn toàn `enable_auto_commit`. Offset chỉ được commit sau khi business
+     write và mọi durability future liên quan đã thành công. Với no-change swap,
+     future này là PostgreSQL checkpoint nền; với IP/swap thật là ghi trực tiếp.
    - Khi một bản ghi hoặc shard bị lỗi cấu trúc dữ liệu không thể xử lý, nó được đẩy vào topic `.dlq` kèm metadata lỗi chi tiết để phục vụ phân tích mà không làm dừng pipeline.
 
 6. **Redis làm Read Cache & Fencing Version**:
@@ -232,32 +234,23 @@ git clone <repo-url>
 cd camara-pipeline
 cp .env.example .env
 
-# 2. Khởi động toàn bộ hạ tầng (Kafka, Zookeeper, PostgreSQL, Redis, Prometheus, Grafana)
-docker compose up -d
+# 2. Khởi động stack theo profile mặc định; script chạy health-check và migration
+bash scripts/run_pipeline.sh config/env/8gb.env
 
-# 3. Chạy migrations khởi tạo cơ sở dữ liệu PostgreSQL
-# Script tự động thực thi các file SQL trong storage/migrations/
-bash scripts/run_pipeline.sh --init-db
-
-# 4. Sinh dữ liệu RADIUS mẫu (tuỳ chọn)
+# 3. Sinh dữ liệu RADIUS mẫu (tuỳ chọn)
 python -m simulator.simulator --output data/radius_sample.csv --records 50000
 
-# 5. Khởi chạy Pipeline xử lý (Consumers)
-python -m pipeline.run_pipeline
-
-# 6. Khởi chạy Notification Dispatcher (Terminal riêng biệt)
-python -m pipeline.dispatcher.notification_dispatcher
-
-# 7. Khởi chạy CAMARA FastAPI Gateway (Terminal riêng biệt)
-uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
-
-# 8. Bắn dữ liệu vào Ingestion (chọn 1 trong 2 cách):
+# 4. Bắn dữ liệu vào Ingestion (chọn 1 trong 2 cách):
 # Cách A: Đọc trực tiếp từ file CSV đẩy vào Kafka
-python -m pipeline.ingestion.producer --file data/radius_sample.csv
+bash scripts/run_ingest_csv.sh data/radius_sample.csv config/env/8gb.env
 
 # Cách B: Giả lập capture server mirror gói tin UDP qua cổng 1813
-python -m pipeline.ingestion.radius_udp_sender --csv data/radius_sample.csv --rate 15000
+bash scripts/simulate_radius_device.sh data/radius_sample.csv 800
 ```
+
+`run_pipeline.sh` đã khởi động ingestion, chín pipeline replica của profile 8 GiB,
+dispatcher, API, Prometheus và Grafana; không chạy thêm `pipeline.run_pipeline`
+trên host cùng consumer group nếu không chủ ý benchmark một process debug riêng.
 
 Sender là công cụ fire-and-forget có pacing; `--rate` là trần lưu lượng UDP mới.
 Nó không nhận response, không retry và không dùng để chứng minh độ bền dữ liệu.
@@ -272,19 +265,19 @@ Nó không nhận response, không retry và không dùng để chứng minh đ�
 | `KAFKA_TOPIC_RAW` | `radius.accounting.raw` | Tên topic Kafka chứa log thô |
 | `KAFKA_TOPIC_PARTITIONS` | `9` | Số partition của profile 12 vCPU/8 GiB; phải chia hết hợp lý cho số consumer |
 | `PIPELINE_GROUPS` | `""` (All) | Chọn consumer group cho tiến trình (`ip-msisdn`, `device-swap`, `sim-swap`) |
-| `*_CONSUMERS_PER_GROUP` | `3` | Số member của từng group; cấu hình riêng cho IP, device-swap và sim-swap |
+| `*_CONSUMERS_PER_GROUP` | `1` | Bắt buộc một Kafka member/PID; scale bằng `PIPELINE_*_REPLICAS` |
 | `*_PARTITION_CONCURRENCY` | `3` | Ba partition/member chạy đồng thời; cùng MSISDN vẫn giữ FIFO trong một partition |
 | `*_PARTITION_QUEUE_RECORDS` | IP=`64`, Swap=`96` | Queue cục bộ tối đa bốn batch; Kafka giữ durable backlog |
-| `*_BATCH_MAX_RECORDS` | IP=`16`, Swap=`24` | Micro-batch latency-first giữ transaction trong ngân sách p95 |
-| `*_BATCH_TIMEOUT_MS` | `1` | Thời gian gom batch tối đa |
+| `*_BATCH_MAX_RECORDS` | IP=`48`, Swap=`64` | Trần coalescing theo partition; batch thực tế có thể nhỏ hơn |
+| `*_BATCH_TIMEOUT_MS` | `5` | Poll/coalescing wait tối đa của profile hiện hành |
 | `PROCESSING_PARTITION_QUEUE_*` | `75%/25%`, `12ms/4ms` | Backpressure theo cả depth và tuổi record; tránh pause/resume quá nhạy với jitter ngắn |
 | `PROCESSING_COMMIT_INTERVAL_MS` / `MAX_RECORDS` | `25` / `512` | Coalesce commit offset ở coordinator nền, giảm request tới Kafka; không nằm trên critical path nghiệp vụ |
-| `DATABASE_URL` | `postgresql://postgres:camara@camara-postgres:5432/camara_db` | Connection string PostgreSQL (`synchronous_commit=on` đảm bảo 100% ACID) |
-| `IP_MSISDN_DB_POOL_MAX` / `DEVICE_SWAP...` / `SIM_SWAP...` | `12` / `8` / `8` | Connection Pool `asyncpg` tối đa phân chia theo từng service (PostgreSQL `max_connections=200`) |
+| `DATABASE_URL` | `postgresql://postgres:camara@camara-postgres:5432/camara_db` | Connection string PostgreSQL; profile dùng `synchronous_commit=on` để commit chờ WAL flush |
+| `IP_MSISDN_DB_POOL_MAX` / `DEVICE_SWAP...` / `SIM_SWAP...` | `4` / `4` / `4` | Pool tối đa trên mỗi replica profile 8 GiB; tổng budget phải nhân với replica |
 | `POSTGRES_CPUS` | `2.5` | CPU PostgreSQL trong profile 12 vCPU/8 GiB; ưu tiên vì PG/state fallback là bottleneck chung của cả ba group |
 | `REDIS_HOST` / `REDIS_PORT` | `camara-redis` / `6379` | Thông tin kết nối Redis Standalone / Cluster |
 | `RADIUS_SHARED_SECRET` | `camara-radius-dev-secret` | Secret key tính Authenticator RFC 2866 |
-| `RADIUS_UDP_RECEIVE_BUFFER_BYTES` | `33554432` (32MB) | Kích thước socket buffer nhận UDP |
+| `RADIUS_UDP_RECEIVE_BUFFER_BYTES` | `16777216` (16MiB) | Giá trị yêu cầu của profile 8 GiB; phải kiểm tra `receive_buffer_actual` do kernel có thể clamp |
 | `RADIUS_UDP_QUEUE_MAX_RECORDS` | `20000` | Burst buffer profile 8 GiB; capture mới là nguồn bền vững |
 | `RADIUS_UDP_KAFKA_BATCH_RECORDS` | `64` | Kích thước tối đa của micro-batch UDP Ingestion |
 | `RADIUS_UDP_KAFKA_BATCH_WAIT_MS` | `1` | Thời gian gom batch Kafka của Ingestion (ms) |
@@ -309,8 +302,9 @@ Nó không nhận response, không retry và không dùng để chứng minh đ�
 
 ### Chọn profile phần cứng
 
-`.env` và `.env.example` là profile 12 vCPU/8 GiB. Các profile lớn hơn chỉ
-override tài nguyên và tham số song song, không chứa secret:
+`.env`/`.env.example` là base chứa secret/endpoint và default an toàn. Luôn nạp
+thêm một hardware profile; `8gb.env` là profile chuẩn cho 12 vCPU/8 GiB. Các
+profile lớn hơn chỉ override tài nguyên/topology và không chứa secret:
 
 ```bash
 bash scripts/run_pipeline.sh config/env/16gb.env
@@ -328,10 +322,15 @@ Xem giả định CPU, ngân sách và lưu ý đổi partition tại
 ### 7.1. Giám sát Telemetry & Split Metrics
 Mỗi `THROUGHPUT_LOG_INTERVAL_SECONDS` (mặc định 10 giây), hệ thống ghi log phân khối trực quan (`|`) cho cả hai chặng:
 - **`[INGESTION]`**: `udp_in`, `kafka_persisted`, throughput `gap`, queue/backlog, batch size, persistence p50/p95/p99, queue residence p95, `worker_slot_wait_p95`, `global_wait_p95` và `data_loss` (`queue_dropped`, `publish_failed`).
-- **`[PROCESSING]`**: Log chi tiết cho từng member: throughput, độ trễ batch/chặng, **E2E `avg/p95/max`**, trạng thái `SLO_BREACH` khi p95 >=100 ms, swap/event và data loss.
+- **`[PROCESSING]`**: Log chi tiết cho từng member: throughput, độ trễ batch/chặng,
+  **business-ready E2E `avg/p95/max`**, trạng thái `SLO_BREACH` khi p95 >=100 ms,
+  swap/event và data loss. Offset commit/checkpoint được báo riêng.
 
 ### 7.2. Tính năng Bảo mật An ninh Mạng (Production Security)
-- **CAMARA OAuth2 OIDC Verification**: Xác thực JWT Bearer Token chuẩn (`exp`, `iss`, `aud`) kết hợp API Key fallback.
+- **Authentication hiện hành**: API Key được so sánh constant-time. Bearer JWT
+  hiện mới parse payload và kiểm tra `exp`/`iss`/`aud`, chưa xác minh chữ ký bằng
+  JWKS; vì vậy production phải đặt API sau gateway xác thực token hoặc hoàn thiện
+  signature verification trước go-live.
 - **SSRF & DNS Rebinding Protection**: Kiểm tra URL webhook chặt chẽ (`ssrf_protection.py`), ngăn chặn các cuộc tấn công quét mạng nội bộ và DNS Rebinding.
 - **HMAC SHA-256 Signature**: Đính kèm chữ ký `X-Signature-SHA256` trên mọi request webhook callback.
 - **Container Hardening**: Toàn bộ Docker images (`pipeline/Dockerfile`, `api/Dockerfile`) thực thi dưới quyền user không có root (`USER appuser`).
@@ -352,7 +351,8 @@ Mỗi `THROUGHPUT_LOG_INTERVAL_SECONDS` (mặc định 10 giây), hệ thống g
 ## 8. Tài liệu Báo cáo Kỹ thuật & Hướng dẫn Vận hành
 
 Dự án đã được tài liệu hóa đầy đủ các giải pháp kiến trúc và thuật toán nâng cao:
-- 🛠️ [**Hướng dẫn Cấu hình & Tối ưu hóa Phần cứng (Hardware Tuning Guide)**](docs/HARDWARE_TUNING_GUIDE.md): Giải thích chi tiết toàn bộ các biến môi trường trong `.env`, quy tắc sizing tài nguyên RAM/CPU, công thức tính toán độ đệm hàng đợi, connection budget PostgreSQL và bảng thông số cấu hình chuẩn cho các môi trường từ Dev/VPS đến Server Production 30k+ pkt/s.
+- 🛠️ [**Hướng dẫn Cấu hình & Tối ưu hóa Phần cứng (Hardware Tuning Guide)**](docs/HARDWARE_TUNING_GUIDE.md): Giải thích các biến môi trường, sizing RAM/CPU, queue/inflight, connection budget PostgreSQL và các profile latency-first. Throughput trong profile là target cần soak-test, không phải cam kết theo dung lượng RAM.
+- 🧭 [**Kiến trúc Pipeline và luồng dữ liệu thực tế**](docs/PIPELINE_ARCHITECTURE.md): Mô tả chi tiết từ UDP socket, shard/micro-batch, Kafka partition và ba consumer group tới PostgreSQL/Redis, checkpoint và offset commit.
 - 📖 [**Báo cáo Kỹ thuật Chuyên sâu các File Trọng điểm**](docs/BAO_CAO_KY_THUAT_PIPELINE.md): Mô tả giải mã RFC 2866/3GPP VSA, passive mirror ingestion, `SO_REUSEPORT`, key-sharded queues, bounded Kafka inflight, per-partition temporal pipeline, transaction batch, fencing tuple, Lua scripts, E2E lag và Transactional Outbox.
 - 🚀 [**Kế hoạch refactor hiệu năng ingestion**](docs/INGESTION_PERFORMANCE_REFACTOR_PLAN.md): Baseline 15k/s, nguyên nhân throughput/E2E/data loss, thay đổi đã triển khai và tiêu chí benchmark nghiệm thu.
 - 📖 [**Disaster Recovery Runbook & HA Operational Guide**](docs/DISASTER_RECOVERY_RUNBOOK.md): Hướng dẫn vận hành sự cố, sao lưu Point-in-Time Recovery (PITR) và quy trình Failover Kafka/PostgreSQL.

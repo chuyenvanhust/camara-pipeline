@@ -1,6 +1,6 @@
 # HƯỚNG DẪN CẤU HÌNH & TỐI ƯU HÓA PHẦN CỨNG (HARDWARE TUNING GUIDE)
 
-> **Tài liệu Hướng dẫn Khả chuyển (Portability & Hardware Sizing Guide)**: Giải thích chi tiết toàn bộ các thông số cài đặt trong file `.env` và công thức tính toán điều chỉnh tài nguyên khi chuyển đổi hạ tầng máy chủ (từ Dev/VPS đến Server Production viễn thông tải cao 30.000+ pkt/s).
+> **Tài liệu Hướng dẫn Khả chuyển (Portability & Hardware Sizing Guide)**: Giải thích các thông số trong `.env` và cách hiệu chỉnh trên phần cứng đích. Mọi throughput trong profile là candidate benchmark, không phải cam kết 30.000+ pkt/s hay hard admission limit.
 
 ---
 
@@ -64,9 +64,9 @@ Hệ thống **CAMARA Network API Data Pipeline** tuân thủ 100% nguyên lý *
 | `POSTGRES_EFFECTIVE_CACHE_SIZE` | `768MB` | RAM | Ước tính cache khả dụng cho Query Planner; đây không phải vùng cấp phát trực tiếp. |
 | `POSTGRES_WORK_MEM` | `4MB` | RAM | Bộ nhớ cho **mỗi phép toán** sort/hash; một query có thể cấp phát nhiều lần. |
 | `POSTGRES_MAX_WAL_SIZE` | `1GB` | Storage | Trần WAL trước checkpoint trong profile cơ sở. |
-| `IP_MSISDN_DB_POOL_MAX` | `12` | Connections | Kích thước pool kết nối tối đa `asyncpg` cho service `pipeline-ip-msisdn`. |
-| `DEVICE_SWAP_DB_POOL_MAX` | `8` | Connections | Kích thước pool kết nối tối đa `asyncpg` cho service `pipeline-device-swap`. |
-| `SIM_SWAP_DB_POOL_MAX` | `8` | Connections | Kích thước pool kết nối tối đa `asyncpg` cho service `pipeline-sim-swap`. |
+| `IP_MSISDN_DB_POOL_MAX` | `4` | Connections/replica | Kích thước pool tối đa trên mỗi process IP của profile 8 GiB. |
+| `DEVICE_SWAP_DB_POOL_MAX` | `4` | Connections/replica | Kích thước pool tối đa trên mỗi process Device Swap. |
+| `SIM_SWAP_DB_POOL_MAX` | `4` | Connections/replica | Kích thước pool tối đa trên mỗi process SIM Swap. |
 | `POSTGRES_MEM_LIMIT` | `1g` | RAM | Giới hạn RAM PostgreSQL của profile cơ sở. |
 | `POSTGRES_CPUS` | `2.5` | Cores | CPU PostgreSQL của profile cơ sở; bottleneck dùng chung cho mapping và hai nhánh swap. |
 
@@ -104,10 +104,10 @@ Hệ thống **CAMARA Network API Data Pipeline** tuân thủ 100% nguyên lý *
 | `INGESTION_BATCH_SIZE_BYTES` | `262144` | Bytes | Buffer batch tối đa của Kafka producer. |
 | `RADIUS_UDP_PUBLISHER_WORKERS` | `4` | Workers | Số lượng worker coroutines publish song song (đã được định tuyến theo MSISDN Key Sharding). |
 | `INGESTION_KAFKA_ACKS` / `INGESTION_ENABLE_IDEMPOTENCE` | `1` / `false` | - | Chỉ chờ leader vì capture server ngoài repo là nguồn bền vững/replay. Dùng `all/true` nếu thay đổi hợp đồng durability. |
-| `INGESTION_KAFKA_PERSIST_WARN_MS` | `20` | ms | Ngưỡng cảnh báo p95 thời gian Kafka xác nhận ghi batch nội bộ. |
-| `INGESTION_QUEUE_WARN_MS` | `20` | ms | Ngưỡng cảnh báo p95 thời gian record nằm trong queue RAM. |
+| `INGESTION_KAFKA_PERSIST_WARN_MS` | `18` | ms | Ngưỡng cảnh báo profile 8 GiB; profile lớn dùng 30ms trong ngân sách E2E 100ms. |
+| `INGESTION_QUEUE_WARN_MS` | `4` | ms | Ngưỡng profile 8 GiB; profile lớn dùng 12ms. Đây là cảnh báo, không drop. |
 | `RADIUS_INGESTION_MEM_LIMIT` | `1g` | RAM | Giới hạn RAM Docker cấp cho Container Ingestion. |
-| `RADIUS_INGESTION_CPUS` | `1` | Cores | Ingestion tại 2,9k/s có queue gần 0 và không phải bottleneck; chỉ tăng lại nếu CPU throttling đi kèm kernel `RcvbufErrors`. |
+| `RADIUS_INGESTION_CPUS` | `1` | Cores | Hard quota của riêng ingestion profile 8 GiB; tăng khi CPU throttling đi kèm queue residence/kernel `RcvbufErrors`. |
 
 ---
 
@@ -116,16 +116,16 @@ Hệ thống **CAMARA Network API Data Pipeline** tuân thủ 100% nguyên lý *
 | Tên Biến Môi Trường | Mặc Định | Đơn Vị | Ý Nghĩa Kỹ Thuật & Tác Động Khi Điều Chỉnh |
 |---|---|---|---|
 | `PIPELINE_GROUPS` | `""` | String | Chọn group kích hoạt cho worker container (`ip-msisdn`, `device-swap`, `sim-swap`). Nếu rỗng sẽ khởi chạy cả 3. |
-| `*_CONSUMERS_PER_GROUP` | `3` | Members | Số member cấu hình riêng cho IP-MSISDN, device-swap và sim-swap. |
+| `*_CONSUMERS_PER_GROUP` | `1` | Members/process | Bắt buộc bằng 1; scale process bằng `PIPELINE_*_REPLICAS`. |
 | `*_PARTITION_CONCURRENCY` | `3` | Workers | Ba partition/member chạy đồng thời; FIFO theo partition vẫn được giữ. |
 | `IP_MSISDN_PARTITION_QUEUE_RECORDS` / `*_SWAP_PARTITION_QUEUE_RECORDS` | `64` / `96` | Records/partition | Tối đa bốn batch cục bộ; Kafka mới là durable backlog. |
 | `PROCESSING_PARTITION_QUEUE_HIGH_RATIO` / `LOW_RATIO` | `0.75` / `0.25` | Ratio | High/low watermark cho backpressure riêng partition. |
 | `PROCESSING_PARTITION_QUEUE_MAX_AGE_MS` / `RESUME_AGE_MS` | `12` / `4` | ms | Backpressure theo tuổi record với hysteresis đủ rộng để tránh flapping do jitter ngắn. |
 | `PROCESSING_COMMIT_INTERVAL_MS` / `MAX_RECORDS` | `25` / `512` | ms / records | Coalesce offset commit ở coordinator nền, giảm request Kafka; không đổi thời điểm xác nhận business write. |
-| `IP_MSISDN_BATCH_MAX_RECORDS` / `*_SWAP_BATCH_MAX_RECORDS` | `16` / `24` | Records | IP có write amplification lớn hơn nên dùng batch nhỏ hơn swap. |
-| `*_BATCH_TIMEOUT_MS` | `2` | ms | Thời gian gom micro-batch tối đa. |
+| `IP_MSISDN_BATCH_MAX_RECORDS` / `*_SWAP_BATCH_MAX_RECORDS` | `48` / `64` | Records | Trần coalescing hiện hành; IP nhỏ hơn vì ghi cả PG và Redis cho mọi event. |
+| `*_BATCH_TIMEOUT_MS` | `5` | ms | Poll/coalescing wait tối đa; worker không cố chờ đủ batch khi FIFO đã hết. |
 | `THROUGHPUT_LOG_INTERVAL_SECONDS` | `10` | Giây | Chu kỳ in log thống kê thông lượng telemetry nội bộ. |
-| `PIPELINE_IP_MEM_LIMIT` / `DEVICE...` / `SIM...` | `512m` / `512m` / `512m` | RAM | Phân bổ RAM profile 8 GiB theo trọng lượng workload. |
+| `PIPELINE_IP_MEM_LIMIT` / `DEVICE...` / `SIM...` | `192m` / `160m` / `160m` | RAM/replica | Container limit trên mỗi replica profile 8 GiB. |
 | `PIPELINE_*_CPU_SHARES` | `1024 / 768 / 768` | Weight | Trọng số tương đối khi CPU contention; pipeline không dùng hard `cpus` quota để tránh CFS throttling gây tail latency. |
 | `PROCESSING_COMBINE_WAIT_MS` / `MAX_RECORDS` | `2 / 64` | ms / records | Gom batch từ các partition độc lập ở cấp process trước một lần ghi downstream. |
 | `PIPELINE_SLA_E2E_P95_MS` | `100` | ms | Log chuyển thành `SLO_BREACH` nếu p95 cửa sổ vượt ngưỡng. |
@@ -178,23 +178,24 @@ Hệ thống **CAMARA Network API Data Pipeline** tuân thủ 100% nguyên lý *
 
 | Biến | 8 GiB / 12 CPU | 16 GiB / 16 CPU | 32 GiB / 24 CPU | 64 GiB / 32 CPU |
 |---|---:|---:|---:|---:|
-| Admission ceiling | **800/s baseline** | **3.9k/s candidate** | **7.8k/s candidate** | **15.5k/s candidate** |
-| Burst/benchmark target | 900/s | 3.9k/s | 7.8k/s | 15.5k/s |
+| Observe-only sustained target | **800/s baseline** | **3.9k/s candidate** | **7.8k/s candidate** | **15.5k/s candidate** |
+| Observe-only burst target | 900/s | 3.9k/s | 7.8k/s | 15.5k/s |
 | SLO bắt buộc | p95 <100ms | p95 <100ms | p95 <100ms | p95 <100ms |
 | Kafka partitions | 9 | 12 | 24 | 48 |
-| Kafka RAM / broker | 900m | 1536m | 3g | 6g |
+| Kafka replication factor | 1 (benchmark) | 3 | 3 | 3 |
+| Kafka RAM / broker | 1200m | 1536m | 3g | 6g |
 | Kafka heap / broker | 448M | 768M | 1536M | 3G |
 | Kafka CPU / broker | 1.5 | 1.5 | 2.5 | 2.5 |
-| PostgreSQL RAM / CPU | 1g / 2.5 | 2560m / 2.5 | 6g / 4.5 | 12g / 6 |
+| PostgreSQL RAM / CPU | 1500m / 2.5 | 2560m / 2.5 | 6g / 4.5 | 12g / 6 |
 | Redis container / dataset / CPU | 384m / 256mb / 0.5 | 1g / 768mb / 1 | 2g / 1536mb / 1.5 | 4g / 3gb / 2 |
 | Ingestion queue | 20k | 30k | 60k | 120k |
 | Ingestion batch / wait / linger | 64 / 1ms / 0ms | 64 / 1ms / 0ms | 64 / 1ms / 0ms | 64 / 1ms / 0ms |
 | Ingestion workers / producers | 4 / 1 | 4 / 1 | 8 / 2 | 8 / 4 |
 | Ingestion RAM / CPU | 1g / 1 | 1g / 1.5 | 1536m / 2.5 | 3g / 3 |
-| IP replicas x members / concurrency | 3x1 / 2 | 4x1 / 3 | 6x1 / 4 | 8x1 / 6 |
-| IP partition batch / fetch wait / CPU | 16 / 2ms / no hard cap | 16 / 2ms / no hard cap | 16 / 2ms / no hard cap | 16 / 2ms / no hard cap |
-| Swap replicas x members / concurrency | 3x1 / 2 | 4x1 / 3 | 6x1 / 4 | 8x1 / 6 |
-| Swap partition batch / fetch wait / CPU | 24 / 2ms / no hard cap | 24 / 2ms / no hard cap | 24 / 2ms / no hard cap | 24 / 2ms / no hard cap |
+| IP replicas x members / concurrency | 3x1 / 3 | 4x1 / 3 | 6x1 / 4 | 8x1 / 6 |
+| IP partition batch / fetch wait / CPU | 48 / 5ms / no hard cap | 48 / 5ms / no hard cap | 48 / 5ms / no hard cap | 48 / 5ms / no hard cap |
+| Swap replicas x members / concurrency | 3x1 / 3 | 4x1 / 3 | 6x1 / 4 | 8x1 / 6 |
+| Swap partition batch / fetch wait / CPU | 64 / 5ms / no hard cap | 64 / 5ms / no hard cap | 64 / 5ms / no hard cap | 64 / 5ms / no hard cap |
 | Process write combine wait / max | 2ms / 64 | 2ms / 64 | 2ms / 96 | 2ms / 128 |
 | Swap checkpoint interval | 150ms | 150ms | 150ms | 150ms |
 
@@ -244,7 +245,7 @@ residence tăng, capture phải giảm tốc/replay.
 ### 2. Dung Lượng Inflight Kafka Tối Đa Toàn Hệ Thống (Total Inflight Capacity)
 $$\text{Required batches}=\left\lceil\frac{\text{target records/s}\times\text{persist latency s}}{\text{batch records}}\right\rceil$$
 $$\text{Capacity}_{\text{inflight}} = \text{inflight batches} \times \text{batch records}$$
-*Ví dụ*: 2,9k/s, persist p95 18ms và batch 64 cần ít nhất 1 batch theo BDP.
+*Ví dụ*: candidate 3,9k/s, persist p95 30ms và batch 64 cần ít nhất 2 batch theo BDP.
 Profile cấp inflight headroom cho tail ngắn. Capture server phải điều tiết tải
 sustained vượt profile; UDP ingestion chỉ quan sát/cảnh báo và không được loại gói
 theo ngưỡng cấu hình.
@@ -252,8 +253,8 @@ theo ngưỡng cấu hình.
 ### 3. Ngân Sách Kết Nối PostgreSQL (Connection Budget)
 $$\text{Total} = 10 + R_{ip}P_{ip} + R_{dev}P_{dev} + R_{sim}P_{sim} + 5 + 10$$
 với $R$ là số replica và $P$ là pool max của mỗi replica. Ví dụ profile 16 GiB:
-$10 + 2\times16 + 2\times10 + 2\times10 + 5 + 10 = \mathbf{97}$ connection,
-nằm dưới `POSTGRES_MAX_CONNECTIONS=120` và còn 23 connection dự phòng.
+$10 + 4\times8 + 4\times4 + 4\times4 + 5 + 10 = \mathbf{89}$ connection,
+nằm dưới `POSTGRES_MAX_CONNECTIONS=120` và còn 31 connection dự phòng.
 
 > **Lưu ý**: Các consumer trong cùng replica dùng chung một pool. Khi scale process,
 > phải nhân pool với replica như công thức trên; không nhân với số member coroutine.
@@ -275,8 +276,10 @@ Khi di chuyển dự án sang hệ thống máy chủ mới:
 # Local/dev
 cp .env.example .env
 
-# Production Linux dùng template production thay cho lệnh trên
-cp .env.production.example .env
+# Production: vẫn bắt đầu từ base đầy đủ
+cp .env.example .env
+# Sau đó chép/thay các secret và endpoint được minh họa trong
+# .env.production.example vào .env; file production example không chứa tuning.
 ```
 
 ### Bước 2: Thay đổi thông số Bảo mật & Secret Keys
@@ -296,9 +299,27 @@ Dựa vào dung lượng vCPU và RAM của máy chủ mới, điều chỉnh c�
 
 ### Bước 4: Khởi động hệ thống & Kiểm tra Log Telemetry
 ```bash
-# Production Linux: áp dụng cả override HA/host-network
-docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+# Khởi động bằng hardware profile đã chọn (ví dụ host 32 GiB / 24 vCPU)
+bash scripts/run_pipeline.sh config/env/32gb.env
 
 # Kiểm tra log telemetry để xác nhận các thông số đã nhận đúng
 docker compose logs -f radius-ingestion pipeline-ip-msisdn pipeline-device-swap pipeline-sim-swap
 ```
+
+Nếu triển khai Linux với Redis Sentinel và host networking cho ingestion, dùng
+thêm production override nhưng vẫn giữ profile 32 GiB làm nguồn tuning duy nhất:
+
+```bash
+docker compose --env-file .env --env-file config/env/32gb.env \
+  -f docker-compose.yml -f docker-compose.prod.yml config --quiet
+
+docker compose --env-file .env --env-file config/env/32gb.env \
+  -f docker-compose.yml -f docker-compose.prod.yml up -d --build \
+  --scale radius-ingestion=1 \
+  --scale pipeline-ip-msisdn=6 \
+  --scale pipeline-device-swap=6 \
+  --scale pipeline-sim-swap=6
+```
+
+Không dùng `docker-compose.prod.yml` trên Docker Desktop Windows/macOS vì
+`network_mode: host` ở đó không tương đương Linux host network.

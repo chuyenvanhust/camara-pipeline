@@ -41,7 +41,11 @@ Swagger UI: http://localhost:8000/docs
 
 ## Authentication
 
-Tất cả endpoint nghiệp vụ yêu cầu header `X-API-Key` khớp biến môi trường `API_KEY`.
+Endpoint nghiệp vụ chấp nhận `X-API-Key` khớp `API_KEY` hoặc Bearer token. API Key
+được so sánh constant-time. Implementation Bearer hiện chỉ decode payload và kiểm
+tra `exp`, `iss`, `aud`; nó **chưa xác minh chữ ký JWT/JWKS**. Không được xem đây
+là OIDC verification hoàn chỉnh: production phải đặt API sau gateway xác thực
+token hoặc bổ sung signature verification trước go-live.
 
 ## Query logic
 

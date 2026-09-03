@@ -55,7 +55,7 @@ python -m pipeline.ingestion.radius_udp_sender \
 | Biến | Mặc định | Ý nghĩa |
 |---|---:|---|
 | `RADIUS_SHARED_SECRET` | bắt buộc | Xác thực Request Authenticator của gói mirror. |
-| `RADIUS_UDP_RECEIVE_BUFFER_BYTES` | `33554432` | Socket receive buffer yêu cầu từ OS. |
+| `RADIUS_UDP_RECEIVE_BUFFER_BYTES` | `16777216` | Profile 8 GiB; code fallback 32MiB. Đây là request, phải xem `receive_buffer_actual`. |
 | `RADIUS_UDP_QUEUE_MAX_RECORDS` | `20000` | Burst buffer profile 8 GiB; capture ngoài repo là nguồn bền vững. |
 | `RADIUS_UDP_PUBLISHER_WORKERS` | `4` | Số queue/publisher shard theo MSISDN. |
 | `RADIUS_UDP_KAFKA_PRODUCERS` | `1` | Producer dùng chung cho các publisher coroutine. `AIOKafkaProducer` giữ thứ tự theo partition và tránh chia nhỏ accumulator. |
@@ -68,13 +68,13 @@ python -m pipeline.ingestion.radius_udp_sender \
 | `INGESTION_KAFKA_ACKS` | `1` | Chỉ chờ leader; capture chịu durability và replay. |
 | `INGESTION_ENABLE_IDEMPOTENCE` | `false` | Bắt buộc khi `acks=1`; downstream version fence xử lý replay. |
 | `INGESTION_BATCH_SIZE_BYTES` | `262144` | Batch buffer tối đa của Kafka producer. |
-| `INGESTION_KAFKA_PERSIST_WARN_MS` | `20` | Ngưỡng cảnh báo p95 thời gian ghi Kafka. |
-| `INGESTION_QUEUE_WARN_MS` | `20` | Ngưỡng cảnh báo p95 thời gian nằm trong queue. |
+| `INGESTION_KAFKA_PERSIST_WARN_MS` | `18` | Ngưỡng cảnh báo p95 profile 8 GiB; profile lớn dùng 30ms. |
+| `INGESTION_QUEUE_WARN_MS` | `4` | Ngưỡng cảnh báo p95 profile 8 GiB; profile lớn dùng 12ms. |
 
 ## Telemetry
 
 ```text
-[INGESTION][OK] window=10.0s | Throughput: udp_in=2900.0/s kafka_persisted=2900.0/s gap=+0.0/s | Capacity target (observe-only): sustained<=2900/s burst<=2900/s | Queue: depth=0/20000(0.0%) backlog=0.00s | Kafka: publish_group_avg=48.0rec last=64rec/8.0ms persist(p50=6.0ms p95=12.0ms p99=18.0ms) queue_p95=2.0ms worker_slot_wait_p95=0.0ms global_wait_p95=0.0ms | Quality/Loss: data_loss=0(+0) (queue_dropped=0, pub_failed=0, dlq=0, invalid=0) | Totals: received=29000, kafka_persisted=29000
+[INGESTION][OK] window=10.0s | Throughput: udp_in=800.0/s kafka_persisted=800.0/s gap=+0.0/s | Capacity target (observe-only): sustained<=800/s burst<=900/s | Queue: depth=0/20000(0.0%) backlog=0.00s | Kafka: publish_group_avg=3.0rec last=4rec/3.0ms persist(p50=3.0ms p95=12.0ms p99=18.0ms) queue_p95=2.0ms worker_slot_wait_p95=0.0ms global_wait_p95=0.0ms | Quality/Loss: data_loss=0(+0) (queue_dropped=0, pub_failed=0, dlq=0, invalid=0) | Totals: received=8000, kafka_persisted=8000
 ```
 
 `publish_group_avg` là số record mà publisher coroutine giao cho Kafka trong một
@@ -97,8 +97,8 @@ tăng liên tục và `data_loss=0`. Queue chỉ hấp thụ burst ngắn; nó k
 durable buffering tại capture server hoặc Kafka.
 
 Sizing inflight phải theo bandwidth-delay product. Profile 8 GiB cấp tối đa
-`24*64=1536` record đang bay, lớn hơn nhiều BDP tại capacity target 2.9k/s nếu
-Kafka leader p95 đạt ngân sách 20ms. Queue 20.000 record chỉ là đệm burst; capture
+`24*64=1536` record đang bay, lớn hơn nhiều BDP tại observe-only target 800/s nếu
+Kafka leader p95 đạt ngân sách 18ms. Queue 20.000 record chỉ là đệm burst; capture
 phải giới hạn sustained rate theo profile. Ingestion không thể backpressure nguồn
 UDP nên tuyệt đối không dùng capacity target để loại gói trước queue.
 

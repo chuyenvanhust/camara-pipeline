@@ -25,7 +25,7 @@ async def ensure_topics(bootstrap_servers: str, topics: list[str]) -> None:
         for topic in topics:
             try:
                 await admin.create_topics([NewTopic(
-                    topic, num_partitions=int(os.getenv("KAFKA_TOPIC_PARTITIONS", "16")),
+                    topic, num_partitions=int(os.getenv("KAFKA_TOPIC_PARTITIONS", "9")),
                     replication_factor=int(os.getenv("KAFKA_REPLICATION_FACTOR", "3")),
                 )])
                 logger.info("Created Kafka topic %s", topic)

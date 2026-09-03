@@ -8,7 +8,11 @@
 
 > ⚠️ **Lưu ý Kiến trúc**: Các thông số RPO/RTO dưới đây đại diện cho **Mục tiêu Thiết kế (Target SLAs)** khi hệ thống được triển khai trên cụm máy chủ phân tán (Kubernetes HA / Multi-node). Môi trường Docker Compose đơn host hiện tại không tự động bảo đảm dự phòng sự cố cấp hạ tầng phần cứng.
 
-- **RPO (Target Recovery Point Objective)**: **< 1 Phút** (Yêu cầu bật WAL Archiving / PITR trên PostgreSQL & 3-broker Kafka cluster `acks=all`, `min.insync.replicas=2`).
+- **RPO (Target Recovery Point Objective)**: **< 1 Phút** (Yêu cầu bật WAL
+  Archiving/PITR trên PostgreSQL và phải có hợp đồng replay từ capture server.
+  Nếu Kafka được chọn làm ranh giới durability thay cho capture, raw producer
+  phải đổi từ cấu hình hiện hành `acks=1` sang `acks=all`, RF=3,
+  `min.insync.replicas=2` và benchmark lại p95).
 - **RTO (Target Recovery Time Objective)**: **< 15 Phút** (Yêu cầu Kubernetes StatefulSet / Multi-node Auto-Failover Orchestration).
 
 ---
@@ -69,7 +73,10 @@ docker compose up -d
 - **Hiện tượng**: Alert `HighKafkaLag` kích hoạt trên Prometheus.
 - **Xử lý**: 
   1. Kiểm tra tài nguyên CPU/RAM của PostgreSQL & Redis: `docker stats pipeline-ip-msisdn pipeline-device-swap pipeline-sim-swap`.
-  2. Tăng số consumer của workload đang lag, ví dụ `IP_MSISDN_CONSUMERS_PER_GROUP=8`; không tăng đồng loạt ba group nếu bottleneck chỉ nằm ở IP-MSISDN.
+  2. Giữ `IP_MSISDN_CONSUMERS_PER_GROUP=1`; scale số process bằng
+     `PIPELINE_IP_REPLICAS` hoặc `docker compose up -d --scale
+     pipeline-ip-msisdn=N`. Không tăng đồng loạt ba group nếu bottleneck chỉ nằm
+     ở IP-MSISDN, và không scale vượt số Kafka partition hữu ích.
   3. Restart service có lag cao nhất (ví dụ `pipeline-ip-msisdn`):
      ```bash
      docker compose restart pipeline-ip-msisdn
